@@ -1,0 +1,3 @@
+[console_scripts]
+trading-bot = trading_bot.cli:main
+trading-bot-web = trading_bot.web_app:run_server

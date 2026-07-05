@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-bot"
+version = "0.1.0"
+description = "A small GEX-powered trading bot foundation."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "trading_bot" }
+]
+dependencies = []
+
+[project.scripts]
+trading-bot = "trading_bot.cli:main"
+trading-bot-web = "trading_bot.web_app:run_server"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

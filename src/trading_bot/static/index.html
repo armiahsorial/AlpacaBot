@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>trading_bot</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="toolbar" aria-label="Analysis controls">
+        <div class="brand">
+          <h1>trading_bot</h1>
+          <p>GEX market read</p>
+        </div>
+
+        <form id="analysis-form" class="controls">
+          <label>
+            <span>Ticker</span>
+            <select id="ticker" name="ticker">
+              <option value="NDX" selected>NDX</option>
+              <option value="SPX">SPX</option>
+              <option value="RUT">RUT</option>
+              <option value="VIX">VIX</option>
+              <option value="NQ_NDX">NQ_NDX</option>
+              <option value="ES_SPX">ES_SPX</option>
+              <option value="QQQ">QQQ</option>
+              <option value="SPY">SPY</option>
+              <option value="IWM">IWM</option>
+              <option value="AAPL">AAPL</option>
+              <option value="AMD">AMD</option>
+              <option value="AMZN">AMZN</option>
+              <option value="AVGO">AVGO</option>
+              <option value="COIN">COIN</option>
+              <option value="GOOG">GOOG</option>
+              <option value="GOOGL">GOOGL</option>
+              <option value="META">META</option>
+              <option value="MSFT">MSFT</option>
+              <option value="MSTR">MSTR</option>
+              <option value="NVDA">NVDA</option>
+              <option value="PLTR">PLTR</option>
+              <option value="TSLA">TSLA</option>
+            </select>
+          </label>
+
+          <label>
+            <span>Period</span>
+            <select id="period" name="period">
+              <option value="zero">0DTE</option>
+              <option value="one">1DTE</option>
+              <option value="full">Full</option>
+            </select>
+          </label>
+
+          <button id="analyze-button" class="sr-only" type="submit" aria-hidden="true" tabindex="-1">Analyze</button>
+
+          <label class="inline-toggle">
+            <input id="auto-refresh" type="checkbox" checked />
+            <span>Auto</span>
+          </label>
+
+          <label>
+            <span>Refresh</span>
+            <select id="refresh-seconds">
+              <option value="1" selected>1 sec</option>
+              <option value="5">5 sec</option>
+              <option value="15">15 sec</option>
+              <option value="30">30 sec</option>
+              <option value="60">60 sec</option>
+            </select>
+          </label>
+        </form>
+      </section>
+
+      <section id="status" class="status">Ready.</section>
+
+      <section id="results" class="results hidden" aria-live="polite">
+        <div class="summary">
+          <div>
+            <span class="label">Permission</span>
+            <strong id="trade-permission">-</strong>
+          </div>
+          <div>
+            <span class="label">Bias</span>
+            <strong id="bias">-</strong>
+          </div>
+          <div>
+            <span class="label">Confidence</span>
+            <strong id="confidence">-</strong>
+          </div>
+          <div>
+            <span class="label">Score</span>
+            <strong id="score">-</strong>
+          </div>
+          <div>
+            <span class="label">Spot</span>
+            <strong id="spot">-</strong>
+          </div>
+          <div>
+            <span class="label">Zero Gamma</span>
+            <strong id="zero-gamma">-</strong>
+          </div>
+        </div>
+
+        <section class="panel">
+          <h2>Action</h2>
+          <p id="action"></p>
+        </section>
+
+        <section class="panel chart-panel">
+          <h2>Strike Map</h2>
+          <div id="strike-chart" class="strike-chart" aria-label="Strike level chart"></div>
+          <div class="legend">
+            <span><i class="spot-dot"></i>Spot</span>
+            <span><i class="zero-dot"></i>Zero gamma</span>
+            <span><i class="call-dot"></i>Call watch zone</span>
+            <span><i class="put-dot"></i>Put watch zone</span>
+          </div>
+        </section>
+
+        <section class="grid">
+          <div class="panel">
+            <h2>Market Regime</h2>
+            <p id="market-regime"></p>
+          </div>
+
+          <div class="panel">
+            <h2>Setup</h2>
+            <p id="setup"></p>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Trade Plan</h2>
+          <dl>
+            <div><dt>Entry trigger</dt><dd id="entry-trigger">-</dd></div>
+            <div><dt>Invalidation</dt><dd id="invalidation">-</dd></div>
+            <div><dt>Target zone</dt><dd id="target-zone">-</dd></div>
+            <div><dt>Avoid zone</dt><dd id="avoid-zone">-</dd></div>
+          </dl>
+        </section>
+
+        <section class="grid">
+          <div class="panel">
+            <h2>Key Levels</h2>
+            <dl>
+              <div><dt>Classic positive</dt><dd id="classic-positive">-</dd></div>
+              <div><dt>Classic negative</dt><dd id="classic-negative">-</dd></div>
+              <div><dt>State call node</dt><dd id="state-call">-</dd></div>
+              <div><dt>State put node</dt><dd id="state-put">-</dd></div>
+            </dl>
+          </div>
+
+          <div class="panel">
+            <h2>Distance</h2>
+            <dl>
+              <div><dt>To zero gamma</dt><dd id="distance-zero">-</dd></div>
+              <div><dt>Upside room</dt><dd id="upside-room">-</dd></div>
+              <div><dt>Downside room</dt><dd id="downside-room">-</dd></div>
+            </dl>
+          </div>
+        </section>
+
+        <section class="grid">
+          <div class="panel">
+            <h2>Pressure</h2>
+            <dl>
+              <div><dt>Classic net GEX</dt><dd id="classic-net">-</dd></div>
+              <div><dt>State imbalance</dt><dd id="state-net">-</dd></div>
+              <div><dt>Classic 30m</dt><dd id="classic-change">-</dd></div>
+              <div><dt>State 30m</dt><dd id="state-change">-</dd></div>
+            </dl>
+          </div>
+
+          <div class="panel">
+            <h2>Score Breakdown</h2>
+            <ul id="score-breakdown"></ul>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Read</h2>
+          <ul id="reasons"></ul>
+        </section>
+
+        <section id="no-trade-panel" class="panel caution hidden">
+          <h2>No-Trade Reasons</h2>
+          <ul id="no-trade-reasons"></ul>
+        </section>
+
+        <section class="panel risk">
+          <h2>Risk</h2>
+          <p id="risk"></p>
+        </section>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

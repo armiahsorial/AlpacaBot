@@ -1,0 +1,208 @@
+Metadata-Version: 2.4
+Name: trading-bot
+Version: 0.1.0
+Summary: A small GEX-powered trading bot foundation.
+Author: trading_bot
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+
+# trading_bot
+
+A fresh Python foundation for a trading bot powered by the GEX API.
+
+The first supported API call is:
+
+- `GET https://api.gexbot.com/tickers`
+
+This endpoint returns the stock, index, and futures symbols that can be used by the rest of the GEX API.
+
+## Setup
+
+```bash
+cd trading_bot
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+```
+
+Create a `.env` file in this folder:
+
+```env
+GEX_API_KEY=your-api-key
+```
+
+Optional settings:
+
+```env
+GEX_BASE_URL=https://api.gexbot.com
+GEX_USER_AGENT=trading_bot/0.1.0
+GEX_TIMEOUT_SECONDS=20
+```
+
+Environment variables from your shell override values in `.env`.
+
+## Usage
+
+Print all supported ticker groups:
+
+```bash
+trading-bot tickers
+```
+
+Print one group:
+
+```bash
+trading-bot tickers --group stocks
+trading-bot tickers --group indexes
+trading-bot tickers --group futures
+```
+
+Raw JSON output:
+
+```bash
+trading-bot tickers --json
+```
+
+Fetch classic GEX chain data:
+
+```bash
+trading-bot gex-chain SPX --period zero
+```
+
+Aggregation periods are `full`, `zero`, and `one`.
+
+Limit the number of strike rows printed:
+
+```bash
+trading-bot gex-chain SPX --period zero --limit 20
+```
+
+Raw JSON output:
+
+```bash
+trading-bot gex-chain SPX --period zero --json
+```
+
+Fetch state GEX imbalance profile:
+
+```bash
+trading-bot state-profile SPX --period zero
+```
+
+Limit the number of strike rows printed:
+
+```bash
+trading-bot state-profile SPX --period zero --limit 20
+```
+
+Raw JSON output:
+
+```bash
+trading-bot state-profile SPX --period zero --json
+```
+
+Fetch slim state GEX major imbalance levels:
+
+```bash
+trading-bot state-majors SPX --period full
+```
+
+Raw JSON output:
+
+```bash
+trading-bot state-majors SPX --period full --json
+```
+
+Fetch state GEX max imbalance changes:
+
+```bash
+trading-bot state-maxchange SPX --period full
+```
+
+Raw JSON output:
+
+```bash
+trading-bot state-maxchange SPX --period full --json
+```
+
+Fetch state orderflow Greek profile:
+
+```bash
+trading-bot state-greeks SPX delta_zero
+```
+
+Supported Greek profile values are `delta_zero`, `gamma_zero`, `delta_one`, `gamma_one`, `charm_zero`, `vanna_zero`, `charm_one`, and `vanna_one`.
+
+Limit the number of mini-contract rows printed:
+
+```bash
+trading-bot state-greeks SPX delta_zero --limit 20
+```
+
+Raw JSON output:
+
+```bash
+trading-bot state-greeks SPX delta_zero --json
+```
+
+Analyze classic GEX and state imbalance together:
+
+```bash
+trading-bot analyze SPX --period zero
+```
+
+The analysis report includes market regime, bias, confidence, trade permission, setup, entry trigger, invalidation, target zone, avoid zone, score breakdown, and no-trade reasons.
+
+Raw JSON output:
+
+```bash
+trading-bot analyze SPX --period zero --json
+```
+
+Start the local web interface:
+
+```bash
+trading-bot-web
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8765
+```
+
+The web UI includes a strike map, call/put watch-zone pointers, and optional auto-refresh.
+
+Fetch slim classic GEX major levels:
+
+```bash
+trading-bot gex-majors SPX --period full
+```
+
+Raw JSON output:
+
+```bash
+trading-bot gex-majors SPX --period full --json
+```
+
+Fetch max GEX changes, also known as max priors:
+
+```bash
+trading-bot gex-maxchange SPX --period full
+```
+
+Raw JSON output:
+
+```bash
+trading-bot gex-maxchange SPX --period full --json
+```
+
+## Tests
+
+```bash
+PYTHONPATH=src python -m unittest discover -s tests
+```
+
+## Notes
+
+This project reads GEX levels for analysis. Options contract data, trading execution, brokerage integration, position sizing, and stricter risk checks should be added deliberately before any live trading is enabled.

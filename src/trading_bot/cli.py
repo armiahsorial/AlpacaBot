@@ -7,8 +7,9 @@ import json
 import sys
 from collections.abc import Sequence
 
+from trading_bot.alpaca_client import AlpacaApiError, AlpacaClient, PaperOrderRequest
 from trading_bot.analysis import GexAnalysis, analyze_gex
-from trading_bot.config import Settings
+from trading_bot.config import AlpacaSettings, Settings
 from trading_bot.gex_client import (
     AGGREGATION_PERIODS,
     GexApiError,
@@ -20,6 +21,7 @@ from trading_bot.gex_client import (
     StateGreekProfile,
     Tickers,
 )
+from trading_bot.options_analysis import OptionRecommendation, recommend_option_contracts
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -91,9 +93,55 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_gex_analysis(analysis, as_json=args.as_json)
             return 0
 
+        if args.command == "alpaca-account":
+            client = _alpaca_client()
+            _print_json_or_summary(client.get_account(), as_json=args.as_json, title="Alpaca paper account")
+            return 0
+
+        if args.command == "alpaca-positions":
+            client = _alpaca_client()
+            _print_positions(client.get_positions(), as_json=args.as_json)
+            return 0
+
+        if args.command == "alpaca-orders":
+            client = _alpaca_client()
+            _print_orders(client.get_orders(status=args.status, limit=args.limit), as_json=args.as_json)
+            return 0
+
+        if args.command == "alpaca-latest-bar":
+            client = _alpaca_client()
+            _print_json_or_summary(client.get_latest_bar(args.symbol, feed=args.feed), as_json=args.as_json, title="Latest bar")
+            return 0
+
+        if args.command == "paper-order":
+            client = _alpaca_client()
+            order = PaperOrderRequest(
+                symbol=args.symbol,
+                side=args.side,
+                qty=args.qty,
+                notional=args.notional,
+                type=args.type,
+                time_in_force=args.time_in_force,
+                limit_price=args.limit_price,
+                stop_price=args.stop_price,
+            )
+            _print_json_or_summary(client.submit_order(order), as_json=args.as_json, title="Submitted paper order")
+            return 0
+
+        if args.command == "option-recommend":
+            gex_analysis = _analyze_ticker(args.ticker, args.period)
+            recommendation = recommend_option_contracts(
+                gex_analysis=gex_analysis,
+                alpaca_client=_alpaca_client(),
+                max_expiration_days=args.max_expiration_days,
+                max_candidates=args.limit,
+            )
+            _print_option_recommendation(recommendation, as_json=args.as_json)
+            return 0
+
         parser.print_help()
         return 2
-    except (GexApiError, ValueError) as exc:
+    except (AlpacaApiError, GexApiError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
@@ -252,11 +300,89 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print raw JSON instead of a report.",
     )
 
+    alpaca_account_parser = subparsers.add_parser("alpaca-account", help="Show Alpaca paper account details.")
+    alpaca_account_parser.add_argument("--json", action="store_true", dest="as_json")
+
+    alpaca_positions_parser = subparsers.add_parser("alpaca-positions", help="Show Alpaca paper positions.")
+    alpaca_positions_parser.add_argument("--json", action="store_true", dest="as_json")
+
+    alpaca_orders_parser = subparsers.add_parser("alpaca-orders", help="Show Alpaca paper orders.")
+    alpaca_orders_parser.add_argument(
+        "--status",
+        choices=("open", "closed", "all"),
+        default="open",
+        help="Order status to fetch. Defaults to open.",
+    )
+    alpaca_orders_parser.add_argument("--limit", type=int, default=50, help="Maximum orders to fetch. Defaults to 50.")
+    alpaca_orders_parser.add_argument("--json", action="store_true", dest="as_json")
+
+    alpaca_bar_parser = subparsers.add_parser("alpaca-latest-bar", help="Fetch Alpaca latest stock minute bar.")
+    alpaca_bar_parser.add_argument("symbol", help="Stock symbol, such as SPY.")
+    alpaca_bar_parser.add_argument("--feed", help="Optional stock data feed, such as iex or sip.")
+    alpaca_bar_parser.add_argument("--json", action="store_true", dest="as_json")
+
+    paper_order_parser = subparsers.add_parser("paper-order", help="Submit an Alpaca paper-trading order.")
+    paper_order_parser.add_argument("symbol", help="Stock symbol, such as SPY.")
+    paper_order_parser.add_argument("side", choices=("buy", "sell"), help="Order side.")
+    quantity = paper_order_parser.add_mutually_exclusive_group(required=True)
+    quantity.add_argument("--qty", type=float, help="Share quantity.")
+    quantity.add_argument("--notional", type=float, help="Dollar notional amount.")
+    paper_order_parser.add_argument(
+        "--type",
+        choices=("market", "limit", "stop", "stop_limit", "trailing_stop"),
+        default="market",
+        help="Order type. Defaults to market.",
+    )
+    paper_order_parser.add_argument(
+        "--time-in-force",
+        choices=("day", "gtc", "opg", "cls", "ioc", "fok"),
+        default="day",
+        help="Time in force. Defaults to day.",
+    )
+    paper_order_parser.add_argument("--limit-price", type=float, help="Limit price for limit or stop-limit orders.")
+    paper_order_parser.add_argument("--stop-price", type=float, help="Stop price for stop or stop-limit orders.")
+    paper_order_parser.add_argument("--json", action="store_true", dest="as_json")
+
+    option_recommend_parser = subparsers.add_parser(
+        "option-recommend",
+        help="Combine GEX and Alpaca options data to rank contract candidates.",
+    )
+    option_recommend_parser.add_argument("ticker", help="GEX ticker symbol, such as AAPL or SPY.")
+    option_recommend_parser.add_argument(
+        "--period",
+        choices=AGGREGATION_PERIODS,
+        default="zero",
+        help="GEX aggregation period. Defaults to zero.",
+    )
+    option_recommend_parser.add_argument(
+        "--max-expiration-days",
+        type=int,
+        default=14,
+        help="Maximum option expiration window. Defaults to 14.",
+    )
+    option_recommend_parser.add_argument("--limit", type=int, default=5, help="Number of candidates to show.")
+    option_recommend_parser.add_argument("--json", action="store_true", dest="as_json")
+
     return parser
 
 
 def _gex_client() -> GexClient:
     return GexClient(Settings.from_env())
+
+
+def _alpaca_client() -> AlpacaClient:
+    return AlpacaClient(AlpacaSettings.from_env())
+
+
+def _analyze_ticker(ticker: str, period: str) -> GexAnalysis:
+    client = _gex_client()
+    return analyze_gex(
+        period=period,
+        classic_major_levels=client.get_gex_major_levels(ticker, period),
+        state_major_levels=client.get_state_gex_major_levels(ticker, period),
+        classic_max_change=client.get_gex_max_change(ticker, period),
+        state_max_change=client.get_state_gex_max_change(ticker, period),
+    )
 
 
 def _print_tickers(tickers: Tickers, group: str | None, as_json: bool) -> None:
@@ -502,6 +628,100 @@ def _format_optional_number(value: float | None) -> str:
     if value is None:
         return "n/a"
     return f"{value:g}"
+
+
+def _print_json_or_summary(payload: dict[str, object], as_json: bool, title: str) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    print(title)
+    for key in ("id", "account_number", "status", "currency", "cash", "buying_power", "portfolio_value"):
+        if key in payload:
+            print(f"{key}: {payload[key]}")
+    if "bars" in payload:
+        print(json.dumps(payload["bars"], indent=2, sort_keys=True))
+    elif "order" in title.lower():
+        for key in ("symbol", "side", "qty", "notional", "type", "time_in_force", "status", "submitted_at"):
+            if key in payload:
+                print(f"{key}: {payload[key]}")
+
+
+def _print_positions(positions: list[dict[str, object]], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(positions, indent=2, sort_keys=True))
+        return
+
+    if not positions:
+        print("No open Alpaca paper positions.")
+        return
+
+    print("symbol      qty       market_value       unrealized_pl")
+    for position in positions:
+        print(
+            f"{str(position.get('symbol', '-')):<8}"
+            f"  {str(position.get('qty', '-')):>8}"
+            f"  {str(position.get('market_value', '-')):>17}"
+            f"  {str(position.get('unrealized_pl', '-')):>14}"
+        )
+
+
+def _print_orders(orders: list[dict[str, object]], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(orders, indent=2, sort_keys=True))
+        return
+
+    if not orders:
+        print("No Alpaca paper orders found.")
+        return
+
+    print("symbol      side      qty/notional      type      status")
+    for order in orders:
+        qty = order.get("qty") or order.get("notional") or "-"
+        print(
+            f"{str(order.get('symbol', '-')):<8}"
+            f"  {str(order.get('side', '-')):<7}"
+            f"  {str(qty):>12}"
+            f"  {str(order.get('type', '-')):<8}"
+            f"  {str(order.get('status', '-'))}"
+        )
+
+
+def _print_option_recommendation(recommendation: OptionRecommendation, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(recommendation.as_dict(), indent=2, sort_keys=True))
+        return
+
+    print(f"{recommendation.ticker} option recommendation")
+    print(f"underlying: {recommendation.underlying_symbol}")
+    print(f"bias: {recommendation.bias}")
+    print(f"trade_permission: {recommendation.trade_permission}")
+    print(f"recommendation: {recommendation.recommendation}")
+    if recommendation.target_level is not None:
+        print(f"gex target level: {recommendation.target_level:g}")
+    for warning in recommendation.warnings:
+        print(f"warning: {warning}")
+
+    if not recommendation.candidates:
+        return
+
+    print()
+    print("symbol                 type   exp          strike      bid      ask      mid    spread%   oi     score")
+    for candidate in recommendation.candidates:
+        spread = "n/a" if candidate.spread_pct is None else f"{candidate.spread_pct:.1%}"
+        oi = "n/a" if candidate.open_interest is None else str(candidate.open_interest)
+        print(
+            f"{candidate.symbol:<22}"
+            f" {candidate.contract_type:<5}"
+            f" {candidate.expiration_date:<10}"
+            f" {candidate.strike_price:>8g}"
+            f" {candidate.bid:>8.2f}"
+            f" {candidate.ask:>8.2f}"
+            f" {candidate.mid:>8.2f}"
+            f" {spread:>9}"
+            f" {oi:>6}"
+            f" {candidate.score:>8.1f}"
+        )
 
 
 if __name__ == "__main__":

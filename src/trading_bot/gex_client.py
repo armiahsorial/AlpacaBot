@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 from urllib.parse import quote
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -22,6 +25,10 @@ STATE_GREEKS = (
     "charm_one",
     "vanna_one",
 )
+MARKET_TZ = ZoneInfo("America/New_York")
+HISTORY_CACHE_DIR = Path.cwd() / ".cache" / "gexbot_history"
+_HISTORICAL_ROWS_CACHE: dict[str, list[dict[str, Any]]] = {}
+_HISTORICAL_ROW_CACHE: dict[str, dict[str, Any]] = {}
 
 
 class GexApiError(RuntimeError):
@@ -411,6 +418,39 @@ class GexClient:
 
         return StateGreekProfile.from_json(payload)
 
+    def get_historical_gex_inputs(
+        self,
+        ticker: str,
+        aggregation_period: str,
+        replay_date: str,
+        replay_time: str,
+    ) -> tuple[GexMajorLevels, GexMajorLevels, GexMaxChange, GexMaxChange]:
+        ticker, aggregation_period = _normalize_ticker_and_period(ticker, aggregation_period)
+        target_timestamp = _market_timestamp(replay_date, replay_time)
+        classic_chain = self._get_historical_chain(ticker, "classic", aggregation_period, replay_date, target_timestamp)
+        state_chain = self._get_historical_chain(ticker, "state", aggregation_period, replay_date, target_timestamp)
+        return (
+            _major_levels_from_chain(classic_chain),
+            _major_levels_from_chain(state_chain),
+            _max_change_from_chain(classic_chain),
+            _max_change_from_chain(state_chain),
+        )
+
+    def validate_historical_gex_date(self, ticker: str, aggregation_period: str, replay_date: str) -> dict[str, Any]:
+        ticker, aggregation_period = _normalize_ticker_and_period(ticker, aggregation_period)
+        safe_ticker = quote(ticker, safe="")
+        safe_period = quote(aggregation_period, safe="")
+
+        classic_payload = self._get_json(f"/hist/{safe_ticker}/classic/{safe_period}/{quote(replay_date, safe='')}?noredirect")
+        state_payload = self._get_json(f"/hist/{safe_ticker}/state/{safe_period}/{quote(replay_date, safe='')}?noredirect")
+        return {
+            "ticker": ticker,
+            "period": aggregation_period,
+            "date": replay_date,
+            "classic_available": isinstance(classic_payload, dict) and isinstance(classic_payload.get("url"), str),
+            "state_available": isinstance(state_payload, dict) and isinstance(state_payload.get("url"), str),
+        }
+
     def _get_json(self, path: str) -> Any:
         request = Request(
             url=f"{self._settings.base_url}{path}",
@@ -437,6 +477,120 @@ class GexClient:
             return json.loads(body)
         except json.JSONDecodeError as exc:
             raise GexApiError("GEX API returned invalid JSON.") from exc
+
+    def _get_historical_chain(
+        self,
+        ticker: str,
+        mode: str,
+        aggregation_period: str,
+        replay_date: str,
+        target_timestamp: int,
+    ) -> GexChain:
+        safe_ticker = quote(ticker, safe="")
+        safe_mode = quote(mode, safe="")
+        safe_period = quote(aggregation_period, safe="")
+        safe_date = quote(replay_date, safe="")
+        history_key = f"{ticker}:{mode}:{aggregation_period}:{replay_date}"
+        row_key = f"{history_key}:{target_timestamp}"
+        rows = _HISTORICAL_ROWS_CACHE.get(history_key)
+        if rows is None:
+            rows = _read_disk_history_cache(history_key)
+        if rows is not None:
+            selected = _select_historical_row(rows, target_timestamp)
+            return GexChain.from_json(selected)
+
+        selected = _HISTORICAL_ROW_CACHE.get(row_key) or _read_disk_history_row(row_key)
+        if selected is None:
+            payload = self._get_json(f"/hist/{safe_ticker}/{safe_mode}/{safe_period}/{safe_date}?noredirect")
+            if not isinstance(payload, dict) or not isinstance(payload.get("url"), str):
+                raise GexApiError("Expected GEX historical endpoint to return a signed URL.")
+
+            selected = self._get_signed_history_row(payload["url"], target_timestamp)
+            _HISTORICAL_ROW_CACHE[row_key] = selected
+            _write_disk_history_row(row_key, selected)
+        return GexChain.from_json(selected)
+
+    def _get_signed_history_rows(self, url: str) -> list[dict[str, Any]]:
+        try:
+            with urlopen(url, timeout=max(self._settings.timeout_seconds, 120.0)) as response:
+                body = response.read().decode("utf-8")
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise GexApiError(f"GEX historical file request failed with HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise GexApiError(f"GEX historical file request failed: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise GexApiError("GEX historical file request timed out.") from exc
+
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise GexApiError("GEX historical file returned invalid JSON.") from exc
+
+        if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
+            raise GexApiError("Expected GEX historical file to contain an array of rows.")
+        return payload
+
+    def _get_signed_history_row(self, url: str, target_timestamp: int) -> dict[str, Any]:
+        decoder = json.JSONDecoder()
+        buffer = ""
+        selected: dict[str, Any] | None = None
+        first_row: dict[str, Any] | None = None
+        array_started = False
+
+        try:
+            with urlopen(url, timeout=max(self._settings.timeout_seconds, 120.0)) as response:
+                while True:
+                    chunk = response.read(65536).decode("utf-8", errors="replace")
+                    if not chunk:
+                        break
+                    buffer += chunk
+
+                    while True:
+                        buffer = buffer.lstrip()
+                        if not array_started:
+                            if not buffer:
+                                break
+                            if buffer[0] != "[":
+                                raise GexApiError("Expected GEX historical file to contain a JSON array.")
+                            buffer = buffer[1:]
+                            array_started = True
+                            continue
+
+                        buffer = buffer.lstrip()
+                        if buffer.startswith(","):
+                            buffer = buffer[1:]
+                            continue
+                        if buffer.startswith("]"):
+                            return selected or first_row or _raise_no_historical_rows()
+                        if not buffer:
+                            break
+
+                        try:
+                            row, end_index = decoder.raw_decode(buffer)
+                        except json.JSONDecodeError:
+                            break
+
+                        if not isinstance(row, dict):
+                            raise GexApiError("Expected GEX historical rows to be JSON objects.")
+                        first_row = first_row or row
+
+                        timestamp = row.get("timestamp")
+                        if isinstance(timestamp, int) and timestamp <= target_timestamp:
+                            selected = row
+                        elif selected is not None:
+                            return selected
+
+                        buffer = buffer[end_index:]
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise GexApiError(f"GEX historical file request failed with HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise GexApiError(f"GEX historical file request failed: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise GexApiError("GEX historical file request timed out.") from exc
+
+        return selected or first_row or _raise_no_historical_rows()
 
 
 def _read_symbol_list(payload: dict[str, Any], field_name: str) -> tuple[str, ...]:
@@ -490,3 +644,128 @@ def _read_pair(value: Any, field_name: str) -> tuple[float, float]:
     if not isinstance(value, list) or len(value) != 2:
         raise GexApiError(f"Expected '{field_name}' entries to be [strike, value].")
     return (_read_number(value[0], field_name), _read_number(value[1], field_name))
+
+
+def _major_levels_from_chain(chain: GexChain) -> GexMajorLevels:
+    return GexMajorLevels(
+        timestamp=chain.timestamp,
+        ticker=chain.ticker,
+        spot=chain.spot,
+        mpos_vol=chain.major_pos_vol,
+        mpos_oi=chain.major_pos_oi,
+        mneg_vol=chain.major_neg_vol,
+        mneg_oi=chain.major_neg_oi,
+        zero_gamma=chain.zero_gamma,
+        net_gex_vol=chain.sum_gex_vol,
+        net_gex_oi=chain.sum_gex_oi,
+    )
+
+
+def _max_change_from_chain(chain: GexChain) -> GexMaxChange:
+    priors = list(chain.max_priors)
+    while len(priors) < 6:
+        priors.append((0.0, 0.0))
+
+    return GexMaxChange(
+        timestamp=chain.timestamp,
+        ticker=chain.ticker,
+        current=GexChange(strike=priors[0][0], value=priors[0][1]),
+        one=GexChange(strike=priors[1][0], value=priors[1][1]),
+        five=GexChange(strike=priors[2][0], value=priors[2][1]),
+        ten=GexChange(strike=priors[3][0], value=priors[3][1]),
+        fifteen=GexChange(strike=priors[4][0], value=priors[4][1]),
+        thirty=GexChange(strike=priors[5][0], value=priors[5][1]),
+    )
+
+
+def _select_historical_row(rows: list[dict[str, Any]], target_timestamp: int) -> dict[str, Any]:
+    selected: dict[str, Any] | None = None
+    for row in rows:
+        timestamp = row.get("timestamp")
+        if not isinstance(timestamp, int):
+            continue
+        if timestamp <= target_timestamp:
+            selected = row
+        elif selected is not None:
+            break
+
+    if selected is not None:
+        return selected
+
+    for row in rows:
+        if isinstance(row.get("timestamp"), int):
+            return row
+
+    raise GexApiError("GEX historical rows did not include timestamps.")
+
+
+def _market_timestamp(day: str, clock: str) -> int:
+    parts = [int(part) for part in clock.split(":")]
+    if len(parts) == 2:
+        hour, minute = parts
+        second = 0
+    elif len(parts) == 3:
+        hour, minute, second = parts
+    else:
+        raise ValueError("time must use HH:MM or HH:MM:SS.")
+    value = datetime.fromisoformat(day).replace(hour=hour, minute=minute, second=second, microsecond=0, tzinfo=MARKET_TZ)
+    return int(value.timestamp())
+
+
+def _read_disk_history_cache(history_key: str) -> list[dict[str, Any]] | None:
+    path = _history_cache_path(history_key)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
+        return None
+    _HISTORICAL_ROWS_CACHE[history_key] = payload
+    return payload
+
+
+def _read_disk_history_row(row_key: str) -> dict[str, Any] | None:
+    path = _history_row_cache_path(row_key)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    _HISTORICAL_ROW_CACHE[row_key] = payload
+    return payload
+
+
+def _write_disk_history_cache(history_key: str, rows: list[dict[str, Any]]) -> None:
+    try:
+        HISTORY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _history_cache_path(history_key).write_text(json.dumps(rows), encoding="utf-8")
+    except OSError:
+        return
+
+
+def _write_disk_history_row(row_key: str, row: dict[str, Any]) -> None:
+    try:
+        path = _history_row_cache_path(row_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(row), encoding="utf-8")
+    except OSError:
+        return
+
+
+def _history_cache_path(history_key: str) -> Path:
+    safe_name = history_key.replace(":", "_").replace("/", "_")
+    return HISTORY_CACHE_DIR / f"{safe_name}.json"
+
+
+def _history_row_cache_path(row_key: str) -> Path:
+    safe_name = row_key.replace(":", "_").replace("/", "_")
+    return HISTORY_CACHE_DIR / "rows" / f"{safe_name}.json"
+
+
+def _raise_no_historical_rows() -> dict[str, Any]:
+    raise GexApiError("No GEX historical rows found in historical file.")

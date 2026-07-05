@@ -12,6 +12,7 @@ from trading_bot.gex_client import GexMajorLevels, GexMaxChange
 class GexAnalysis:
     ticker: str
     period: str
+    timestamp: int
     spot: float
     zero_gamma: float
     score: int
@@ -45,6 +46,7 @@ class GexAnalysis:
         return {
             "ticker": self.ticker,
             "period": self.period,
+            "timestamp": self.timestamp,
             "spot": self.spot,
             "zero_gamma": self.zero_gamma,
             "score": self.score,
@@ -178,6 +180,7 @@ def analyze_gex(
     return GexAnalysis(
         ticker=classic_major_levels.ticker,
         period=period,
+        timestamp=classic_major_levels.timestamp,
         spot=spot,
         zero_gamma=zero_gamma,
         score=score,

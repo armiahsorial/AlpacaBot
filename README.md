@@ -31,6 +31,15 @@ GEX_USER_AGENT=trading_bot/0.1.0
 GEX_TIMEOUT_SECONDS=20
 ```
 
+To connect an Alpaca paper trading account, add your paper API keys:
+
+```env
+APCA_API_KEY_ID=your-alpaca-paper-key-id
+APCA_API_SECRET_KEY=your-alpaca-paper-secret-key
+ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
+ALPACA_DATA_BASE_URL=https://data.alpaca.markets
+```
+
 Environment variables from your shell override values in `.env`.
 
 ## Usage
@@ -151,6 +160,31 @@ Raw JSON output:
 trading-bot analyze SPX --period zero --json
 ```
 
+Show Alpaca paper account details:
+
+```bash
+trading-bot alpaca-account
+```
+
+Show current paper positions and orders:
+
+```bash
+trading-bot alpaca-positions
+trading-bot alpaca-orders --status open
+```
+
+Fetch Alpaca stock market data:
+
+```bash
+trading-bot alpaca-latest-bar SPY
+```
+
+Submit an Alpaca paper order:
+
+```bash
+trading-bot paper-order SPY buy --qty 1
+```
+
 Start the local web interface:
 
 ```bash
@@ -164,6 +198,7 @@ http://127.0.0.1:8765
 ```
 
 The web UI includes a strike map, call/put watch-zone pointers, and optional auto-refresh.
+When Alpaca paper keys are configured, the web UI also shows paper account state, positions, latest stock bar lookup, and a manual paper order ticket.
 
 Fetch slim classic GEX major levels:
 

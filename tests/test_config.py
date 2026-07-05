@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from trading_bot.config import Settings
+from trading_bot.config import AlpacaSettings, Settings
 
 
 class SettingsTests(unittest.TestCase):
@@ -62,6 +62,36 @@ class SettingsTests(unittest.TestCase):
                 settings = Settings.from_env(env_file)
 
         self.assertEqual(settings.api_key, "from-env")
+
+    def test_alpaca_from_env_reads_paper_keys(self):
+        env = {
+            "APCA_API_KEY_ID": "paper-key",
+            "APCA_API_SECRET_KEY": "paper-secret",
+            "ALPACA_PAPER_BASE_URL": "https://paper.example.test/",
+            "ALPACA_DATA_BASE_URL": "https://data.example.test/",
+            "ALPACA_TIMEOUT_SECONDS": "7",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            settings = AlpacaSettings.from_env(None)
+
+        self.assertEqual(settings.api_key_id, "paper-key")
+        self.assertEqual(settings.api_secret_key, "paper-secret")
+        self.assertEqual(settings.paper_base_url, "https://paper.example.test")
+        self.assertEqual(settings.data_base_url, "https://data.example.test")
+        self.assertEqual(settings.timeout_seconds, 7.0)
+
+    def test_alpaca_from_env_accepts_alpaca_key_aliases(self):
+        env = {
+            "ALPACA_API_KEY_ID": "paper-key",
+            "ALPACA_API_SECRET_KEY": "paper-secret",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            settings = AlpacaSettings.from_env(None)
+
+        self.assertEqual(settings.api_key_id, "paper-key")
+        self.assertEqual(settings.api_secret_key, "paper-secret")
 
 if __name__ == "__main__":
     unittest.main()

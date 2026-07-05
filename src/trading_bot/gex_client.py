@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +30,9 @@ MARKET_TZ = ZoneInfo("America/New_York")
 HISTORY_CACHE_DIR = Path.cwd() / ".cache" / "gexbot_history"
 _HISTORICAL_ROWS_CACHE: dict[str, list[dict[str, Any]]] = {}
 _HISTORICAL_ROW_CACHE: dict[str, dict[str, Any]] = {}
+_HISTORICAL_URL_CACHE: dict[str, str] = {}
+_GEX_HISTORY_RATE_LIMITED_UNTIL = 0.0
+GEX_HISTORY_RATE_LIMIT_COOLDOWN_SECONDS = 60 * 60
 
 
 class GexApiError(RuntimeError):
@@ -452,6 +456,14 @@ class GexClient:
         }
 
     def _get_json(self, path: str) -> Any:
+        global _GEX_HISTORY_RATE_LIMITED_UNTIL
+        if path.startswith("/hist/") and time.time() < _GEX_HISTORY_RATE_LIMITED_UNTIL:
+            remaining = int(_GEX_HISTORY_RATE_LIMITED_UNTIL - time.time())
+            raise GexApiError(
+                "GEX historical replay is cooling down after a rate-limit response. "
+                f"Try again in about {max(1, remaining // 60)} minutes."
+            )
+
         request = Request(
             url=f"{self._settings.base_url}{path}",
             method="GET",
@@ -467,6 +479,8 @@ class GexClient:
                 body = response.read().decode("utf-8")
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code == 429 and path.startswith("/hist/"):
+                _GEX_HISTORY_RATE_LIMITED_UNTIL = time.time() + GEX_HISTORY_RATE_LIMIT_COOLDOWN_SECONDS
             raise GexApiError(f"GEX API request failed with HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
             raise GexApiError(f"GEX API request failed: {exc.reason}") from exc
@@ -501,14 +515,51 @@ class GexClient:
 
         selected = _HISTORICAL_ROW_CACHE.get(row_key) or _read_disk_history_row(row_key)
         if selected is None:
-            payload = self._get_json(f"/hist/{safe_ticker}/{safe_mode}/{safe_period}/{safe_date}?noredirect")
-            if not isinstance(payload, dict) or not isinstance(payload.get("url"), str):
-                raise GexApiError("Expected GEX historical endpoint to return a signed URL.")
+            url = self._get_historical_signed_url(
+                history_key=history_key,
+                safe_ticker=safe_ticker,
+                safe_mode=safe_mode,
+                safe_period=safe_period,
+                safe_date=safe_date,
+            )
 
-            selected = self._get_signed_history_row(payload["url"], target_timestamp)
+            try:
+                selected = self._get_signed_history_row(url, target_timestamp)
+            except GexApiError as exc:
+                if not _is_expired_signed_url_error(exc):
+                    raise
+                _HISTORICAL_URL_CACHE.pop(history_key, None)
+                url = self._get_historical_signed_url(
+                    history_key=history_key,
+                    safe_ticker=safe_ticker,
+                    safe_mode=safe_mode,
+                    safe_period=safe_period,
+                    safe_date=safe_date,
+                )
+                selected = self._get_signed_history_row(url, target_timestamp)
             _HISTORICAL_ROW_CACHE[row_key] = selected
             _write_disk_history_row(row_key, selected)
         return GexChain.from_json(selected)
+
+    def _get_historical_signed_url(
+        self,
+        *,
+        history_key: str,
+        safe_ticker: str,
+        safe_mode: str,
+        safe_period: str,
+        safe_date: str,
+    ) -> str:
+        url = _HISTORICAL_URL_CACHE.get(history_key)
+        if url is not None:
+            return url
+
+        payload = self._get_json(f"/hist/{safe_ticker}/{safe_mode}/{safe_period}/{safe_date}?noredirect")
+        if not isinstance(payload, dict) or not isinstance(payload.get("url"), str):
+            raise GexApiError("Expected GEX historical endpoint to return a signed URL.")
+        url = payload["url"]
+        _HISTORICAL_URL_CACHE[history_key] = url
+        return url
 
     def _get_signed_history_rows(self, url: str) -> list[dict[str, Any]]:
         try:
@@ -697,6 +748,18 @@ def _select_historical_row(rows: list[dict[str, Any]], target_timestamp: int) ->
             return row
 
     raise GexApiError("GEX historical rows did not include timestamps.")
+
+
+def _is_expired_signed_url_error(error: GexApiError) -> bool:
+    message = str(error).lower()
+    return (
+        "http 403" in message
+        and (
+            "authenticationfailed" in message
+            or "signed expiry time" in message
+            or "server failed to authenticate the request" in message
+        )
+    )
 
 
 def _market_timestamp(day: str, clock: str) -> int:

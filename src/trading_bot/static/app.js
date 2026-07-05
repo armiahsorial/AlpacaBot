@@ -14,9 +14,17 @@ const replayDate = document.querySelector("#replay-date");
 const replayTime = document.querySelector("#replay-time");
 const replayClock = document.querySelector("#replay-clock");
 const replayPlay = document.querySelector("#replay-play");
+const replayRefresh = document.querySelector("#replay-refresh");
+const replayToday = document.querySelector("#replay-today");
+const stageBestPickButton = document.querySelector("#stage-best-pick");
+const clearTradeHistoryButton = document.querySelector("#clear-trade-history");
 const speedButtons = document.querySelectorAll("[data-speed]");
 const barSymbol = document.querySelector("#bar-symbol");
 const latestBar = document.querySelector("#latest-bar");
+const metricTooltip = document.createElement("div");
+metricTooltip.className = "metric-tooltip";
+metricTooltip.setAttribute("role", "tooltip");
+document.body.appendChild(metricTooltip);
 let refreshTimer = null;
 let replayTimer = null;
 let replaySpeed = 1;
@@ -25,6 +33,14 @@ let isAnalysisRunning = false;
 let isInspectingContract = false;
 let isReplayLoading = false;
 let replayAbortController = null;
+let lastReplayFetchSecond = null;
+let lastReplayFetchStartedAt = 0;
+let currentBestPick = null;
+const REPLAY_FETCH_STEP_SECONDS = 300;
+const REPLAY_MIN_FETCH_INTERVAL_MS = 5000;
+const TRADE_HISTORY_STORAGE_KEY = "tradingBot.tradePermissionHistory";
+const MAX_TRADE_HISTORY_ITEMS = 100;
+const PACIFIC_TO_EASTERN_SECONDS = 3 * 60 * 60;
 
 const fields = {
   tradePermission: document.querySelector("#trade-permission"),
@@ -64,6 +80,11 @@ const fields = {
   positionsList: document.querySelector("#positions-list"),
   contractSummary: document.querySelector("#contract-summary"),
   contractList: document.querySelector("#contract-list"),
+  bestPick: document.querySelector("#best-pick"),
+  bestPickAction: document.querySelector("#best-pick-action"),
+  bestPickContract: document.querySelector("#best-pick-contract"),
+  bestPickReason: document.querySelector("#best-pick-reason"),
+  tradeHistory: document.querySelector("#trade-history"),
 };
 
 form.addEventListener("submit", async (event) => {
@@ -106,6 +127,7 @@ loadContractsButton.addEventListener("click", () => {
 });
 
 replayDate.addEventListener("change", () => {
+  renderTradeHistory();
   loadOptionReplay();
 });
 
@@ -120,6 +142,57 @@ replayTime.addEventListener("change", () => {
 replayPlay.addEventListener("click", () => {
   toggleReplay();
 });
+
+replayRefresh.addEventListener("click", () => {
+  loadOptionReplay({ force: true });
+});
+
+replayToday.addEventListener("click", () => {
+  jumpToTodayNow();
+});
+
+stageBestPickButton.addEventListener("click", () => {
+  if (!currentBestPick) {
+    return;
+  }
+  stageCandidate(currentBestPick.candidate, currentBestPick.entryPrice, currentBestPick.message);
+});
+
+clearTradeHistoryButton.addEventListener("click", () => {
+  saveTradeHistory([]);
+  renderTradeHistory();
+});
+
+document.addEventListener("pointerover", (event) => {
+  const target = event.target.closest(".info-dot");
+  if (target) {
+    showMetricTooltip(target);
+  }
+});
+
+document.addEventListener("pointerout", (event) => {
+  const target = event.target.closest(".info-dot");
+  if (target) {
+    hideMetricTooltip();
+  }
+});
+
+document.addEventListener("focusin", (event) => {
+  const target = event.target.closest(".info-dot");
+  if (target) {
+    showMetricTooltip(target);
+  }
+});
+
+document.addEventListener("focusout", (event) => {
+  const target = event.target.closest(".info-dot");
+  if (target) {
+    hideMetricTooltip();
+  }
+});
+
+window.addEventListener("scroll", hideMetricTooltip, { passive: true });
+window.addEventListener("resize", hideMetricTooltip);
 
 for (const speedButton of speedButtons) {
   speedButton.addEventListener("click", () => {
@@ -163,7 +236,7 @@ async function runAnalysis({ isRefresh = false } = {}) {
     lastAnalysis = payload;
     renderAnalysis(payload);
     if (!isRefresh && !isInspectingContract) {
-      loadOptionRecommendation();
+      await loadOptionRecommendation();
     }
     setStatus(`Updated ${ticker} ${period} at ${new Date().toLocaleTimeString()}.`, false);
   } catch (error) {
@@ -247,6 +320,7 @@ runAnalysis();
 scheduleRefresh();
 refreshAlpaca();
 initializeReplayControls();
+renderTradeHistory();
 
 function renderStrikeChart(analysis) {
   const points = [
@@ -467,6 +541,7 @@ async function loadOptionRecommendation() {
   fields.contractSummary.textContent = "Scanning Alpaca options...";
   fields.contractSummary.classList.remove("error");
   fields.contractList.textContent = "-";
+  resetBestPick();
 
   try {
     const query = new URLSearchParams({
@@ -480,10 +555,11 @@ async function loadOptionRecommendation() {
   } catch (error) {
     fields.contractSummary.textContent = error.message;
     fields.contractSummary.classList.add("error");
+    resetBestPick();
   }
 }
 
-async function loadOptionReplay() {
+async function loadOptionReplay({ force = false } = {}) {
   if (isReplayLoading) {
     if (replayAbortController) {
       replayAbortController.abort();
@@ -498,30 +574,37 @@ async function loadOptionReplay() {
   scheduleRefresh();
   const { ticker, period } = getFormValues();
   updateReplayClock();
+  const replaySecond = Number(replayTime.value || 57540);
+  const now = Date.now();
+  if (
+    !force &&
+    lastReplayFetchSecond !== null &&
+    Math.abs(replaySecond - lastReplayFetchSecond) < REPLAY_FETCH_STEP_SECONDS
+  ) {
+    isReplayLoading = false;
+    replayAbortController = null;
+    fields.contractSummary.textContent = `Clock updated to ${replayClock.textContent} PT. Press Update Data to rescore this exact second.`;
+    return;
+  }
+  if (!force && now - lastReplayFetchStartedAt < REPLAY_MIN_FETCH_INTERVAL_MS) {
+    isReplayLoading = false;
+    replayAbortController = null;
+    return;
+  }
+  lastReplayFetchStartedAt = now;
+
   fields.contractSummary.textContent =
     "Loading historical GEX and Alpaca option bars. First load for a ticker/date can take a minute or two...";
   fields.contractSummary.classList.remove("error");
   fields.contractList.textContent = "-";
+  resetBestPick();
 
   try {
-    const validationQuery = new URLSearchParams({
-      ticker,
-      period,
-      date: replayDate.value,
-    });
-    const validation = await getJsonWithTimeout(`/api/options/replay/validate?${validationQuery.toString()}`, {
-      signal: replayAbortController.signal,
-      timeoutMs: 20000,
-    });
-    if (!validation.valid) {
-      throw new Error(validation.error || `No GEX replay data found for ${ticker} ${period} on ${replayDate.value}.`);
-    }
-
     const query = new URLSearchParams({
       ticker,
       period,
       date: replayDate.value,
-      time: replayClock.textContent,
+      time: getReplayMarketClock(),
       max_expiration_days: "14",
       limit: "5",
     });
@@ -529,6 +612,7 @@ async function loadOptionReplay() {
       signal: replayAbortController.signal,
       timeoutMs: 90000,
     });
+    lastReplayFetchSecond = replaySecond;
     renderOptionReplay(payload);
   } catch (error) {
     if (error.name === "AbortError") {
@@ -536,6 +620,7 @@ async function loadOptionReplay() {
     } else {
       fields.contractSummary.textContent = error.message;
       fields.contractSummary.classList.add("error");
+      resetBestPick();
     }
   } finally {
     isReplayLoading = false;
@@ -547,8 +632,14 @@ function renderOptionReplay(payload) {
   const recommendation = payload.recommendation || {};
   const warning = payload.warning ? ` ${payload.warning}` : "";
   const gexTime = recommendation.gex_timestamp ? ` GEX ${new Date(recommendation.gex_timestamp * 1000).toLocaleTimeString()}.` : "";
+  if (payload.analysis) {
+    lastAnalysis = payload.analysis;
+    renderAnalysis(payload.analysis);
+    setStatus(`Replay GEX map updated for ${payload.date} ${replayClock.textContent} Pacific time.`, false);
+  }
   fields.contractSummary.classList.toggle("error", Boolean(payload.warning));
-  fields.contractSummary.textContent = `${payload.date} ${payload.selected_time}: ${recommendation.recommendation || "No recommendation."}${gexTime}${warning}`;
+  fields.contractSummary.textContent = `${payload.date} ${replayClock.textContent} PT: ${recommendation.recommendation || "No recommendation."}${gexTime}${warning}`;
+  renderBestPick(payload, "replay");
 
   if (!payload.candidates || payload.candidates.length === 0) {
     fields.contractList.textContent = "No replay bars found for this time.";
@@ -559,46 +650,101 @@ function renderOptionReplay(payload) {
   for (const candidate of payload.candidates) {
     const row = document.createElement("button");
     row.type = "button";
-    row.className = "contract-row";
+    row.className = `contract-row contract-${contractSide(candidate)}`;
     row.innerHTML = `
-      <span><strong>${candidate.symbol}</strong><em>${candidate.expiration_date} ${formatNumber(candidate.strike_price)} ${candidate.contract_type}</em></span>
-      <span>${formatCurrency(candidate.close)}</span>
-      <span>${formatPercent(candidate.day_change_pct)}</span>
-      <span>${formatNumber(candidate.volume || 0)} vol</span>
-      <span>${formatNumber(candidate.replay_score)}</span>
+      ${contractTitleMarkup(candidate)}
+      ${contractMetric("Price", formatCurrency(candidate.close), "What this option was worth at the selected replay time. This is the old market price, not today's price.")}
+      ${contractMetric("Day", formatPercent(candidate.day_change_pct), "How much this option had moved that day by the selected replay time. Positive means it was up; negative means it was down.")}
+      ${contractMetric("Volume", formatNumber(candidate.volume || 0), "How many of this exact option traded in the latest 1-minute bar. Thin liquidity: 1-10 contracts. Healthier/thicker activity: hundreds or thousands in a minute.")}
+      ${contractMetric("Replay score", formatNumber(candidate.replay_score), "The bot's replay rank. It starts with the contract quality score, then adds what happened to price and volume during that historical day. Higher means it ranked better.")}
+      <small>${formatGreek("delta", candidate.delta)} ${formatGreek("gamma", candidate.gamma)} ${formatGreek("iv", candidate.implied_volatility)}</small>
     `;
     row.addEventListener("click", () => {
       isInspectingContract = true;
       autoRefresh.checked = false;
       scheduleRefresh();
-      paperOrderForm.elements.symbol.value = candidate.symbol;
-      paperOrderForm.elements.side.value = "buy";
-      paperOrderForm.elements.qty.value = "1";
-      paperOrderForm.elements.type.value = "limit";
-      paperOrderForm.elements.limit_price.value = candidate.close ? Number(candidate.close).toFixed(2) : "";
-      setAlpacaStatus(`Staged ${candidate.symbol} from replay at ${payload.selected_time}.`, false);
+      stageCandidate(candidate, candidate.close, `Staged ${candidate.symbol} from replay at ${replayClock.textContent} PT.`);
     });
     fields.contractList.appendChild(row);
   }
 }
 
 function initializeReplayControls() {
-  const today = new Date();
+  const today = new Date(`${currentPacificDate()}T12:00:00`);
   const priorDay = new Date(today);
   priorDay.setDate(today.getDate() - 1);
   while (priorDay.getDay() === 0 || priorDay.getDay() === 6) {
     priorDay.setDate(priorDay.getDate() - 1);
   }
-  replayDate.value = priorDay.toISOString().slice(0, 10);
+  replayDate.value = formatDateInput(priorDay);
   updateReplayClock();
   for (const button of speedButtons) {
     button.classList.toggle("active", Number(button.dataset.speed) === replaySpeed);
   }
 }
 
+function currentPacificDate() {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Los_Angeles",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const part = (type) => parts.find((item) => item.type === type)?.value || "01";
+  return `${part("year")}-${part("month")}-${part("day")}`;
+}
+
+function formatDateInput(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
 function updateReplayClock() {
-  const seconds = Number(replayTime.value || 57540);
+  const seconds = Number(replayTime.value || 46740);
   replayClock.textContent = formatClock(seconds);
+}
+
+function getReplayMarketClock() {
+  return formatClock(Number(replayTime.value || 46740) + PACIFIC_TO_EASTERN_SECONDS);
+}
+
+async function jumpToTodayNow() {
+  const now = new Date();
+  const pacificParts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Los_Angeles",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(now);
+  const part = (type) => pacificParts.find((item) => item.type === type)?.value || "00";
+  const marketDate = `${part("year")}-${part("month")}-${part("day")}`;
+  const pacificSeconds = Number(part("hour")) * 3600 + Number(part("minute")) * 60 + Number(part("second"));
+  const min = Number(replayTime.min);
+  const max = Number(replayTime.max);
+  const clampedSeconds = Math.min(Math.max(pacificSeconds, min), max);
+
+  replayDate.value = marketDate;
+  replayTime.value = String(clampedSeconds);
+  lastReplayFetchSecond = null;
+  updateReplayClock();
+  renderTradeHistory();
+
+  const isMarketHours = pacificSeconds >= min && pacificSeconds <= max;
+  if (isMarketHours) {
+    isInspectingContract = false;
+    await runAnalysis();
+    setStatus(`Live view updated to today at ${replayClock.textContent} Pacific time.`, false);
+    return;
+  }
+
+  setStatus(`Market is outside regular hours. Showing nearest replay point for ${marketDate} ${replayClock.textContent} Pacific time.`, false);
+  await loadOptionReplay({ force: true });
 }
 
 function toggleReplay() {
@@ -615,12 +761,18 @@ function toggleReplay() {
   replayPlay.textContent = "Pause";
   replayTimer = setInterval(() => {
     if (isReplayLoading) {
+      const nextValue = Math.min(Number(replayTime.value) + replaySpeed, Number(replayTime.max));
+      replayTime.value = String(nextValue);
+      updateReplayClock();
       return;
     }
-    const nextValue = Math.min(Number(replayTime.value) + replaySpeed, Number(replayTime.max));
+    const previousValue = Number(replayTime.value);
+    const nextValue = Math.min(previousValue + replaySpeed, Number(replayTime.max));
     replayTime.value = String(nextValue);
     updateReplayClock();
-    loadOptionReplay();
+    if (Math.floor(previousValue / REPLAY_FETCH_STEP_SECONDS) !== Math.floor(nextValue / REPLAY_FETCH_STEP_SECONDS)) {
+      loadOptionReplay();
+    }
     if (nextValue >= Number(replayTime.max)) {
       toggleReplay();
     }
@@ -641,6 +793,7 @@ function renderOptionRecommendation(payload) {
   if (payload.warnings && payload.warnings.length > 0) {
     fields.contractSummary.textContent += ` ${payload.warnings.join(" ")}`;
   }
+  renderBestPick(payload, "live");
 
   if (!payload.candidates || payload.candidates.length === 0) {
     fields.contractList.textContent = "No contract candidates.";
@@ -651,27 +804,349 @@ function renderOptionRecommendation(payload) {
   for (const candidate of payload.candidates) {
     const row = document.createElement("button");
     row.type = "button";
-    row.className = "contract-row";
+    row.className = `contract-row contract-${contractSide(candidate)}`;
     row.innerHTML = `
-      <span><strong>${candidate.symbol}</strong><em>${candidate.expiration_date} ${formatNumber(candidate.strike_price)} ${candidate.contract_type}</em></span>
-      <span>${formatCurrency(candidate.mid)}</span>
-      <span>${formatPercent(candidate.spread_pct)}</span>
-      <span>${candidate.open_interest ?? "n/a"} OI</span>
-      <span>${formatNumber(candidate.score)}</span>
+      ${contractTitleMarkup(candidate)}
+      ${contractMetric("Mid", formatCurrency(candidate.mid), "The middle between what buyers are bidding and sellers are asking. Think of it as a fair reference price, not a guaranteed fill.")}
+      ${contractMetric("Spread", formatPercent(candidate.spread_pct), "The gap between buy and sell prices. Smaller is usually better because it may cost less to enter and exit.")}
+      ${contractMetric("Open int", candidate.open_interest ?? "n/a", "How many of this option are still open in the market. Bigger usually means more people are involved and the option may be easier to trade.")}
+      ${contractMetric("Score", formatNumber(candidate.score), "The bot's quality rank for this contract. It favors options near the GEX target, with tighter pricing and better activity.")}
+      <small>${formatGreek("delta", candidate.delta)} ${formatGreek("gamma", candidate.gamma)} ${formatGreek("iv", candidate.implied_volatility)}</small>
     `;
     row.addEventListener("click", () => {
       isInspectingContract = true;
       autoRefresh.checked = false;
       scheduleRefresh();
-      paperOrderForm.elements.symbol.value = candidate.symbol;
-      paperOrderForm.elements.side.value = "buy";
-      paperOrderForm.elements.qty.value = "1";
-      paperOrderForm.elements.type.value = "limit";
-      paperOrderForm.elements.limit_price.value = candidate.mid ? candidate.mid.toFixed(2) : "";
-      setAlpacaStatus(`Staged ${candidate.symbol} as a paper limit order.`, false);
+      stageCandidate(candidate, candidate.mid, `Staged ${candidate.symbol} as a paper limit order.`);
     });
     fields.contractList.appendChild(row);
   }
+}
+
+function renderBestPick(payload, mode) {
+  const recommendation = mode === "replay" ? payload.recommendation || {} : payload;
+  const candidate = (payload.candidates || [])[0];
+
+  if (!candidate) {
+    currentBestPick = null;
+    fields.bestPick.classList.remove("hidden");
+    fields.bestPick.classList.add("best-pick-wait");
+    fields.bestPickAction.textContent = "No contract pick";
+    fields.bestPickContract.textContent = "No ranked candidate is available for this read.";
+    fields.bestPickReason.textContent = payload.warning || "Run a scan after GEX and Alpaca both return usable data.";
+    stageBestPickButton.disabled = true;
+    return;
+  }
+
+  const permission = String(recommendation.trade_permission || "").toLowerCase();
+  const bias = String(recommendation.bias || "unknown");
+  const score = mode === "replay" ? candidate.replay_score : candidate.score;
+  const entryPrice = mode === "replay" ? candidate.close : candidate.mid;
+  const priceLabel = mode === "replay" ? "last replay close" : "mid";
+  const hasTradePermission = permission.includes("possible trade");
+  const isStandDown = !hasTradePermission || Boolean(payload.warning);
+  const action = hasTradePermission && !payload.warning ? "Buy candidate after confirmation" : "Wait / watch only";
+  const reasonParts = [
+    `GEX is ${bias}${permission ? ` with ${permission} permission` : ""}.`,
+    `${candidate.symbol} is the top ranked ${candidate.contract_type} with score ${formatNumber(score)}.`,
+  ];
+
+  if (entryPrice) {
+    reasonParts.push(`Reference ${priceLabel}: ${formatCurrency(entryPrice)}.`);
+  }
+  if (payload.warning) {
+    reasonParts.push(payload.warning);
+  }
+
+  currentBestPick = {
+    candidate,
+    entryPrice,
+    message:
+      mode === "replay"
+        ? `Staged ${candidate.symbol} from the best replay pick.`
+        : `Staged ${candidate.symbol} from the best watchlist pick.`,
+  };
+
+  fields.bestPick.classList.remove("hidden", "best-pick-wait");
+  fields.bestPick.classList.toggle("best-pick-wait", isStandDown);
+  fields.bestPickAction.textContent = action;
+  fields.bestPickContract.textContent = `${readableContractName(candidate)} | ${priceLabel} ${formatCurrency(entryPrice)}`;
+  fields.bestPickReason.textContent = reasonParts.join(" ");
+  stageBestPickButton.disabled = false;
+
+  if (!isStandDown) {
+    recordTradePermissionPick({
+      candidate,
+      recommendation,
+      payload,
+      mode,
+      entryPrice,
+      priceLabel,
+      score,
+    });
+  }
+}
+
+function resetBestPick() {
+  currentBestPick = null;
+  fields.bestPick.classList.add("hidden");
+  fields.bestPick.classList.remove("best-pick-wait");
+  fields.bestPickAction.textContent = "-";
+  fields.bestPickContract.textContent = "-";
+  fields.bestPickReason.textContent = "-";
+  stageBestPickButton.disabled = true;
+}
+
+function stageCandidate(candidate, entryPrice, message) {
+  paperOrderForm.elements.symbol.value = candidate.symbol;
+  paperOrderForm.elements.side.value = "buy";
+  paperOrderForm.elements.qty.value = "1";
+  paperOrderForm.elements.type.value = "limit";
+  paperOrderForm.elements.limit_price.value = entryPrice ? Number(entryPrice).toFixed(2) : "";
+  setAlpacaStatus(message, false);
+}
+
+function recordTradePermissionPick({ candidate, recommendation, payload, mode, entryPrice, priceLabel, score }) {
+  const timestamp = pickTimestamp({ recommendation, payload, mode });
+  const item = {
+    id: `${mode}:${timestamp.iso}:${candidate.symbol}`,
+    timestamp,
+    replayDate: mode === "replay" && payload.date ? payload.date : timestamp.day,
+    mode,
+    ticker: recommendation.ticker || contractUnderlying(candidate),
+    bias: recommendation.bias || "unknown",
+    permission: recommendation.trade_permission || "trade permission",
+    contract: readableContractName(candidate),
+    symbol: candidate.symbol,
+    side: contractSide(candidate),
+    entryPrice,
+    priceLabel,
+    score,
+  };
+  const history = loadTradeHistory();
+  const withoutDuplicate = history.filter((existing) => existing.id !== item.id);
+  saveTradeHistory([item, ...withoutDuplicate].slice(0, MAX_TRADE_HISTORY_ITEMS));
+  renderTradeHistory();
+}
+
+function pickTimestamp({ recommendation, payload, mode }) {
+  if (mode === "replay" && payload.date && payload.selected_time) {
+    return {
+      iso: `${payload.date}T${payload.selected_time}`,
+      day: payload.date,
+      label: `${formatContractDate(payload.date)} ${formatDisplayTime(payload.selected_time)}`,
+    };
+  }
+  if (recommendation.gex_timestamp) {
+    const date = new Date(Number(recommendation.gex_timestamp) * 1000);
+    return {
+      iso: date.toISOString(),
+      day: date.toISOString().slice(0, 10),
+      label: formatHistoryDate(date),
+    };
+  }
+  const now = new Date();
+  return {
+    iso: now.toISOString(),
+    day: now.toISOString().slice(0, 10),
+    label: formatHistoryDate(now),
+  };
+}
+
+function renderTradeHistory() {
+  const selectedDate = replayDate.value;
+  const history = loadTradeHistory().filter((item) => historyItemDate(item) === selectedDate);
+  if (history.length === 0) {
+    fields.tradeHistory.textContent = selectedDate
+      ? `No trade-permission picks recorded for ${formatContractDate(selectedDate)}.`
+      : "No trade-permission picks yet.";
+    return;
+  }
+  fields.tradeHistory.innerHTML = "";
+  for (const item of history) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = `trade-history-row contract-${item.side || "call"}`;
+    row.innerHTML = `
+      <span>
+        <strong>${item.timestamp.label}</strong>
+        <em>${item.contract}</em>
+      </span>
+      <span>${formatCurrency(item.entryPrice)}</span>
+      <span>${item.bias}</span>
+      <span>${formatOptionalNumber(item.score)}</span>
+    `;
+    row.addEventListener("click", () => {
+      paperOrderForm.elements.symbol.value = item.symbol;
+      paperOrderForm.elements.side.value = "buy";
+      paperOrderForm.elements.qty.value = "1";
+      paperOrderForm.elements.type.value = "limit";
+      paperOrderForm.elements.limit_price.value = item.entryPrice ? Number(item.entryPrice).toFixed(2) : "";
+      setAlpacaStatus(`Staged ${item.symbol} from trade permission history.`, false);
+    });
+    fields.tradeHistory.appendChild(row);
+  }
+}
+
+function historyItemDate(item) {
+  if (item.replayDate) {
+    return item.replayDate;
+  }
+  if (item.timestamp && item.timestamp.day) {
+    return item.timestamp.day;
+  }
+  if (item.timestamp && item.timestamp.iso) {
+    return String(item.timestamp.iso).slice(0, 10);
+  }
+  return "";
+}
+
+function loadTradeHistory() {
+  try {
+    const raw = localStorage.getItem(TRADE_HISTORY_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_error) {
+    return [];
+  }
+}
+
+function saveTradeHistory(history) {
+  try {
+    localStorage.setItem(TRADE_HISTORY_STORAGE_KEY, JSON.stringify(history));
+  } catch (_error) {
+    fields.tradeHistory.textContent = "Trade history could not be saved in this browser.";
+  }
+}
+
+function contractTitleMarkup(candidate) {
+  const side = contractSide(candidate);
+  return `
+    <span class="contract-title">
+      <strong>${readableContractName(candidate)}</strong>
+      <em>${candidate.symbol}</em>
+      <b class="contract-badge ${side}">${side.toUpperCase()}</b>
+    </span>
+  `;
+}
+
+function contractMetric(label, value, description) {
+  return `
+    <span class="contract-metric">
+      <i>${label}<b class="info-dot" data-tooltip="${escapeAttribute(description)}" aria-label="${escapeAttribute(description)}" tabindex="0">i</b></i>
+      <strong>${value}</strong>
+    </span>
+  `;
+}
+
+function showMetricTooltip(target) {
+  const message = target.dataset.tooltip;
+  if (!message) {
+    return;
+  }
+  metricTooltip.textContent = message;
+  metricTooltip.classList.add("visible");
+
+  const rect = target.getBoundingClientRect();
+  const tooltipRect = metricTooltip.getBoundingClientRect();
+  const margin = 10;
+  let left = rect.left + rect.width / 2 - tooltipRect.width / 2;
+  left = Math.max(margin, Math.min(left, window.innerWidth - tooltipRect.width - margin));
+
+  let top = rect.bottom + 8;
+  if (top + tooltipRect.height + margin > window.innerHeight) {
+    top = rect.top - tooltipRect.height - 8;
+  }
+  metricTooltip.style.left = `${left}px`;
+  metricTooltip.style.top = `${Math.max(margin, top)}px`;
+}
+
+function hideMetricTooltip() {
+  metricTooltip.classList.remove("visible");
+}
+
+function readableContractName(candidate) {
+  const underlying = contractUnderlying(candidate);
+  const expiration = formatContractDate(candidate.expiration_date);
+  const strike = formatStrike(candidate.strike_price);
+  const side = contractSide(candidate);
+  return `${underlying} Exp ${expiration} ${strike} ${capitalize(side)}`;
+}
+
+function contractUnderlying(candidate) {
+  if (candidate.underlying_symbol) {
+    return String(candidate.underlying_symbol).toUpperCase();
+  }
+  const match = String(candidate.symbol || "").match(/^([A-Z]+)\d{6}[CP]\d{8}$/);
+  return match ? match[1] : String(candidate.symbol || "").replace(/\d.*$/, "").toUpperCase();
+}
+
+function contractSide(candidate) {
+  const type = String(candidate.contract_type || "").toLowerCase();
+  if (type === "put" || type === "call") {
+    return type;
+  }
+  const match = String(candidate.symbol || "").match(/^[A-Z]+\d{6}([CP])\d{8}$/);
+  return match && match[1] === "P" ? "put" : "call";
+}
+
+function formatContractDate(value) {
+  const date = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(date.getTime())) {
+    return value || "-";
+  }
+  return date.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+}
+
+function formatDisplayTime(value) {
+  const parts = String(value || "").split(":");
+  if (parts.length < 2) {
+    return value || "-";
+  }
+  const date = new Date();
+  date.setHours(Number(parts[0]), Number(parts[1]), Number(parts[2] || 0), 0);
+  return date.toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function formatHistoryDate(date) {
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function formatStrike(value) {
+  if (value === null || value === undefined || value === "") {
+    return "-";
+  }
+  return Number(value).toLocaleString(undefined, {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: Number.isInteger(Number(value)) ? 0 : 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+function capitalize(value) {
+  return value ? `${value.charAt(0).toUpperCase()}${value.slice(1)}` : "";
+}
+
+function escapeAttribute(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 async function getJson(url) {
@@ -750,6 +1225,16 @@ function formatPercent(value) {
     style: "percent",
     maximumFractionDigits: 1,
   });
+}
+
+function formatGreek(label, value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    return `${label}: n/a`;
+  }
+  if (label === "iv") {
+    return `${label}: ${formatPercent(value)}`;
+  }
+  return `${label}: ${Number(value).toFixed(3)}`;
 }
 
 function setAlpacaStatus(message, isError) {

@@ -114,6 +114,7 @@ class WebAppTests(unittest.TestCase):
     def test_handle_option_replay_returns_json(self):
         handler = _handler()
         analysis = MagicMock()
+        analysis.as_dict.return_value = {"ticker": "AAPL", "bias": "bearish"}
         alpaca = MagicMock()
         recommendation = MagicMock()
         replay = MagicMock()
@@ -126,7 +127,9 @@ class WebAppTests(unittest.TestCase):
                         handler._handle_option_replay("ticker=aapl&period=zero&date=2026-07-02&time=10:45:30")
 
         self.assertEqual(handler.status, HTTPStatus.OK)
-        self.assertEqual(json.loads(handler.body.decode("utf-8"))["date"], "2026-07-02")
+        payload = json.loads(handler.body.decode("utf-8"))
+        self.assertEqual(payload["date"], "2026-07-02")
+        self.assertEqual(payload["analysis"]["bias"], "bearish")
         analyze_mock.assert_called_once_with("AAPL", "zero", replay_date="2026-07-02", replay_time="10:45:30")
         replay_mock.assert_called_once_with(
             recommendation=recommendation,

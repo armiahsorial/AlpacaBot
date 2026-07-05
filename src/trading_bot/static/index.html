@@ -157,10 +157,12 @@
             </label>
             <label>
               <span>Time</span>
-              <input id="replay-time" type="range" min="34200" max="57600" step="1" value="57540" />
+              <input id="replay-time" type="range" min="23400" max="46800" step="1" value="46740" />
             </label>
-            <strong id="replay-clock">15:59:00</strong>
+            <strong id="replay-clock">12:59:00</strong>
+            <button id="replay-today" type="button">Today Now</button>
             <button id="replay-play" type="button">Play</button>
+            <button id="replay-refresh" type="button">Update Data</button>
             <div class="speed-buttons" aria-label="Replay speed">
               <button type="button" data-speed="1">1x</button>
               <button type="button" data-speed="2">2x</button>
@@ -171,6 +173,22 @@
             </div>
           </div>
           <div id="contract-summary" class="mini-status">Run GEX analysis to scan contracts.</div>
+          <div id="best-pick" class="best-pick hidden">
+            <div>
+              <span class="label">Best Pick</span>
+              <strong id="best-pick-action">-</strong>
+              <p id="best-pick-contract">-</p>
+              <p id="best-pick-reason">-</p>
+            </div>
+            <button id="stage-best-pick" type="button">Stage</button>
+          </div>
+          <div class="trade-history-panel">
+            <div class="panel-heading compact-heading">
+              <h3>Trade Permission History</h3>
+              <button id="clear-trade-history" type="button">Clear</button>
+            </div>
+            <div id="trade-history" class="trade-history-list">No trade-permission picks yet.</div>
+          </div>
           <div id="contract-list" class="contract-list">-</div>
         </section>
       </section>

@@ -184,8 +184,9 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
                 allowed = ", ".join(AGGREGATION_PERIODS)
                 raise ValueError(f"period must be one of: {allowed}.")
             alpaca_client = _alpaca_client()
+            analysis = _analyze_ticker(ticker, period, replay_date=replay_date, replay_time=replay_time)
             recommendation = recommend_option_contracts(
-                gex_analysis=_analyze_ticker(ticker, period, replay_date=replay_date, replay_time=replay_time),
+                gex_analysis=analysis,
                 alpaca_client=alpaca_client,
                 max_expiration_days=int(max_expiration_days_raw),
                 max_candidates=int(limit_raw),
@@ -200,7 +201,9 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
 
-        self._send_json(replay.as_dict())
+        payload = replay.as_dict()
+        payload["analysis"] = analysis.as_dict()
+        self._send_json(payload)
 
     def _handle_option_replay_validate(self, query: str) -> None:
         params = parse_qs(query)

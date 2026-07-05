@@ -2,6 +2,7 @@ import json
 import unittest
 from unittest.mock import MagicMock, patch
 
+from trading_bot import gex_client
 from trading_bot.config import Settings
 from trading_bot.gex_client import (
     GexApiError,
@@ -301,6 +302,40 @@ class GexClientTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "greek"):
             client.get_state_greek_profile("SPX", "delta")
+
+    def test_historical_chain_refreshes_expired_signed_url(self):
+        settings = Settings(api_key="secret", base_url="https://api.example.test")
+        client = GexClient(settings)
+        history_key = "SPX:classic:zero:2026-07-01"
+        gex_client._HISTORICAL_ROWS_CACHE.clear()
+        gex_client._HISTORICAL_ROW_CACHE.clear()
+        gex_client._HISTORICAL_URL_CACHE.clear()
+        gex_client._HISTORICAL_URL_CACHE[history_key] = "https://history.example.test/stale.json"
+
+        with (
+            patch("trading_bot.gex_client._read_disk_history_cache", return_value=None),
+            patch("trading_bot.gex_client._read_disk_history_row", return_value=None),
+            patch("trading_bot.gex_client._write_disk_history_row"),
+            patch.object(client, "_get_json", return_value={"url": "https://history.example.test/fresh.json"}) as get_json,
+            patch.object(
+                client,
+                "_get_signed_history_row",
+                side_effect=[
+                    GexApiError(
+                        "GEX historical file request failed with HTTP 403: "
+                        "AuthenticationFailed signed expiry time must be after signed start time"
+                    ),
+                    _gex_chain_payload(),
+                ],
+            ) as get_signed_history_row,
+        ):
+            chain = client._get_historical_chain("SPX", "classic", "zero", "2026-07-01", 1753283590)
+
+        self.assertEqual(chain.ticker, "SPX")
+        self.assertEqual(get_signed_history_row.call_args_list[0].args[0], "https://history.example.test/stale.json")
+        self.assertEqual(get_signed_history_row.call_args_list[1].args[0], "https://history.example.test/fresh.json")
+        self.assertEqual(gex_client._HISTORICAL_URL_CACHE[history_key], "https://history.example.test/fresh.json")
+        get_json.assert_called_once_with("/hist/SPX/classic/zero/2026-07-01?noredirect")
 
 
 def _mock_response(payload):

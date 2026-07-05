@@ -27,6 +27,9 @@ class ReplayCandidate:
     close: float | None
     volume: float | None
     day_change_pct: float | None
+    delta: float | None
+    gamma: float | None
+    implied_volatility: float | None
     replay_score: float
 
     def as_dict(self) -> dict[str, Any]:
@@ -42,6 +45,9 @@ class ReplayCandidate:
             "close": self.close,
             "volume": self.volume,
             "day_change_pct": self.day_change_pct,
+            "delta": self.delta,
+            "gamma": self.gamma,
+            "implied_volatility": self.implied_volatility,
             "replay_score": round(self.replay_score, 4),
         }
 
@@ -124,6 +130,9 @@ def replay_option_recommendation(
                 close=close,
                 volume=volume,
                 day_change_pct=change_pct,
+                delta=base.delta,
+                gamma=base.gamma,
+                implied_volatility=base.implied_volatility,
                 replay_score=replay_score,
             )
         )

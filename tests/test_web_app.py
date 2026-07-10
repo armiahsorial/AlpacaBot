@@ -4,7 +4,8 @@ from io import BytesIO
 from http import HTTPStatus
 from unittest.mock import MagicMock, patch
 
-from trading_bot.web_app import TradingBotWebHandler, _stock_technicals
+from trading_bot.alpaca_client import AlpacaApiError
+from trading_bot.web_app import TradingBotWebHandler, _option_outcomes, _stock_technicals
 
 
 class WebAppTests(unittest.TestCase):
@@ -169,6 +170,99 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(alpaca.get_stock_bars.call_count, 2)
         for call in alpaca.get_stock_bars.call_args_list:
             self.assertEqual(call.kwargs["feed"], "iex")
+
+    def test_option_outcomes_returns_high_low_and_estimated_greeks(self):
+        alpaca = MagicMock()
+        alpaca.get_option_bars.return_value = {
+            "AAPL260710C00100000": [
+                {"t": "2026-07-10T14:30:00Z", "h": 2.6, "l": 2.1},
+                {"t": "2026-07-10T15:00:00Z", "h": 4.2, "l": 3.8},
+                {"t": "2026-07-10T16:00:00Z", "h": 1.9, "l": 1.4},
+            ]
+        }
+        alpaca.get_stock_bars.return_value = [
+            {"t": "2026-07-10T14:30:00Z", "c": 100.0},
+            {"t": "2026-07-10T15:00:00Z", "c": 102.0},
+            {"t": "2026-07-10T16:00:00Z", "c": 98.0},
+        ]
+
+        outcomes = _option_outcomes(
+            alpaca,
+            [
+                {
+                    "id": "signal-1",
+                    "symbol": "AAPL260710C00100000",
+                    "date": "2026-07-10",
+                    "timestamp_iso": "2026-07-10T14:30:00Z",
+                    "underlying": "AAPL",
+                    "expiration_date": "2026-07-10",
+                    "strike_price": 100,
+                    "contract_type": "call",
+                    "entry_price": 2.5,
+                    "entry_iv": 0.3,
+                    "entry_spot": 100,
+                }
+            ],
+        )
+
+        outcome = outcomes["signal-1"]
+        self.assertEqual(outcome["high"], 4.2)
+        self.assertEqual(outcome["low"], 1.4)
+        self.assertTrue(outcome["went_up"])
+        self.assertTrue(outcome["high_greeks"]["estimated"])
+        self.assertTrue(outcome["low_greeks"]["estimated"])
+
+    def test_option_outcomes_uses_saved_path_when_option_bars_fail(self):
+        alpaca = MagicMock()
+        alpaca.get_option_bars.side_effect = AlpacaApiError("subscription does not permit option bars")
+        alpaca.get_stock_bars.return_value = []
+
+        outcomes = _option_outcomes(
+            alpaca,
+            [
+                {
+                    "id": "signal-2",
+                    "symbol": "QQQ260710C00715000",
+                    "date": "2026-07-10",
+                    "timestamp_iso": "2026-07-10T14:30:00Z",
+                    "underlying": "QQQ",
+                    "expiration_date": "2026-07-10",
+                    "strike_price": 715,
+                    "contract_type": "call",
+                    "entry_price": 10.0,
+                    "entry_iv": 0.3,
+                    "fallback_delta": 0.4,
+                    "fallback_gamma": 0.02,
+                    "fallback_path": [10.0, 12.5, 9.5],
+                }
+            ],
+        )
+
+        outcome = outcomes["signal-2"]
+        self.assertEqual(outcome["high"], 12.5)
+        self.assertEqual(outcome["low"], 9.5)
+        self.assertEqual(outcome["source"], "saved intraday path fallback")
+        self.assertEqual(outcome["high_greeks"]["delta"], 0.4)
+
+    def test_option_outcomes_returns_row_error_without_bars_or_fallback(self):
+        alpaca = MagicMock()
+        alpaca.get_option_bars.side_effect = AlpacaApiError("option bars unavailable")
+        alpaca.get_stock_bars.return_value = []
+
+        outcomes = _option_outcomes(
+            alpaca,
+            [
+                {
+                    "id": "signal-3",
+                    "symbol": "QQQ260710C00715000",
+                    "date": "2026-07-10",
+                    "timestamp_iso": "2026-07-10T14:30:00Z",
+                    "underlying": "QQQ",
+                }
+            ],
+        )
+
+        self.assertEqual(outcomes["signal-3"]["error"], "option bars unavailable")
 
 def _handler(body: bytes = b""):
     handler = object.__new__(TradingBotWebHandler)

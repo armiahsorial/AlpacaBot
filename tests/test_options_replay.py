@@ -47,6 +47,7 @@ def _recommendation():
         delta=None,
         gamma=None,
         implied_volatility=None,
+        greeks_estimated=False,
         score=95.0,
         reasons=(),
     )

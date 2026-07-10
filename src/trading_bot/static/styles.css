@@ -193,6 +193,12 @@ button:disabled {
   margin-bottom: 14px;
 }
 
+.contract-workspace {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
 .contract-panel {
   grid-column: 1 / -1;
 }
@@ -413,7 +419,7 @@ button:disabled {
 
 .trade-history-row {
   display: grid;
-  grid-template-columns: minmax(260px, 1.5fr) repeat(3, minmax(74px, 0.5fr));
+  grid-template-columns: minmax(280px, 1.7fr) repeat(6, minmax(86px, 0.55fr));
   gap: 10px;
   align-items: center;
   min-height: 58px;
@@ -454,6 +460,17 @@ button:disabled {
   white-space: nowrap;
 }
 
+.trade-history-row i {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 850;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
 .trade-history-row strong,
 .trade-history-row em {
   display: block;
@@ -466,12 +483,44 @@ button:disabled {
   font-size: 14px;
 }
 
+.trade-history-row .positive {
+  color: var(--accent);
+}
+
+.trade-history-row .negative {
+  color: var(--danger);
+}
+
 .trade-history-row em {
   margin-top: 4px;
   color: var(--muted);
   font-size: 12px;
   font-style: normal;
   font-weight: 700;
+}
+
+.live-controls {
+  display: grid;
+  grid-template-columns: auto auto minmax(110px, 150px) minmax(180px, 1fr);
+  gap: 8px;
+  align-items: end;
+  border: 1px solid rgba(53, 231, 176, 0.16);
+  border-radius: 7px;
+  background:
+    linear-gradient(90deg, rgba(53, 231, 176, 0.1), transparent 46%),
+    rgba(6, 16, 24, 0.58);
+  padding: 10px;
+}
+
+.live-controls button,
+.live-controls select {
+  height: 40px;
+}
+
+.live-controls .mini-status {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
 }
 
 .replay-controls {
@@ -529,9 +578,15 @@ button:disabled {
   color: #03130e;
 }
 
+#replay-play.active {
+  border-color: rgba(53, 231, 176, 0.58);
+  background: linear-gradient(180deg, rgba(53, 231, 176, 0.96), rgba(24, 137, 109, 0.96));
+  color: #03130e;
+}
+
 .contract-row {
   display: grid;
-  grid-template-columns: minmax(260px, 1.8fr) repeat(4, minmax(72px, 0.7fr));
+  grid-template-columns: minmax(260px, 1.6fr) minmax(150px, 0.85fr) repeat(4, minmax(72px, 0.7fr));
   gap: 10px;
   align-items: center;
   height: auto;
@@ -597,6 +652,63 @@ button:disabled {
   gap: 3px;
   overflow: visible;
   position: relative;
+}
+
+.option-sparkline {
+  display: grid;
+  gap: 3px;
+  min-width: 140px;
+  align-self: stretch;
+  align-content: center;
+  border: 1px solid rgba(53, 231, 176, 0.18);
+  border-radius: 7px;
+  background:
+    linear-gradient(180deg, rgba(53, 231, 176, 0.06), rgba(53, 231, 176, 0.015)),
+    rgba(3, 12, 19, 0.36);
+  padding: 5px 7px;
+}
+
+.option-sparkline svg {
+  width: 100%;
+  height: 46px;
+  overflow: visible;
+}
+
+.spark-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2.5;
+  filter: drop-shadow(0 0 5px rgba(53, 231, 176, 0.42));
+}
+
+.spark-area {
+  fill: rgba(53, 231, 176, 0.1);
+}
+
+.spark-down .spark-line {
+  stroke: var(--danger);
+  filter: drop-shadow(0 0 5px rgba(255, 82, 119, 0.34));
+}
+
+.spark-down .spark-area {
+  fill: rgba(255, 82, 119, 0.11);
+}
+
+.option-sparkline em {
+  color: var(--muted);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.spark-empty {
+  place-items: center;
+  min-height: 58px;
+  border-style: dashed;
+  color: var(--muted);
 }
 
 .contract-metric i {
@@ -1285,8 +1397,13 @@ td:nth-child(2) {
   }
 
   .contract-title,
+  .option-sparkline,
   .contract-row small {
     grid-column: 1 / -1;
+  }
+
+  .live-controls {
+    grid-template-columns: 1fr;
   }
 
   .best-pick {

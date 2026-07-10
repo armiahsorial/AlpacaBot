@@ -65,6 +65,24 @@ class AlpacaClientTests(unittest.TestCase):
             "https://data.example.test/v2/stocks/bars/latest?symbols=SPY&feed=iex",
         )
 
+    def test_get_stock_bars_uses_data_endpoint(self):
+        client = AlpacaClient(_settings())
+        payload = {"bars": {"AAPL": [{"c": 205.0}]}}
+
+        with patch("trading_bot.alpaca_client.urlopen", return_value=_mock_response(payload)) as mock:
+            bars = client.get_stock_bars(
+                "aapl",
+                start="2026-07-01T13:30:00Z",
+                end="2026-07-01T20:00:00Z",
+                timeframe="1Min",
+            )
+
+        request = mock.call_args.args[0]
+        self.assertIn("https://data.example.test/v2/stocks/bars?", request.full_url)
+        self.assertIn("symbols=AAPL", request.full_url)
+        self.assertIn("timeframe=1Min", request.full_url)
+        self.assertEqual(bars[0]["c"], 205.0)
+
     def test_get_option_contracts_uses_paper_endpoint(self):
         client = AlpacaClient(_settings())
         payload = {"option_contracts": [{"symbol": "SPY260117C00450000"}]}

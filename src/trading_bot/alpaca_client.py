@@ -116,6 +116,42 @@ class AlpacaClient:
             raise AlpacaApiError("Expected Alpaca latest bar response to be a JSON object.")
         return payload
 
+    def get_stock_bars(
+        self,
+        symbol: str,
+        *,
+        start: str,
+        end: str,
+        timeframe: str = "1Min",
+        feed: str | None = None,
+        limit: int = 10000,
+    ) -> list[dict[str, Any]]:
+        symbol = symbol.strip().upper()
+        if not symbol:
+            raise ValueError("symbol is required.")
+
+        params: dict[str, str | int] = {
+            "symbols": symbol,
+            "timeframe": timeframe,
+            "start": start,
+            "end": end,
+            "limit": max(1, min(limit, 10000)),
+        }
+        if feed:
+            params["feed"] = feed.strip().lower()
+
+        payload = self._request("GET", self._data_url(f"/v2/stocks/bars?{urlencode(params)}"))
+        if not isinstance(payload, dict):
+            raise AlpacaApiError("Expected Alpaca stock bars response to be a JSON object.")
+
+        bars = payload.get("bars")
+        if not isinstance(bars, dict):
+            raise AlpacaApiError("Expected Alpaca stock bars response to include bars.")
+        symbol_bars = bars.get(symbol, [])
+        if not isinstance(symbol_bars, list):
+            raise AlpacaApiError("Expected Alpaca stock bars for symbol to be a JSON array.")
+        return symbol_bars
+
     def get_option_contracts(
         self,
         underlying_symbol: str,

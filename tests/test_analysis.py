@@ -2,6 +2,7 @@ import unittest
 
 from trading_bot.analysis import analyze_gex
 from trading_bot.gex_client import GexChange, GexMajorLevels, GexMaxChange
+from trading_bot.technicals import StockTechnicals
 
 
 class AnalyzeGexTests(unittest.TestCase):
@@ -89,6 +90,39 @@ class AnalyzeGexTests(unittest.TestCase):
         self.assertEqual(analysis.invalidation, "Reclaim of zero gamma near 30274.8 or classic positive near 30300.")
         self.assertEqual(analysis.target_zone, "30240 to 30250.")
         self.assertEqual(analysis.avoid_zone, "Avoid chasing bearish trades into 30240 to 30250.")
+
+    def test_analyze_gex_includes_technical_context_in_score(self):
+        analysis = analyze_gex(
+            period="zero",
+            classic_major_levels=_major_levels(spot=6326.0, zero_gamma=6323.0, net_gex_vol=1000.0),
+            state_major_levels=_major_levels(spot=6326.0, zero_gamma=0.0, net_gex_vol=500.0),
+            classic_max_change=_max_change(thirty_value=100.0),
+            state_max_change=_max_change(thirty_value=50.0),
+            technicals=StockTechnicals(
+                symbol="SPY",
+                as_of="2026-07-01T10:00:00-04:00",
+                last_price=6326.0,
+                vwap=6320.0,
+                sma_50=6200.0,
+                sma_200=6000.0,
+                fibonacci_levels={"50%": 6000.0},
+                fibonacci_near_sma_200={
+                    "label": "50%",
+                    "level": 6000.0,
+                    "reference": 6000.0,
+                    "distance": 0.0,
+                    "distance_pct": 0.0,
+                },
+                intraday_volume=100000,
+                score_adjustment=3,
+                reasons=("Price is above VWAP.",),
+                warnings=(),
+            ),
+        )
+
+        self.assertEqual(analysis.score, 8)
+        self.assertEqual(analysis.technicals.symbol, "SPY")
+        self.assertIn("+3 VWAP/50-day/200-day technical context", analysis.score_breakdown)
 
 
 def _major_levels(

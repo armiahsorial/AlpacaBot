@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+from datetime import date, datetime, time, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from urllib.parse import parse_qs, urlparse
 
 from trading_bot.alpaca_client import AlpacaApiError, AlpacaClient, PaperOrderRequest
@@ -14,11 +16,20 @@ from trading_bot.config import AlpacaSettings, Settings
 from trading_bot.gex_client import AGGREGATION_PERIODS, GexApiError, GexClient
 from trading_bot.options_analysis import recommend_option_contracts
 from trading_bot.options_replay import replay_option_recommendation
+from trading_bot.technicals import StockTechnicals, calculate_stock_technicals
 
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 STATIC_DIR = Path(__file__).parent / "static"
+EASTERN = ZoneInfo("America/New_York")
+UTC = ZoneInfo("UTC")
+DEFAULT_STOCK_DATA_FEED = "iex"
+TECHNICAL_UNDERLYING_OVERRIDES = {
+    "SPX": "SPY",
+    "NDX": "QQQ",
+    "RUT": "IWM",
+}
 
 
 class TradingBotWebHandler(BaseHTTPRequestHandler):
@@ -61,6 +72,10 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
 
         if parsed_url.path == "/api/options/recommend":
             self._handle_option_recommendation(parsed_url.query)
+            return
+
+        if parsed_url.path == "/api/options/prices":
+            self._handle_option_prices(parsed_url.query)
             return
 
         if parsed_url.path == "/api/options/replay":
@@ -156,8 +171,9 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
                 allowed = ", ".join(AGGREGATION_PERIODS)
                 raise ValueError(f"period must be one of: {allowed}.")
 
+            analysis = _analyze_ticker(ticker, period)
             recommendation = recommend_option_contracts(
-                gex_analysis=_analyze_ticker(ticker, period),
+                gex_analysis=analysis,
                 alpaca_client=_alpaca_client(),
                 max_expiration_days=int(max_expiration_days_raw),
                 max_candidates=int(limit_raw),
@@ -166,7 +182,30 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
 
-        self._send_json(recommendation.as_dict())
+        payload = recommendation.as_dict()
+        payload["analysis"] = analysis.as_dict()
+        self._send_json(payload)
+
+    def _handle_option_prices(self, query: str) -> None:
+        params = parse_qs(query)
+        symbols_raw = params.get("symbols", [""])[0]
+        symbols = [symbol.strip().upper() for symbol in symbols_raw.split(",") if symbol.strip()]
+
+        try:
+            if not symbols:
+                raise ValueError("symbols are required.")
+            if len(symbols) > 100:
+                raise ValueError("At most 100 option symbols can be priced at once.")
+            snapshots = _alpaca_client().get_option_snapshots(symbols)
+        except (AlpacaApiError, ValueError) as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        prices = {
+            symbol: _option_price_from_snapshot(snapshots.get(symbol, {}))
+            for symbol in symbols
+        }
+        self._send_json({"prices": prices})
 
     def _handle_option_replay(self, query: str) -> None:
         params = parse_qs(query)
@@ -300,6 +339,7 @@ def _alpaca_client() -> AlpacaClient:
 def _analyze_ticker(ticker: str, period: str, replay_date: str | None = None, replay_time: str | None = None):
     settings = Settings.from_env()
     client = GexClient(settings)
+    technicals = _stock_technicals(ticker, replay_date=replay_date, replay_time=replay_time)
     if replay_date and replay_time:
         (
             classic_major_levels,
@@ -313,6 +353,7 @@ def _analyze_ticker(ticker: str, period: str, replay_date: str | None = None, re
             state_major_levels=state_major_levels,
             classic_max_change=classic_max_change,
             state_max_change=state_max_change,
+            technicals=technicals,
         )
 
     return analyze_gex(
@@ -321,7 +362,90 @@ def _analyze_ticker(ticker: str, period: str, replay_date: str | None = None, re
         state_major_levels=client.get_state_gex_major_levels(ticker, period),
         classic_max_change=client.get_gex_max_change(ticker, period),
         state_max_change=client.get_state_gex_max_change(ticker, period),
+        technicals=technicals,
     )
+
+
+def _stock_technicals(ticker: str, replay_date: str | None = None, replay_time: str | None = None) -> StockTechnicals:
+    alpaca_client = _alpaca_client()
+    ticker = ticker.strip().upper()
+    symbol = TECHNICAL_UNDERLYING_OVERRIDES.get(ticker, ticker)
+    as_of = _technical_as_of(replay_date, replay_time)
+    market_open = datetime.combine(as_of.date(), time(9, 30), tzinfo=EASTERN)
+    daily_start = as_of.date() - timedelta(days=360)
+    daily_end = as_of.date()
+
+    minute_bars = alpaca_client.get_stock_bars(
+        symbol,
+        start=_to_utc_iso(market_open),
+        end=_to_utc_iso(as_of),
+        timeframe="1Min",
+        feed=DEFAULT_STOCK_DATA_FEED,
+        limit=10000,
+    )
+    daily_bars = alpaca_client.get_stock_bars(
+        symbol,
+        start=daily_start.isoformat(),
+        end=daily_end.isoformat(),
+        timeframe="1Day",
+        feed=DEFAULT_STOCK_DATA_FEED,
+        limit=300,
+    )
+    return calculate_stock_technicals(
+        symbol=symbol,
+        as_of=as_of.isoformat(),
+        minute_bars=minute_bars,
+        daily_bars=daily_bars,
+    )
+
+
+def _technical_as_of(replay_date: str | None, replay_time: str | None) -> datetime:
+    if replay_date and replay_time:
+        hour_raw, minute_raw, *second_parts = replay_time.split(":")
+        second_raw = second_parts[0] if second_parts else "0"
+        return datetime.combine(
+            date.fromisoformat(replay_date),
+            time(int(hour_raw), int(minute_raw), int(second_raw)),
+            tzinfo=EASTERN,
+        )
+    return datetime.now(EASTERN)
+
+
+def _to_utc_iso(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _option_price_from_snapshot(snapshot: object) -> dict[str, float | None]:
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    quote = snapshot.get("latestQuote") if isinstance(snapshot, dict) else None
+    quote = quote if isinstance(quote, dict) else {}
+    trade = snapshot.get("latestTrade") if isinstance(snapshot, dict) else None
+    trade = trade if isinstance(trade, dict) else {}
+
+    bid = _optional_snapshot_float(quote.get("bp"))
+    ask = _optional_snapshot_float(quote.get("ap"))
+    last = _optional_snapshot_float(trade.get("p"))
+    mid = None
+    if bid is not None and ask is not None and bid > 0 and ask > 0 and ask >= bid:
+        mid = (bid + ask) / 2
+    elif last is not None and last > 0:
+        mid = last
+
+    return {
+        "bid": bid,
+        "ask": ask,
+        "last": last,
+        "mid": mid,
+    }
+
+
+def _optional_snapshot_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _optional_float(value: object) -> float | None:

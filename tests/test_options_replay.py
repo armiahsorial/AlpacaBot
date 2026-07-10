@@ -17,6 +17,7 @@ class OptionReplayTests(unittest.TestCase):
         self.assertEqual(replay.selected_time, "10:00:25")
         self.assertEqual(replay.candidates[0].symbol, "AAPL260710C00310000")
         self.assertGreater(replay.candidates[0].day_change_pct, 0)
+        self.assertEqual(replay.candidates[0].price_path, (2.0, 2.4))
 
 
 class _FakeAlpacaClient:

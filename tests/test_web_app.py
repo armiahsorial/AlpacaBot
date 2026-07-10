@@ -4,7 +4,7 @@ from io import BytesIO
 from http import HTTPStatus
 from unittest.mock import MagicMock, patch
 
-from trading_bot.web_app import TradingBotWebHandler
+from trading_bot.web_app import TradingBotWebHandler, _stock_technicals
 
 
 class WebAppTests(unittest.TestCase):
@@ -97,6 +97,7 @@ class WebAppTests(unittest.TestCase):
     def test_handle_option_recommendation_returns_json(self):
         handler = _handler()
         analysis = MagicMock()
+        analysis.as_dict.return_value = {"ticker": "AAPL", "bias": "bullish"}
         recommendation = MagicMock()
         recommendation.as_dict.return_value = {"ticker": "AAPL", "candidates": []}
 
@@ -106,10 +107,30 @@ class WebAppTests(unittest.TestCase):
                     handler._handle_option_recommendation("ticker=aapl&period=zero&limit=3")
 
         self.assertEqual(handler.status, HTTPStatus.OK)
-        self.assertEqual(json.loads(handler.body.decode("utf-8"))["ticker"], "AAPL")
+        payload = json.loads(handler.body.decode("utf-8"))
+        self.assertEqual(payload["ticker"], "AAPL")
+        self.assertEqual(payload["analysis"]["bias"], "bullish")
         analyze_mock.assert_called_once_with("AAPL", "zero")
         alpaca_mock.assert_called_once_with()
         self.assertEqual(recommend_mock.call_args.kwargs["max_candidates"], 3)
+
+    def test_handle_option_prices_returns_current_mids(self):
+        handler = _handler()
+        alpaca = MagicMock()
+        alpaca.get_option_snapshots.return_value = {
+            "AAPL260710C00310000": {
+                "latestQuote": {"bp": 2.4, "ap": 2.6},
+                "latestTrade": {"p": 2.55},
+            }
+        }
+
+        with patch("trading_bot.web_app._alpaca_client", return_value=alpaca):
+            handler._handle_option_prices("symbols=AAPL260710C00310000")
+
+        self.assertEqual(handler.status, HTTPStatus.OK)
+        payload = json.loads(handler.body.decode("utf-8"))
+        self.assertEqual(payload["prices"]["AAPL260710C00310000"]["mid"], 2.5)
+        alpaca.get_option_snapshots.assert_called_once_with(["AAPL260710C00310000"])
 
     def test_handle_option_replay_returns_json(self):
         handler = _handler()
@@ -137,6 +158,17 @@ class WebAppTests(unittest.TestCase):
             replay_date="2026-07-02",
             replay_time="10:45:30",
         )
+
+    def test_stock_technicals_uses_iex_feed_for_alpaca_bars(self):
+        alpaca = MagicMock()
+        alpaca.get_stock_bars.return_value = []
+
+        with patch("trading_bot.web_app._alpaca_client", return_value=alpaca):
+            _stock_technicals("AAPL", replay_date="2026-07-02", replay_time="10:45:30")
+
+        self.assertEqual(alpaca.get_stock_bars.call_count, 2)
+        for call in alpaca.get_stock_bars.call_args_list:
+            self.assertEqual(call.kwargs["feed"], "iex")
 
 def _handler(body: bytes = b""):
     handler = object.__new__(TradingBotWebHandler)

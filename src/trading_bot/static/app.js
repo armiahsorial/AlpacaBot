@@ -2,6 +2,7 @@ const form = document.querySelector("#analysis-form");
 const statusEl = document.querySelector("#status");
 const resultsEl = document.querySelector("#results");
 const button = document.querySelector("#analyze-button");
+const tickerSelect = document.querySelector("#ticker");
 const autoRefresh = document.querySelector("#auto-refresh");
 const refreshSeconds = document.querySelector("#refresh-seconds");
 const alpacaStatus = document.querySelector("#alpaca-status");
@@ -22,6 +23,11 @@ const replayRefresh = document.querySelector("#replay-refresh");
 const replayToday = document.querySelector("#replay-today");
 const stageBestPickButton = document.querySelector("#stage-best-pick");
 const clearTradeHistoryButton = document.querySelector("#clear-trade-history");
+const exportTradeHistoryButton = document.querySelector("#export-trade-history");
+const exportTradeHistoryRangeButton = document.querySelector("#export-trade-history-range");
+const historyStartDate = document.querySelector("#history-start-date");
+const historyEndDate = document.querySelector("#history-end-date");
+const historyTickers = document.querySelector("#history-tickers");
 const speedButtons = document.querySelectorAll("[data-speed]");
 const barSymbol = document.querySelector("#bar-symbol");
 const latestBar = document.querySelector("#latest-bar");
@@ -47,6 +53,7 @@ const REPLAY_FETCH_STEP_SECONDS = 300;
 const REPLAY_MIN_FETCH_INTERVAL_MS = 5000;
 const TRADE_HISTORY_STORAGE_KEY = "tradingBot.tradePermissionHistory";
 const MAX_TRADE_HISTORY_ITEMS = 100;
+const MAX_RECORDED_PERMISSION_CANDIDATES = 5;
 const PACIFIC_TO_EASTERN_SECONDS = 3 * 60 * 60;
 
 const fields = {
@@ -99,6 +106,8 @@ const fields = {
   bestPickReason: document.querySelector("#best-pick-reason"),
   bestPickExit: document.querySelector("#best-pick-exit"),
   tradeHistory: document.querySelector("#trade-history"),
+  multiTickerPanel: document.querySelector("#multi-ticker-panel"),
+  multiTickerList: document.querySelector("#multi-ticker-list"),
 };
 
 form.addEventListener("submit", async (event) => {
@@ -157,6 +166,7 @@ liveInterval.addEventListener("change", () => {
 
 replayDate.addEventListener("change", () => {
   stopLiveMode();
+  syncHistoryExportDatesToReplayDate();
   renderTradeHistory();
   loadOptionReplay();
 });
@@ -195,8 +205,16 @@ stageBestPickButton?.addEventListener("click", () => {
 });
 
 clearTradeHistoryButton.addEventListener("click", () => {
-  saveTradeHistory([]);
+  clearTradeHistoryForSelectedDay();
   renderTradeHistory();
+});
+
+exportTradeHistoryButton?.addEventListener("click", async () => {
+  await downloadTradeHistoryForSelectedDay();
+});
+
+exportTradeHistoryRangeButton?.addEventListener("click", async () => {
+  await downloadTradeHistoryForRange();
 });
 
 document.addEventListener("pointerover", (event) => {
@@ -250,26 +268,30 @@ async function runAnalysis({ isRefresh = false } = {}) {
   }
 
   isAnalysisRunning = true;
-  const { ticker, period } = getFormValues();
+  const { period } = getFormValues();
+  const tickers = getSelectedTickers();
+  const primaryTicker = tickers[0] || "NDX";
 
-  setStatus(isRefresh ? "Refreshing GEX data..." : "Pulling GEX data...", false);
+  setStatus(isRefresh ? `Refreshing ${tickers.join(", ")} GEX data...` : `Pulling ${tickers.join(", ")} GEX data...`, false);
   if (button) {
     button.disabled = true;
   }
 
   try {
-    const query = new URLSearchParams(getFormValues());
-    const response = await fetch(`/api/analyze?${query.toString()}`);
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.error || "Analysis failed.");
+    const analyses = await Promise.all(tickers.map((ticker) => loadTickerAnalysis(ticker, period)));
+    renderMultiTickerSummary(analyses);
+    const primaryResult = analyses.find((result) => result.ticker === primaryTicker && result.payload) || analyses.find((result) => result.payload);
+    if (!primaryResult) {
+      throw new Error(analyses.map((result) => `${result.ticker}: ${result.error}`).join(" | ") || "Analysis failed.");
     }
-    lastAnalysis = payload;
-    renderAnalysis(payload);
+    lastAnalysis = primaryResult.payload;
+    renderAnalysis(primaryResult.payload);
     if (!isRefresh && !isInspectingContract) {
       await loadOptionRecommendation();
     }
-    setStatus(`Updated ${ticker} ${period} at ${new Date().toLocaleTimeString()}.`, false);
+    const failedCount = analyses.filter((result) => result.error).length;
+    const partial = failedCount > 0 ? ` ${failedCount} ticker${failedCount === 1 ? "" : "s"} failed.` : "";
+    setStatus(`Updated ${tickers.join(", ")} ${period} at ${new Date().toLocaleTimeString()}.${partial}`, failedCount > 0);
   } catch (error) {
     resultsEl.classList.add("hidden");
     setStatus(error.message, true);
@@ -278,6 +300,55 @@ async function runAnalysis({ isRefresh = false } = {}) {
       button.disabled = false;
     }
     isAnalysisRunning = false;
+  }
+}
+
+async function loadTickerAnalysis(ticker, period) {
+  try {
+    const query = new URLSearchParams({ ticker, period });
+    const payload = await getJson(`/api/analyze?${query.toString()}`);
+    return { ticker, payload };
+  } catch (error) {
+    return { ticker, error: error.message || "Analysis failed." };
+  }
+}
+
+function renderMultiTickerSummary(results) {
+  if (!fields.multiTickerPanel || !fields.multiTickerList) {
+    return;
+  }
+
+  if (results.length <= 1) {
+    fields.multiTickerPanel.classList.add("hidden");
+    fields.multiTickerList.innerHTML = "";
+    return;
+  }
+
+  fields.multiTickerPanel.classList.remove("hidden");
+  fields.multiTickerList.innerHTML = "";
+  for (const result of results) {
+    const card = document.createElement("article");
+    if (result.error) {
+      card.className = "multi-ticker-card error";
+      card.innerHTML = `
+        <strong>${result.ticker}</strong>
+        <span>Unavailable</span>
+        <em>${result.error}</em>
+      `;
+      fields.multiTickerList.appendChild(card);
+      continue;
+    }
+
+    const analysis = result.payload;
+    card.className = `multi-ticker-card permission-${permissionClass(analysis.trade_permission)}`;
+    card.innerHTML = `
+      <strong>${result.ticker}</strong>
+      <span>${analysis.trade_permission}</span>
+      <span>${analysis.bias}</span>
+      <span>score ${formatOptionalNumber(analysis.score)}</span>
+      <span>spot ${formatOptionalNumber(analysis.spot)}</span>
+    `;
+    fields.multiTickerList.appendChild(card);
   }
 }
 
@@ -439,10 +510,29 @@ function technicalLeanLabel(adjustment) {
 
 function getFormValues() {
   const data = new FormData(form);
+  const tickers = getSelectedTickers();
   return {
-    ticker: String(data.get("ticker") || "NDX").trim().toUpperCase(),
+    ticker: tickers[0] || "NDX",
     period: String(data.get("period") || "zero"),
   };
+}
+
+function getSelectedTickers() {
+  const selected = Array.from(tickerSelect?.selectedOptions || [])
+    .map((option) => option.value.trim().toUpperCase())
+    .filter(Boolean);
+  return selected.length > 0 ? [...new Set(selected)] : ["NDX"];
+}
+
+function permissionClass(permission) {
+  const normalized = String(permission || "").toLowerCase();
+  if (normalized.includes("no")) {
+    return "no-trade";
+  }
+  if (normalized.includes("trade")) {
+    return "trade";
+  }
+  return "watch";
 }
 
 function scheduleRefresh() {
@@ -462,6 +552,7 @@ function scheduleRefresh() {
 }
 
 initializeReplayControls();
+initializeTradeHistoryExportControls();
 autoRefresh.checked = true;
 initializeMarketMode();
 scheduleRefresh();
@@ -829,7 +920,7 @@ function renderOptionReplay(payload) {
       ${contractMetric("Day", formatPercent(candidate.day_change_pct), "How much this option had moved that day by the selected replay time. Positive means it was up; negative means it was down.")}
       ${contractMetric("Volume", formatNumber(candidate.volume || 0), "How many of this exact option traded in the latest 1-minute bar. Thin liquidity: 1-10 contracts. Healthier/thicker activity: hundreds or thousands in a minute.")}
       ${contractMetric("Replay score", formatNumber(candidate.replay_score), "The bot's replay rank. It starts with the contract quality score, then adds what happened to price and volume during that historical day. Higher means it ranked better.")}
-      <small>${formatGreek("delta", candidate.delta)} ${formatGreek("gamma", candidate.gamma)} ${formatGreek("iv", candidate.implied_volatility)}</small>
+      <small>${greekSummary(candidate)}</small>
     `;
     row.addEventListener("click", () => {
       isInspectingContract = true;
@@ -850,6 +941,24 @@ function initializeReplayControls() {
   updateReplayClock();
   for (const button of speedButtons) {
     button.classList.toggle("active", Number(button.dataset.speed) === replaySpeed);
+  }
+}
+
+function initializeTradeHistoryExportControls() {
+  const selectedDate = replayDate.value || currentPacificDate();
+  if (historyStartDate && !historyStartDate.value) {
+    historyStartDate.value = selectedDate;
+  }
+  if (historyEndDate && !historyEndDate.value) {
+    historyEndDate.value = selectedDate;
+  }
+}
+
+function syncHistoryExportDatesToReplayDate() {
+  const selectedDate = replayDate.value || currentPacificDate();
+  if (historyStartDate && historyEndDate && historyStartDate.value === historyEndDate.value) {
+    historyStartDate.value = selectedDate;
+    historyEndDate.value = selectedDate;
   }
 }
 
@@ -1039,7 +1148,7 @@ function renderOptionRecommendation(payload) {
       ${contractMetric("Spread", formatPercent(candidate.spread_pct), "The gap between buy and sell prices. Smaller is usually better because it may cost less to enter and exit.")}
       ${contractMetric("Open int", candidate.open_interest ?? "n/a", "How many of this option are still open in the market. Bigger usually means more people are involved and the option may be easier to trade.")}
       ${contractMetric("Score", formatNumber(candidate.score), "The bot's quality rank for this contract. It favors options near the GEX target, with tighter pricing and better activity.")}
-      <small>${formatGreek("delta", candidate.delta)} ${formatGreek("gamma", candidate.gamma)} ${formatGreek("iv", candidate.implied_volatility)}</small>
+      <small>${greekSummary(candidate)}</small>
     `;
     row.addEventListener("click", () => {
       isInspectingContract = true;
@@ -1107,14 +1216,12 @@ function renderBestPick(payload, mode) {
   }
 
   if (!isStandDown) {
-    recordTradePermissionPick({
-      candidate,
+    recordTradePermissionPicks({
+      candidates: payload.candidates || [],
       recommendation,
       payload,
       mode,
-      entryPrice,
       priceLabel,
-      score,
     });
   }
 }
@@ -1145,28 +1252,70 @@ function stageCandidate(candidate, entryPrice, message) {
   setAlpacaStatus(message, false);
 }
 
-function recordTradePermissionPick({ candidate, recommendation, payload, mode, entryPrice, priceLabel, score }) {
+function recordTradePermissionPicks({ candidates, recommendation, payload, mode, priceLabel }) {
   const timestamp = pickTimestamp({ recommendation, payload, mode });
-  const item = {
-    id: `${mode}:${timestamp.iso}:${candidate.symbol}`,
+  const items = (candidates || [])
+    .slice(0, MAX_RECORDED_PERMISSION_CANDIDATES)
+    .map((candidate, index) =>
+      buildTradePermissionItem({
+        candidate,
+        recommendation,
+        payload,
+        mode,
+        priceLabel,
+        timestamp,
+        rank: index + 1,
+      })
+    )
+    .filter(Boolean);
+
+  if (items.length === 0) {
+    return;
+  }
+
+  const history = loadTradeHistory();
+  const incomingIds = new Set(items.map((item) => item.id));
+  const withoutDuplicates = history.filter((existing) => !incomingIds.has(existing.id));
+  saveTradeHistory([...items, ...withoutDuplicates].slice(0, MAX_TRADE_HISTORY_ITEMS));
+  renderTradeHistory();
+}
+
+function buildTradePermissionItem({ candidate, recommendation, payload, mode, priceLabel, timestamp, rank }) {
+  if (!candidate.symbol) {
+    return null;
+  }
+
+  const entryPrice = mode === "replay" ? candidate.close : candidate.mid;
+  const score = mode === "replay" ? candidate.replay_score : candidate.score;
+  return {
+    id: `${mode}:${timestamp.iso}:${rank}:${candidate.symbol}`,
     timestamp,
     replayDate: mode === "replay" && payload.date ? payload.date : timestamp.day,
     mode,
+    rank,
     ticker: recommendation.ticker || contractUnderlying(candidate),
+    underlying: candidate.underlying_symbol || recommendation.underlying_symbol || contractUnderlying(candidate),
     bias: recommendation.bias || "unknown",
     permission: recommendation.trade_permission || "trade permission",
     contract: readableContractName(candidate),
     symbol: candidate.symbol,
     side: contractSide(candidate),
+    expirationDate: candidate.expiration_date,
+    strikePrice: candidate.strike_price,
+    contractType: candidate.contract_type || contractSide(candidate),
     entryPrice,
+    entrySpot: recommendation.gex_spot || null,
+    pricePath: Array.isArray(candidate.price_path) ? candidate.price_path : [],
+    entryGreeks: {
+      delta: candidate.delta ?? null,
+      gamma: candidate.gamma ?? null,
+      implied_volatility: candidate.implied_volatility ?? null,
+      estimated: Boolean(candidate.greeks_estimated),
+    },
     priceLabel,
     score,
     sellPlan: sellPlanText(entryPrice),
   };
-  const history = loadTradeHistory();
-  const withoutDuplicate = history.filter((existing) => existing.id !== item.id);
-  saveTradeHistory([item, ...withoutDuplicate].slice(0, MAX_TRADE_HISTORY_ITEMS));
-  renderTradeHistory();
 }
 
 function pickTimestamp({ recommendation, payload, mode }) {
@@ -1207,19 +1356,22 @@ function renderTradeHistory() {
     const row = document.createElement("button");
     row.type = "button";
     row.className = `trade-history-row contract-${item.side || "call"}`;
+    row.dataset.historyId = item.id || "";
     row.dataset.symbol = item.symbol || "";
     row.dataset.entryPrice = item.entryPrice || "";
     row.innerHTML = `
-      <span>
+      <span class="history-contract">
         <strong>${item.timestamp.label}</strong>
-        <em>${item.contract}</em>
+        <em>${historyRankLabel(item)}${item.contract}</em>
       </span>
-      <span><i>Recorded</i><strong>${formatCurrency(item.entryPrice)}</strong></span>
-      <span><i>Current</i><strong class="history-current">Loading...</strong></span>
-      <span><i>Change</i><strong class="history-change">-</strong></span>
-      <span><i>Exit</i><strong class="history-exit">Checking...</strong></span>
-      <span><i>Bias</i><strong>${item.bias}</strong></span>
-      <span><i>Score</i><strong>${formatOptionalNumber(item.score)}</strong></span>
+      <span class="history-pill history-bias">${item.bias}</span>
+      <span class="history-pill">Score ${formatOptionalNumber(item.score)}</span>
+      <span class="history-stat"><i>Recorded</i><strong>${formatCurrency(item.entryPrice)}</strong></span>
+      <span class="history-stat"><i>High</i><strong class="history-high">Loading...</strong><em class="history-high-greeks">-</em></span>
+      <span class="history-stat"><i>Low</i><strong class="history-low">Loading...</strong><em class="history-low-greeks">-</em></span>
+      <span class="history-stat"><i>Current</i><strong class="history-current">Loading...</strong></span>
+      <span class="history-stat"><i>Change</i><strong class="history-change">-</strong></span>
+      <span class="history-stat"><i>Exit</i><strong class="history-exit">Checking...</strong></span>
     `;
     row.addEventListener("click", () => {
       stageCandidate(
@@ -1230,7 +1382,340 @@ function renderTradeHistory() {
     });
     fields.tradeHistory.appendChild(row);
   }
+  updateTradeHistoryOutcomes(history);
   updateTradeHistoryPrices(history);
+}
+
+function historyRankLabel(item) {
+  return item.rank ? `Pick #${item.rank} - ` : "";
+}
+
+function clearTradeHistoryForSelectedDay() {
+  const selectedDate = replayDate.value || currentPacificDate();
+  const remaining = loadTradeHistory().filter((item) => historyItemDate(item) !== selectedDate);
+  saveTradeHistory(remaining);
+  setStatus(`Cleared trade-permission picks for ${formatContractDate(selectedDate)}.`, false);
+}
+
+async function downloadTradeHistoryForSelectedDay() {
+  const selectedDate = replayDate.value || currentPacificDate();
+  const history = loadTradeHistory().filter((item) => historyItemDate(item) === selectedDate);
+  await downloadTradeHistoryItems({
+    history,
+    emptyMessage: `No trade-permission picks to download for ${formatContractDate(selectedDate)}.`,
+    filename: `trade-permissions-${selectedDate}.csv`,
+    label: formatContractDate(selectedDate),
+  });
+}
+
+async function downloadTradeHistoryForRange() {
+  const startDate = historyStartDate?.value || replayDate.value || currentPacificDate();
+  const endDate = historyEndDate?.value || startDate;
+  const from = startDate <= endDate ? startDate : endDate;
+  const to = startDate <= endDate ? endDate : startDate;
+  const tickers = parseTickerFilter(historyTickers?.value || "");
+  const history = loadTradeHistory().filter((item) => {
+    const day = historyItemDate(item);
+    return day >= from && day <= to && matchesTickerFilter(item, tickers);
+  });
+  const tickerLabel = tickers.length > 0 ? `-${tickers.join("-")}` : "";
+  await downloadTradeHistoryItems({
+    history,
+    emptyMessage: `No trade-permission picks found from ${formatContractDate(from)} to ${formatContractDate(to)}${tickers.length ? ` for ${tickers.join(", ")}` : ""}.`,
+    filename: `trade-permissions-${from}-to-${to}${tickerLabel}.csv`,
+    label: `${formatContractDate(from)} to ${formatContractDate(to)}`,
+  });
+}
+
+async function downloadTradeHistoryItems({ history, emptyMessage, filename, label }) {
+  if (history.length === 0) {
+    setStatus(emptyMessage, true);
+    return;
+  }
+
+  setStatus(`Refreshing outcome data for ${history.length} saved picks...`, false);
+  let outcomes = {};
+  try {
+    outcomes = await fetchTradeHistoryOutcomes(history);
+  } catch (_error) {
+    setStatus("Could not refresh high/low outcomes. Downloading saved values instead.", true);
+  }
+  const mergedOutcomes = mergeOutcomeFallbacks(history, outcomes);
+  const hydrated = history.map((item) => mergedOutcomes[item.id] ? { ...item, outcome: mergedOutcomes[item.id] } : item);
+  saveTradeHistoryOutcomes(mergedOutcomes);
+  const csv = tradeHistoryCsv(hydrated);
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  setStatus(`Downloaded ${hydrated.length} trade-permission picks for ${label}.`, false);
+}
+
+function tradeHistoryCsv(history) {
+  const header = [
+    "time",
+    "rank",
+    "ticker",
+    "contract",
+    "symbol",
+    "side",
+    "recorded_price",
+    "highest_after_buy",
+    "highest_delta",
+    "highest_gamma",
+    "highest_iv",
+    "lowest_after_buy",
+    "lowest_delta",
+    "lowest_gamma",
+    "lowest_iv",
+    "outcome_status",
+    "bias",
+    "permission",
+    "score",
+    "mode",
+  ];
+  const rows = history.map((item) => [
+    item.timestamp?.label || "",
+    item.rank || "",
+    item.ticker || "",
+    item.contract || "",
+    item.symbol || "",
+    item.side || "",
+    item.entryPrice ?? "",
+    item.outcome?.high ?? "",
+    item.outcome?.high_greeks?.delta ?? "",
+    item.outcome?.high_greeks?.gamma ?? "",
+    item.outcome?.high_greeks?.implied_volatility ?? "",
+    item.outcome?.low ?? "",
+    item.outcome?.low_greeks?.delta ?? "",
+    item.outcome?.low_greeks?.gamma ?? "",
+    item.outcome?.low_greeks?.implied_volatility ?? "",
+    outcomeStatus(item.outcome),
+    item.bias || "",
+    item.permission || "",
+    item.score ?? "",
+    item.mode || "",
+  ]);
+  return [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\n");
+}
+
+function parseTickerFilter(value) {
+  return [...new Set(
+    String(value || "")
+      .split(",")
+      .map((ticker) => ticker.trim().toUpperCase())
+      .filter(Boolean)
+  )];
+}
+
+function matchesTickerFilter(item, tickers) {
+  if (tickers.length === 0) {
+    return true;
+  }
+  const ticker = String(item.ticker || "").toUpperCase();
+  const underlying = String(item.underlying || "").toUpperCase();
+  const symbol = String(item.symbol || "").toUpperCase();
+  return tickers.some((filter) => ticker === filter || underlying === filter || symbol.startsWith(filter));
+}
+
+function csvCell(value) {
+  const text = String(value ?? "");
+  return `"${text.replaceAll('"', '""')}"`;
+}
+
+async function updateTradeHistoryOutcomes(history) {
+  try {
+    const outcomes = await fetchTradeHistoryOutcomes(history);
+    const mergedOutcomes = mergeOutcomeFallbacks(history, outcomes);
+    saveTradeHistoryOutcomes(mergedOutcomes);
+    for (const row of fields.tradeHistory.querySelectorAll(".trade-history-row")) {
+      const id = row.dataset.historyId;
+      renderHistoryOutcome(row, mergedOutcomes[id]);
+    }
+  } catch (_error) {
+    const fallbackOutcomes = mergeOutcomeFallbacks(history, {});
+    saveTradeHistoryOutcomes(fallbackOutcomes);
+    for (const row of fields.tradeHistory.querySelectorAll(".trade-history-row")) {
+      renderHistoryOutcome(row, fallbackOutcomes[row.dataset.historyId] || null);
+    }
+  }
+}
+
+function mergeOutcomeFallbacks(history, outcomes) {
+  const merged = { ...outcomes };
+  const allHistory = loadTradeHistory();
+  for (const item of history) {
+    const existing = merged[item.id] || item.outcome;
+    if (existing && !existing.error && existing.high !== undefined && existing.low !== undefined) {
+      merged[item.id] = existing;
+      continue;
+    }
+    const fallback = savedSignalOutcomeFallback(item, allHistory);
+    if (fallback) {
+      merged[item.id] = fallback;
+    } else if (existing) {
+      merged[item.id] = existing;
+    }
+  }
+  return merged;
+}
+
+function savedSignalOutcomeFallback(item, allHistory) {
+  const symbol = String(item.symbol || "").toUpperCase();
+  const day = historyItemDate(item);
+  const entryIso = item.timestamp?.iso || "";
+  if (!symbol || !day || !entryIso) {
+    return null;
+  }
+
+  const comparable = allHistory
+    .filter((candidate) => {
+      const candidatePrice = optionalNumber(candidate.entryPrice);
+      return (
+        String(candidate.symbol || "").toUpperCase() === symbol &&
+        historyItemDate(candidate) === day &&
+        candidate.timestamp?.iso &&
+        candidate.timestamp.iso >= entryIso &&
+        candidatePrice !== null &&
+        Number.isFinite(candidatePrice)
+      );
+    })
+    .sort((a, b) => String(a.timestamp?.iso || "").localeCompare(String(b.timestamp?.iso || "")));
+
+  if (comparable.length === 0) {
+    return null;
+  }
+
+  const highItem = comparable.reduce((best, current) =>
+    Number(current.entryPrice) > Number(best.entryPrice) ? current : best
+  );
+  const lowItem = comparable.reduce((best, current) =>
+    Number(current.entryPrice) < Number(best.entryPrice) ? current : best
+  );
+  const entryPrice = optionalNumber(item.entryPrice);
+  const high = optionalNumber(highItem.entryPrice);
+  const low = optionalNumber(lowItem.entryPrice);
+  return {
+    high,
+    high_time: highItem.timestamp?.iso || null,
+    high_greeks: greeksFromHistoryItem(highItem),
+    low,
+    low_time: lowItem.timestamp?.iso || null,
+    low_greeks: greeksFromHistoryItem(lowItem),
+    went_up: high !== null && entryPrice !== null ? high > entryPrice : false,
+    source: "saved signal prices fallback",
+  };
+}
+
+function greeksFromHistoryItem(item) {
+  const greeks = item.entryGreeks || {};
+  const delta = optionalNumber(greeks.delta);
+  const gamma = optionalNumber(greeks.gamma);
+  const iv = optionalNumber(greeks.implied_volatility);
+  if (delta === null && gamma === null && iv === null) {
+    return null;
+  }
+  return {
+    delta,
+    gamma,
+    implied_volatility: iv,
+    estimated: Boolean(greeks.estimated),
+  };
+}
+
+async function fetchTradeHistoryOutcomes(history) {
+  const entries = history
+    .filter((item) => item.symbol && item.timestamp?.iso)
+    .map((item) => ({
+      id: item.id,
+      symbol: item.symbol,
+      date: historyItemDate(item),
+      timestamp_iso: item.timestamp.iso,
+      underlying: item.underlying || item.ticker || contractUnderlying({ symbol: item.symbol }),
+      expiration_date: item.expirationDate,
+      strike_price: item.strikePrice,
+      contract_type: item.contractType || item.side,
+      entry_price: item.entryPrice,
+      entry_spot: item.entrySpot,
+      entry_iv: item.entryGreeks?.implied_volatility,
+      fallback_path: item.pricePath || [],
+      fallback_delta: item.entryGreeks?.delta,
+      fallback_gamma: item.entryGreeks?.gamma,
+    }));
+  if (entries.length === 0) {
+    return {};
+  }
+
+  const outcomes = {};
+  for (let index = 0; index < entries.length; index += 100) {
+    const payload = await postJson("/api/options/outcomes", { entries: entries.slice(index, index + 100) });
+    Object.assign(outcomes, payload.outcomes || {});
+  }
+  return outcomes;
+}
+
+function saveTradeHistoryOutcomes(outcomes) {
+  const history = loadTradeHistory();
+  let changed = false;
+  const updated = history.map((item) => {
+    const outcome = outcomes[item.id];
+    if (!outcome) {
+      return item;
+    }
+    changed = true;
+    return { ...item, outcome };
+  });
+  if (changed) {
+    saveTradeHistory(updated);
+  }
+}
+
+function renderHistoryOutcome(row, outcome) {
+  const highEl = row.querySelector(".history-high");
+  const highGreeksEl = row.querySelector(".history-high-greeks");
+  const lowEl = row.querySelector(".history-low");
+  const lowGreeksEl = row.querySelector(".history-low-greeks");
+  if (!highEl || !highGreeksEl || !lowEl || !lowGreeksEl) {
+    return;
+  }
+  if (!outcome || outcome.error) {
+    highEl.textContent = "n/a";
+    highGreeksEl.textContent = outcome?.error || "No outcome data";
+    lowEl.textContent = "n/a";
+    lowGreeksEl.textContent = "-";
+    return;
+  }
+
+  highEl.textContent = outcome.went_up ? formatCurrency(outcome.high) : `No rise ${formatCurrency(outcome.high)}`;
+  highGreeksEl.textContent = greekOutcomeSummary(outcome.high_greeks);
+  lowEl.textContent = formatCurrency(outcome.low);
+  lowGreeksEl.textContent = greekOutcomeSummary(outcome.low_greeks);
+}
+
+function outcomeStatus(outcome) {
+  if (!outcome) {
+    return "not refreshed";
+  }
+  if (outcome.error) {
+    return outcome.error;
+  }
+  if (outcome.source) {
+    return outcome.source;
+  }
+  return "alpaca option bars";
+}
+
+function greekOutcomeSummary(greeks) {
+  if (!greeks) {
+    return "Greeks n/a";
+  }
+  const suffix = greeks.estimated ? " est" : "";
+  return `${formatGreek("delta", greeks.delta)} ${formatGreek("gamma", greeks.gamma)} ${formatGreek("iv", greeks.implied_volatility)}${suffix}`;
 }
 
 async function updateTradeHistoryPrices(history) {
@@ -1625,6 +2110,11 @@ function formatGreek(label, value) {
     return `${label}: ${formatPercent(value)}`;
   }
   return `${label}: ${Number(value).toFixed(3)}`;
+}
+
+function greekSummary(candidate) {
+  const suffix = candidate.greeks_estimated ? " estimated" : "";
+  return `${formatGreek("delta", candidate.delta)} ${formatGreek("gamma", candidate.gamma)} ${formatGreek("iv", candidate.implied_volatility)}${suffix}`;
 }
 
 function setAlpacaStatus(message, isError) {

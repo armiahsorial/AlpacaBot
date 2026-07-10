@@ -17,7 +17,7 @@
         <form id="analysis-form" class="controls">
           <label>
             <span>Ticker</span>
-            <select id="ticker" name="ticker">
+            <select id="ticker" name="ticker" multiple size="6" aria-describedby="ticker-help">
               <option value="NDX" selected>NDX</option>
               <option value="SPX">SPX</option>
               <option value="RUT">RUT</option>
@@ -45,6 +45,7 @@
               <option value="WDC">WDC</option>
               <option value="WDCX">WDCX</option>
             </select>
+            <small id="ticker-help">Hold Command/Ctrl to pick more than one. The first selected ticker drives the contract watchlist.</small>
           </label>
 
           <label>
@@ -77,6 +78,13 @@
       </section>
 
       <section id="status" class="status">Ready.</section>
+
+      <section id="multi-ticker-panel" class="multi-ticker-panel hidden" aria-live="polite">
+        <div class="panel-heading compact-heading">
+          <h3>Selected Tickers</h3>
+        </div>
+        <div id="multi-ticker-list" class="multi-ticker-list"></div>
+      </section>
 
       <section class="contract-workspace" aria-label="Contract analysis">
         <section class="panel alpaca-panel contract-panel">
@@ -132,7 +140,25 @@
           <div class="trade-history-panel">
             <div class="panel-heading compact-heading">
               <h3>Trade Permission History</h3>
-              <button id="clear-trade-history" type="button">Clear</button>
+              <div class="history-actions">
+                <button id="export-trade-history" type="button">Download Day</button>
+                <button id="export-trade-history-range" type="button">Download Range</button>
+                <button id="clear-trade-history" type="button">Clear Day</button>
+              </div>
+            </div>
+            <div class="history-filters" aria-label="Trade history export filters">
+              <label>
+                <span>From</span>
+                <input id="history-start-date" type="date" />
+              </label>
+              <label>
+                <span>To</span>
+                <input id="history-end-date" type="date" />
+              </label>
+              <label>
+                <span>Tickers</span>
+                <input id="history-tickers" type="text" placeholder="All, or QQQ,AAPL" />
+              </label>
             </div>
             <div id="trade-history" class="trade-history-list">No trade-permission picks yet.</div>
           </div>

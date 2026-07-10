@@ -14,7 +14,7 @@ from trading_bot.alpaca_client import AlpacaApiError, AlpacaClient, PaperOrderRe
 from trading_bot.analysis import analyze_gex
 from trading_bot.config import AlpacaSettings, Settings
 from trading_bot.gex_client import AGGREGATION_PERIODS, GexApiError, GexClient
-from trading_bot.options_analysis import recommend_option_contracts
+from trading_bot.options_analysis import _black_scholes_delta, _black_scholes_gamma, _solve_implied_volatility, recommend_option_contracts
 from trading_bot.options_replay import replay_option_recommendation
 from trading_bot.technicals import StockTechnicals, calculate_stock_technicals
 
@@ -93,6 +93,10 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
 
         if parsed_url.path == "/api/alpaca/orders":
             self._handle_submit_alpaca_order()
+            return
+
+        if parsed_url.path == "/api/options/outcomes":
+            self._handle_option_outcomes()
             return
 
         self._send_json({"error": "Not found."}, status=HTTPStatus.NOT_FOUND)
@@ -289,6 +293,19 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
         except (AlpacaApiError, ValueError) as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
 
+    def _handle_option_outcomes(self) -> None:
+        try:
+            payload = self._read_json_body()
+            entries = payload.get("entries")
+            if not isinstance(entries, list) or not entries:
+                raise ValueError("entries are required.")
+            if len(entries) > 100:
+                raise ValueError("At most 100 option entries can be evaluated at once.")
+            outcomes = _option_outcomes(_alpaca_client(), entries)
+            self._send_json({"outcomes": outcomes})
+        except (AlpacaApiError, ValueError) as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
     def _send_file(self, path: Path, content_type: str) -> None:
         try:
             body = path.read_bytes()
@@ -397,6 +414,286 @@ def _stock_technicals(ticker: str, replay_date: str | None = None, replay_time: 
         minute_bars=minute_bars,
         daily_bars=daily_bars,
     )
+
+
+def _option_outcomes(alpaca_client: AlpacaClient, raw_entries: list[object]) -> dict[str, dict[str, object]]:
+    entries = [_normalize_option_outcome_entry(entry) for entry in raw_entries]
+    entries = [entry for entry in entries if entry is not None]
+    if not entries:
+        raise ValueError("entries did not include any usable option symbols.")
+
+    outcomes: dict[str, dict[str, object]] = {}
+    for outcome_date in sorted({entry["date"] for entry in entries}):
+        date_entries = [entry for entry in entries if entry["date"] == outcome_date]
+        symbols = sorted({entry["symbol"] for entry in date_entries})
+        start_dt = min(entry["start_dt"] for entry in date_entries)
+        end_dt = _option_outcome_end_dt(outcome_date)
+        if end_dt <= start_dt:
+            end_dt = start_dt + timedelta(minutes=1)
+
+        try:
+            option_bars = alpaca_client.get_option_bars(
+                symbols,
+                start=_to_utc_iso(start_dt),
+                end=_to_utc_iso(end_dt),
+                timeframe="1Min",
+            )
+            option_bars_error = None
+        except AlpacaApiError as exc:
+            option_bars = {}
+            option_bars_error = str(exc)
+        stock_bars_by_underlying = _load_outcome_stock_bars(alpaca_client, date_entries, start_dt, end_dt)
+
+        for entry in date_entries:
+            bars = [
+                bar
+                for bar in option_bars.get(entry["symbol"], [])
+                if isinstance(bar, dict) and (_bar_datetime(bar) is None or _bar_datetime(bar) >= entry["start_dt"])
+            ]
+            if bars:
+                outcomes[entry["id"]] = _outcome_for_entry(entry, bars, stock_bars_by_underlying.get(entry["underlying"], []))
+            else:
+                outcomes[entry["id"]] = _fallback_outcome_for_entry(entry, option_bars_error)
+
+    return outcomes
+
+
+def _normalize_option_outcome_entry(entry: object) -> dict[str, object] | None:
+    if not isinstance(entry, dict):
+        return None
+    symbol = str(entry.get("symbol", "")).strip().upper()
+    if not symbol:
+        return None
+    outcome_date = str(entry.get("date", "")).strip()
+    timestamp_iso = str(entry.get("timestamp_iso", "")).strip()
+    start_dt = _entry_start_datetime(outcome_date, timestamp_iso)
+    underlying = str(entry.get("underlying", "")).strip().upper() or _underlying_from_option_symbol(symbol)
+    return {
+        "id": str(entry.get("id") or symbol),
+        "symbol": symbol,
+        "date": outcome_date or start_dt.date().isoformat(),
+        "start_dt": start_dt,
+        "underlying": underlying,
+        "expiration_date": str(entry.get("expiration_date", "")).strip(),
+        "strike_price": _optional_snapshot_float(entry.get("strike_price")),
+        "contract_type": str(entry.get("contract_type", "")).strip().lower(),
+        "entry_price": _optional_snapshot_float(entry.get("entry_price")),
+        "entry_iv": _optional_snapshot_float(entry.get("entry_iv")),
+        "entry_spot": _optional_snapshot_float(entry.get("entry_spot")),
+        "fallback_path": [
+            value
+            for value in (_optional_snapshot_float(value) for value in _as_list(entry.get("fallback_path")))
+            if value is not None
+        ],
+        "fallback_delta": _optional_snapshot_float(entry.get("fallback_delta")),
+        "fallback_gamma": _optional_snapshot_float(entry.get("fallback_gamma")),
+    }
+
+
+def _entry_start_datetime(outcome_date: str, timestamp_iso: str) -> datetime:
+    if timestamp_iso:
+        value = timestamp_iso.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=EASTERN)
+            return parsed.astimezone(EASTERN)
+        except ValueError:
+            pass
+    if not outcome_date:
+        raise ValueError("entry date or timestamp is required.")
+    return datetime.combine(date.fromisoformat(outcome_date), time(9, 30), tzinfo=EASTERN)
+
+
+def _option_outcome_end_dt(outcome_date: str) -> datetime:
+    day = date.fromisoformat(outcome_date)
+    session_close = datetime.combine(day, time(16, 0), tzinfo=EASTERN)
+    now = datetime.now(EASTERN)
+    if day == now.date():
+        return min(now, session_close)
+    return session_close
+
+
+def _load_outcome_stock_bars(
+    alpaca_client: AlpacaClient,
+    entries: list[dict[str, object]],
+    start_dt: datetime,
+    end_dt: datetime,
+) -> dict[str, list[dict[str, object]]]:
+    bars_by_underlying: dict[str, list[dict[str, object]]] = {}
+    for underlying in sorted({str(entry["underlying"]) for entry in entries if entry.get("underlying")}):
+        try:
+            bars_by_underlying[underlying] = alpaca_client.get_stock_bars(
+                underlying,
+                start=_to_utc_iso(start_dt),
+                end=_to_utc_iso(end_dt),
+                timeframe="1Min",
+                feed=DEFAULT_STOCK_DATA_FEED,
+                limit=10000,
+            )
+        except AlpacaApiError:
+            bars_by_underlying[underlying] = []
+    return bars_by_underlying
+
+
+def _outcome_for_entry(
+    entry: dict[str, object],
+    bars: list[dict[str, object]],
+    stock_bars: list[dict[str, object]],
+) -> dict[str, object]:
+    if not bars:
+        return {"error": "No option bars found after the recorded buy time."}
+
+    high_bar = max(bars, key=lambda bar: _optional_snapshot_float(bar.get("h")) or float("-inf"))
+    low_bar = min(bars, key=lambda bar: _optional_snapshot_float(bar.get("l")) or float("inf"))
+    high_price = _optional_snapshot_float(high_bar.get("h"))
+    low_price = _optional_snapshot_float(low_bar.get("l"))
+    entry_price = entry.get("entry_price")
+    went_up = high_price is not None and isinstance(entry_price, float) and high_price > entry_price
+
+    high_time = _bar_datetime(high_bar)
+    low_time = _bar_datetime(low_bar)
+    return {
+        "high": high_price,
+        "high_time": high_time.isoformat() if high_time else None,
+        "high_greeks": _estimate_outcome_greeks(entry, high_price, high_time, stock_bars),
+        "low": low_price,
+        "low_time": low_time.isoformat() if low_time else None,
+        "low_greeks": _estimate_outcome_greeks(entry, low_price, low_time, stock_bars),
+        "went_up": went_up,
+        "source": "alpaca option bars",
+    }
+
+
+def _fallback_outcome_for_entry(entry: dict[str, object], option_bars_error: str | None) -> dict[str, object]:
+    path = entry.get("fallback_path")
+    path = path if isinstance(path, list) else []
+    prices = [price for price in path if isinstance(price, float)]
+    if not prices:
+        return {"error": option_bars_error or "No option bars found after the recorded buy time."}
+
+    high_price = max(prices)
+    low_price = min(prices)
+    entry_price = entry.get("entry_price")
+    went_up = high_price is not None and isinstance(entry_price, float) and high_price > entry_price
+    greeks = _fallback_greeks(entry)
+    return {
+        "high": high_price,
+        "high_time": None,
+        "high_greeks": greeks,
+        "low": low_price,
+        "low_time": None,
+        "low_greeks": greeks,
+        "went_up": went_up,
+        "source": "saved intraday path fallback",
+    }
+
+
+def _fallback_greeks(entry: dict[str, object]) -> dict[str, float | bool] | None:
+    delta = entry.get("fallback_delta")
+    gamma = entry.get("fallback_gamma")
+    iv = entry.get("entry_iv")
+    if not isinstance(delta, float) and not isinstance(gamma, float) and not isinstance(iv, float):
+        return None
+    return {
+        "delta": delta if isinstance(delta, float) else None,
+        "gamma": gamma if isinstance(gamma, float) else None,
+        "implied_volatility": iv if isinstance(iv, float) else None,
+        "estimated": True,
+    }
+
+
+def _estimate_outcome_greeks(
+    entry: dict[str, object],
+    option_price: float | None,
+    as_of: datetime | None,
+    stock_bars: list[dict[str, object]],
+) -> dict[str, float | bool] | None:
+    if option_price is None or as_of is None:
+        return None
+    spot = _spot_at_or_before(stock_bars, as_of) or entry.get("entry_spot")
+    strike = entry.get("strike_price")
+    expiration_date = str(entry.get("expiration_date") or "")
+    contract_type = str(entry.get("contract_type") or "")
+    if not isinstance(spot, float) or not isinstance(strike, float):
+        return None
+    years = _years_to_expiration_at(expiration_date, as_of)
+    if years is None or years <= 0:
+        return None
+    volatility = _solve_implied_volatility(
+        contract_type=contract_type,
+        spot=spot,
+        strike=strike,
+        years=years,
+        option_mid=option_price,
+    )
+    if volatility is None or volatility <= 0:
+        entry_iv = entry.get("entry_iv")
+        volatility = entry_iv if isinstance(entry_iv, float) and entry_iv > 0 else None
+    if volatility is None:
+        return None
+    delta = _black_scholes_delta(contract_type, spot, strike, years, volatility)
+    gamma = _black_scholes_gamma(spot, strike, years, volatility)
+    if delta is None or gamma is None:
+        return None
+    return {
+        "delta": delta,
+        "gamma": gamma,
+        "implied_volatility": volatility,
+        "estimated": True,
+    }
+
+
+def _years_to_expiration_at(expiration_date: str, as_of: datetime) -> float | None:
+    try:
+        expiration_day = date.fromisoformat(expiration_date)
+    except ValueError:
+        return None
+    expiration_dt = datetime.combine(expiration_day, time(16, 0), tzinfo=EASTERN)
+    seconds = (expiration_dt - as_of.astimezone(EASTERN)).total_seconds()
+    return max(seconds, 60) / (365 * 24 * 60 * 60)
+
+
+def _spot_at_or_before(stock_bars: list[dict[str, object]], as_of: datetime) -> float | None:
+    best_time: datetime | None = None
+    best_close: float | None = None
+    for bar in stock_bars:
+        if not isinstance(bar, dict):
+            continue
+        bar_time = _bar_datetime(bar)
+        close = _optional_snapshot_float(bar.get("c"))
+        if bar_time is None or close is None or bar_time > as_of:
+            continue
+        if best_time is None or bar_time > best_time:
+            best_time = bar_time
+            best_close = close
+    return best_close
+
+
+def _bar_datetime(bar: dict[str, object]) -> datetime | None:
+    timestamp = bar.get("t")
+    if not timestamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC).astimezone(EASTERN)
+    return parsed.astimezone(EASTERN)
+
+
+def _underlying_from_option_symbol(symbol: str) -> str:
+    prefix = []
+    for character in symbol:
+        if character.isdigit():
+            break
+        prefix.append(character)
+    return "".join(prefix)
+
+
+def _as_list(value: object) -> list[object]:
+    return value if isinstance(value, list) else []
 
 
 def _technical_as_of(replay_date: str | None, replay_time: str | None) -> datetime:

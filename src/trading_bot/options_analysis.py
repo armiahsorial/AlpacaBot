@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
+from math import erf, exp, log, pi, sqrt
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -35,6 +36,7 @@ class OptionCandidate:
     delta: float | None
     gamma: float | None
     implied_volatility: float | None
+    greeks_estimated: bool
     score: float
     reasons: tuple[str, ...]
     price_path: tuple[float, ...] = ()
@@ -55,6 +57,7 @@ class OptionCandidate:
             "delta": self.delta,
             "gamma": self.gamma,
             "implied_volatility": self.implied_volatility,
+            "greeks_estimated": self.greeks_estimated,
             "score": round(self.score, 4),
             "reasons": list(self.reasons),
             "price_path": list(self.price_path),
@@ -314,6 +317,21 @@ def _candidate_from_contract(
     delta = _to_float(greeks.get("delta"))
     gamma = _to_float(greeks.get("gamma"))
     iv = _to_float(snapshot.get("impliedVolatility")) if isinstance(snapshot, dict) else None
+    greeks_estimated = False
+    if delta is None or gamma is None or iv is None:
+        estimate = _estimate_greeks(
+            contract_type=contract_type,
+            spot=analysis.spot,
+            strike=strike,
+            expiration_date=str(contract.get("expiration_date", "")),
+            option_mid=mid,
+            implied_volatility=iv,
+        )
+        if estimate:
+            delta = delta if delta is not None else estimate["delta"]
+            gamma = gamma if gamma is not None else estimate["gamma"]
+            iv = iv if iv is not None else estimate["implied_volatility"]
+            greeks_estimated = True
 
     score = 100.0
     reasons: list[str] = []
@@ -338,6 +356,8 @@ def _candidate_from_contract(
         desired_delta = 0.45 if contract_type == "call" else -0.45
         score -= min(abs(delta - desired_delta) * 25, 15)
         reasons.append(f"Delta is {delta:g}.")
+        if greeks_estimated:
+            reasons.append("Greeks were estimated from option mid because Alpaca did not return snapshot Greeks.")
 
     if analysis.trade_permission == "no trade":
         score -= 20
@@ -358,9 +378,158 @@ def _candidate_from_contract(
         delta=delta,
         gamma=gamma,
         implied_volatility=iv,
+        greeks_estimated=greeks_estimated,
         score=score,
         reasons=tuple(reasons),
     )
+
+
+def _estimate_greeks(
+    *,
+    contract_type: str,
+    spot: float,
+    strike: float,
+    expiration_date: str,
+    option_mid: float,
+    implied_volatility: float | None,
+) -> dict[str, float] | None:
+    years = _years_to_expiration(expiration_date)
+    if spot <= 0 or strike <= 0 or option_mid <= 0 or years is None or years <= 0:
+        return None
+
+    volatility = implied_volatility
+    if volatility is None or volatility <= 0:
+        volatility = _solve_implied_volatility(
+            contract_type=contract_type,
+            spot=spot,
+            strike=strike,
+            years=years,
+            option_mid=option_mid,
+        )
+    if volatility is None or volatility <= 0:
+        return None
+
+    delta = _black_scholes_delta(contract_type, spot, strike, years, volatility)
+    gamma = _black_scholes_gamma(spot, strike, years, volatility)
+    if delta is None or gamma is None:
+        return None
+    return {
+        "delta": delta,
+        "gamma": gamma,
+        "implied_volatility": volatility,
+    }
+
+
+def _years_to_expiration(expiration_date: str) -> float | None:
+    try:
+        expiration_day = date.fromisoformat(expiration_date)
+    except ValueError:
+        return None
+    expiration_dt = datetime.combine(expiration_day, time(16, 0), tzinfo=MARKET_TZ)
+    seconds = (expiration_dt - datetime.now(MARKET_TZ)).total_seconds()
+    return max(seconds, 60) / (365 * 24 * 60 * 60)
+
+
+def _solve_implied_volatility(
+    *,
+    contract_type: str,
+    spot: float,
+    strike: float,
+    years: float,
+    option_mid: float,
+) -> float | None:
+    low = 0.01
+    high = 5.0
+    low_price = _black_scholes_price(contract_type, spot, strike, years, low)
+    high_price = _black_scholes_price(contract_type, spot, strike, years, high)
+    if low_price is None or high_price is None:
+        return None
+    if option_mid < low_price or option_mid > high_price:
+        return None
+
+    for _ in range(60):
+        mid = (low + high) / 2
+        price = _black_scholes_price(contract_type, spot, strike, years, mid)
+        if price is None:
+            return None
+        if price < option_mid:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2
+
+
+def _black_scholes_price(
+    contract_type: str,
+    spot: float,
+    strike: float,
+    years: float,
+    volatility: float,
+    risk_free_rate: float = 0.045,
+) -> float | None:
+    d1, d2 = _black_scholes_d1_d2(spot, strike, years, volatility, risk_free_rate)
+    if d1 is None or d2 is None:
+        return None
+    discounted_strike = strike * exp(-risk_free_rate * years)
+    if contract_type == "call":
+        return spot * _normal_cdf(d1) - discounted_strike * _normal_cdf(d2)
+    if contract_type == "put":
+        return discounted_strike * _normal_cdf(-d2) - spot * _normal_cdf(-d1)
+    return None
+
+
+def _black_scholes_delta(
+    contract_type: str,
+    spot: float,
+    strike: float,
+    years: float,
+    volatility: float,
+    risk_free_rate: float = 0.045,
+) -> float | None:
+    d1, _d2 = _black_scholes_d1_d2(spot, strike, years, volatility, risk_free_rate)
+    if d1 is None:
+        return None
+    if contract_type == "call":
+        return _normal_cdf(d1)
+    if contract_type == "put":
+        return _normal_cdf(d1) - 1
+    return None
+
+
+def _black_scholes_gamma(
+    spot: float,
+    strike: float,
+    years: float,
+    volatility: float,
+    risk_free_rate: float = 0.045,
+) -> float | None:
+    d1, _d2 = _black_scholes_d1_d2(spot, strike, years, volatility, risk_free_rate)
+    if d1 is None or spot <= 0 or volatility <= 0 or years <= 0:
+        return None
+    return _normal_pdf(d1) / (spot * volatility * sqrt(years))
+
+
+def _black_scholes_d1_d2(
+    spot: float,
+    strike: float,
+    years: float,
+    volatility: float,
+    risk_free_rate: float,
+) -> tuple[float | None, float | None]:
+    if spot <= 0 or strike <= 0 or years <= 0 or volatility <= 0:
+        return None, None
+    denominator = volatility * sqrt(years)
+    d1 = (log(spot / strike) + (risk_free_rate + (volatility**2 / 2)) * years) / denominator
+    d2 = d1 - denominator
+    return d1, d2
+
+
+def _normal_cdf(value: float) -> float:
+    return (1 + erf(value / sqrt(2))) / 2
+
+
+def _normal_pdf(value: float) -> float:
+    return exp(-(value**2) / 2) / sqrt(2 * pi)
 
 
 def _to_float(value: Any) -> float | None:

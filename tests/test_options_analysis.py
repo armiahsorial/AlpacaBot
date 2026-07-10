@@ -15,6 +15,18 @@ class OptionRecommendationTests(unittest.TestCase):
         self.assertEqual(recommendation.candidates[0].symbol, "AAPL260110C00200000")
         self.assertIn("Watch", recommendation.recommendation)
 
+    def test_estimates_missing_greeks_from_mid_price(self):
+        recommendation = recommend_option_contracts(
+            gex_analysis=_analysis(bias="bullish", score=4, permission="possible trade after confirmation"),
+            alpaca_client=_FakeAlpacaClient(include_greeks=False),
+        )
+
+        candidate = recommendation.candidates[0]
+        self.assertTrue(candidate.greeks_estimated)
+        self.assertIsNotNone(candidate.delta)
+        self.assertIsNotNone(candidate.gamma)
+        self.assertIsNotNone(candidate.implied_volatility)
+
     def test_returns_no_contract_for_neutral_gex(self):
         recommendation = recommend_option_contracts(
             gex_analysis=_analysis(bias="neutral", score=0, permission="no trade"),
@@ -27,6 +39,9 @@ class OptionRecommendationTests(unittest.TestCase):
 
 
 class _FakeAlpacaClient:
+    def __init__(self, *, include_greeks: bool = True):
+        self._include_greeks = include_greeks
+
     def get_option_contracts(self, *_args, **_kwargs):
         return [
             {
@@ -35,7 +50,7 @@ class _FakeAlpacaClient:
                 "type": "call",
                 "status": "active",
                 "tradable": True,
-                "expiration_date": "2026-01-10",
+                "expiration_date": "2026-07-17",
                 "strike_price": "200",
                 "open_interest": "1500",
             },
@@ -45,24 +60,29 @@ class _FakeAlpacaClient:
                 "type": "put",
                 "status": "active",
                 "tradable": True,
-                "expiration_date": "2026-01-10",
+                "expiration_date": "2026-07-17",
                 "strike_price": "190",
                 "open_interest": "1500",
             },
         ]
 
     def get_option_snapshots(self, symbols):
-        return {
-            symbol: {
+        snapshots = {}
+        for symbol in symbols:
+            snapshot = {
                 "latestQuote": {
                     "bp": 2.4,
                     "ap": 2.6,
                 },
-                "greeks": {"delta": 0.44, "gamma": 0.03},
-                "impliedVolatility": 0.28,
             }
-            for symbol in symbols
-        }
+            if self._include_greeks:
+                snapshot["greeks"] = {"delta": 0.44, "gamma": 0.03}
+                snapshot["impliedVolatility"] = 0.28
+            snapshots[symbol] = snapshot
+        return snapshots
+
+    def get_option_bars(self, symbols, **_kwargs):
+        return {symbol: [] for symbol in symbols}
 
 
 def _analysis(*, bias: str, score: int, permission: str) -> GexAnalysis:

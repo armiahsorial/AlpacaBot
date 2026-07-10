@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, timedelta
+from dataclasses import dataclass, replace
+from datetime import date, datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from trading_bot.alpaca_client import AlpacaClient
 from trading_bot.analysis import GexAnalysis
@@ -14,6 +15,8 @@ OPTIONABLE_GEX_TICKER_OVERRIDES = {
     "NDX": "QQQ",
     "RUT": "IWM",
 }
+MARKET_TZ = ZoneInfo("America/New_York")
+UTC = ZoneInfo("UTC")
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,7 @@ class OptionCandidate:
     implied_volatility: float | None
     score: float
     reasons: tuple[str, ...]
+    price_path: tuple[float, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -53,6 +57,7 @@ class OptionCandidate:
             "implied_volatility": self.implied_volatility,
             "score": round(self.score, 4),
             "reasons": list(self.reasons),
+            "price_path": list(self.price_path),
         }
 
 
@@ -147,6 +152,7 @@ def recommend_option_contracts(
             reverse=True,
         )[:max_candidates]
     )
+    candidates = _attach_intraday_price_paths(alpaca_client, candidates)
 
     if not candidates:
         return OptionRecommendation(
@@ -242,6 +248,41 @@ def _load_snapshots(alpaca_client: AlpacaClient, symbols: list[str]) -> dict[str
     for index in range(0, len(symbols), 100):
         snapshots.update(alpaca_client.get_option_snapshots(symbols[index : index + 100]))
     return snapshots
+
+
+def _attach_intraday_price_paths(
+    alpaca_client: AlpacaClient,
+    candidates: tuple[OptionCandidate, ...],
+) -> tuple[OptionCandidate, ...]:
+    if not candidates:
+        return candidates
+
+    today = date.today()
+    start_dt = datetime.combine(today, time(9, 30), tzinfo=MARKET_TZ)
+    end_dt = datetime.now(MARKET_TZ)
+    if end_dt < start_dt:
+        return candidates
+
+    try:
+        bars_by_symbol = alpaca_client.get_option_bars(
+            [candidate.symbol for candidate in candidates],
+            start=start_dt.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+            end=end_dt.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+            timeframe="1Min",
+        )
+    except Exception:
+        return candidates
+
+    hydrated: list[OptionCandidate] = []
+    for candidate in candidates:
+        bars = bars_by_symbol.get(candidate.symbol, [])
+        price_path = tuple(
+            close
+            for close in (_to_float(bar.get("c")) for bar in bars if isinstance(bar, dict))
+            if close is not None
+        )
+        hydrated.append(replace(candidate, price_path=price_path))
+    return tuple(hydrated)
 
 
 def _candidate_from_contract(

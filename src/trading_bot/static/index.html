@@ -39,7 +39,11 @@
               <option value="MSTR">MSTR</option>
               <option value="NVDA">NVDA</option>
               <option value="PLTR">PLTR</option>
+              <option value="SNDK">SNDK</option>
+              <option value="SNXX">SNXX</option>
               <option value="TSLA">TSLA</option>
+              <option value="WDC">WDC</option>
+              <option value="WDCX">WDCX</option>
             </select>
           </label>
 
@@ -55,7 +59,7 @@
           <button id="analyze-button" type="submit">Analyze</button>
 
           <label class="inline-toggle">
-            <input id="auto-refresh" type="checkbox" />
+            <input id="auto-refresh" type="checkbox" checked />
             <span>Auto</span>
           </label>
 
@@ -74,81 +78,24 @@
 
       <section id="status" class="status">Ready.</section>
 
-      <section class="alpaca-workspace" aria-label="Alpaca paper trading">
-        <section class="panel alpaca-panel">
-          <div class="panel-heading">
-            <h2>Alpaca Paper</h2>
-            <button id="refresh-alpaca" type="button">Refresh</button>
-          </div>
-          <div id="alpaca-status" class="mini-status">Not connected.</div>
-          <div class="account-grid">
-            <div><span class="label">Status</span><strong id="alpaca-account-status">-</strong></div>
-            <div><span class="label">Cash</span><strong id="alpaca-cash">-</strong></div>
-            <div><span class="label">Buying Power</span><strong id="alpaca-buying-power">-</strong></div>
-            <div><span class="label">Portfolio</span><strong id="alpaca-portfolio">-</strong></div>
-          </div>
-        </section>
-
-        <section class="panel alpaca-panel">
-          <div class="panel-heading">
-            <h2>Paper Order</h2>
-            <span class="paper-badge">Paper only</span>
-          </div>
-          <form id="paper-order-form" class="order-form">
-            <label>
-              <span>Symbol</span>
-              <input name="symbol" value="SPY" autocomplete="off" />
-            </label>
-            <label>
-              <span>Side</span>
-              <select name="side">
-                <option value="buy">Buy</option>
-                <option value="sell">Sell</option>
-              </select>
-            </label>
-            <label>
-              <span>Qty</span>
-              <input name="qty" type="number" min="0" step="0.0001" value="1" />
-            </label>
-            <label>
-              <span>Type</span>
-              <select name="type">
-                <option value="market">Market</option>
-                <option value="limit">Limit</option>
-              </select>
-            </label>
-            <label>
-              <span>Limit</span>
-              <input name="limit_price" type="number" min="0" step="0.01" />
-            </label>
-            <button type="submit">Submit</button>
-          </form>
-        </section>
-
-        <section class="panel alpaca-panel">
-          <div class="panel-heading">
-            <h2>Positions</h2>
-            <button id="refresh-positions" type="button">Refresh</button>
-          </div>
-          <div id="positions-list" class="compact-list">-</div>
-        </section>
-
-        <section class="panel alpaca-panel">
-          <div class="panel-heading">
-            <h2>Latest Bar</h2>
-            <button id="load-bar" type="button">Load</button>
-          </div>
-          <label>
-            <span>Symbol</span>
-            <input id="bar-symbol" value="SPY" autocomplete="off" />
-          </label>
-          <pre id="latest-bar" class="data-box">-</pre>
-        </section>
-
+      <section class="contract-workspace" aria-label="Contract analysis">
         <section class="panel alpaca-panel contract-panel">
           <div class="panel-heading">
             <h2>Contract Watchlist</h2>
-            <button id="load-contracts" type="button">Scan</button>
+          </div>
+          <div class="live-controls">
+            <button id="live-update" type="button">Live Now</button>
+            <button id="live-toggle" type="button">Start Live</button>
+            <label>
+              <span>Refresh</span>
+              <select id="live-interval">
+                <option value="30">30 sec</option>
+                <option value="60" selected>60 sec</option>
+                <option value="120">2 min</option>
+                <option value="300">5 min</option>
+              </select>
+            </label>
+            <div id="live-status" class="mini-status">Live mode is off.</div>
           </div>
           <div class="replay-controls">
             <label>
@@ -179,8 +126,8 @@
               <strong id="best-pick-action">-</strong>
               <p id="best-pick-contract">-</p>
               <p id="best-pick-reason">-</p>
+              <p id="best-pick-exit">-</p>
             </div>
-            <button id="stage-best-pick" type="button">Stage</button>
           </div>
           <div class="trade-history-panel">
             <div class="panel-heading compact-heading">
@@ -220,6 +167,18 @@
             <strong id="zero-gamma">-</strong>
           </div>
         </div>
+
+        <section class="panel">
+          <h2>Technicals</h2>
+          <dl>
+            <div><dt>VWAP</dt><dd id="technical-vwap">-</dd></div>
+            <div><dt>50-day MA</dt><dd id="technical-sma-50">-</dd></div>
+            <div><dt>200-day MA</dt><dd id="technical-sma-200">-</dd></div>
+            <div><dt>Fib near 200 MA</dt><dd id="technical-fib-200">-</dd></div>
+            <div><dt>Technical lean</dt><dd id="technical-lean">-</dd></div>
+          </dl>
+          <ul id="technical-reasons" class="compact-list"></ul>
+        </section>
 
         <section class="panel">
           <h2>Action</h2>

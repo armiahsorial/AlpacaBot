@@ -10,6 +10,10 @@ const refreshPositionsButton = document.querySelector("#refresh-positions");
 const paperOrderForm = document.querySelector("#paper-order-form");
 const loadBarButton = document.querySelector("#load-bar");
 const loadContractsButton = document.querySelector("#load-contracts");
+const liveUpdateButton = document.querySelector("#live-update");
+const liveToggleButton = document.querySelector("#live-toggle");
+const liveInterval = document.querySelector("#live-interval");
+const liveStatus = document.querySelector("#live-status");
 const replayDate = document.querySelector("#replay-date");
 const replayTime = document.querySelector("#replay-time");
 const replayClock = document.querySelector("#replay-clock");
@@ -26,11 +30,14 @@ metricTooltip.className = "metric-tooltip";
 metricTooltip.setAttribute("role", "tooltip");
 document.body.appendChild(metricTooltip);
 let refreshTimer = null;
+let liveTimer = null;
+let liveClockTimer = null;
 let replayTimer = null;
 let replaySpeed = 1;
 let lastAnalysis = null;
 let isAnalysisRunning = false;
 let isInspectingContract = false;
+let isLiveLoading = false;
 let isReplayLoading = false;
 let replayAbortController = null;
 let lastReplayFetchSecond = null;
@@ -49,6 +56,12 @@ const fields = {
   score: document.querySelector("#score"),
   spot: document.querySelector("#spot"),
   zeroGamma: document.querySelector("#zero-gamma"),
+  technicalVwap: document.querySelector("#technical-vwap"),
+  technicalSma50: document.querySelector("#technical-sma-50"),
+  technicalSma200: document.querySelector("#technical-sma-200"),
+  technicalFib200: document.querySelector("#technical-fib-200"),
+  technicalLean: document.querySelector("#technical-lean"),
+  technicalReasons: document.querySelector("#technical-reasons"),
   strikeChart: document.querySelector("#strike-chart"),
   action: document.querySelector("#action"),
   marketRegime: document.querySelector("#market-regime"),
@@ -84,6 +97,7 @@ const fields = {
   bestPickAction: document.querySelector("#best-pick-action"),
   bestPickContract: document.querySelector("#best-pick-contract"),
   bestPickReason: document.querySelector("#best-pick-reason"),
+  bestPickExit: document.querySelector("#best-pick-exit"),
   tradeHistory: document.querySelector("#trade-history"),
 };
 
@@ -109,24 +123,40 @@ refreshSeconds.addEventListener("change", () => {
   scheduleRefresh();
 });
 
-refreshAlpacaButton.addEventListener("click", () => {
+refreshAlpacaButton?.addEventListener("click", () => {
   refreshAlpaca();
 });
 
-refreshPositionsButton.addEventListener("click", () => {
+refreshPositionsButton?.addEventListener("click", () => {
   loadPositions();
 });
 
-loadBarButton.addEventListener("click", () => {
+loadBarButton?.addEventListener("click", () => {
   loadLatestBar();
 });
 
-loadContractsButton.addEventListener("click", () => {
+loadContractsButton?.addEventListener("click", () => {
+  stopLiveMode();
   isInspectingContract = false;
   loadOptionReplay();
 });
 
+liveUpdateButton.addEventListener("click", () => {
+  runLiveUpdate({ manual: true });
+});
+
+liveToggleButton.addEventListener("click", () => {
+  toggleLiveMode();
+});
+
+liveInterval.addEventListener("change", () => {
+  if (liveTimer !== null) {
+    startLiveMode();
+  }
+});
+
 replayDate.addEventListener("change", () => {
+  stopLiveMode();
   renderTradeHistory();
   loadOptionReplay();
 });
@@ -136,14 +166,20 @@ replayTime.addEventListener("input", () => {
 });
 
 replayTime.addEventListener("change", () => {
+  stopLiveMode();
   loadOptionReplay();
 });
 
 replayPlay.addEventListener("click", () => {
+  if (liveTimer !== null) {
+    setStatus("Live Mode is already playing. Use Stop Live to leave live mode.", false);
+    return;
+  }
   toggleReplay();
 });
 
 replayRefresh.addEventListener("click", () => {
+  stopLiveMode();
   loadOptionReplay({ force: true });
 });
 
@@ -151,7 +187,7 @@ replayToday.addEventListener("click", () => {
   jumpToTodayNow();
 });
 
-stageBestPickButton.addEventListener("click", () => {
+stageBestPickButton?.addEventListener("click", () => {
   if (!currentBestPick) {
     return;
   }
@@ -203,18 +239,13 @@ for (const speedButton of speedButtons) {
   });
 }
 
-paperOrderForm.addEventListener("submit", async (event) => {
+paperOrderForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
   await submitPaperOrder();
 });
 
 async function runAnalysis({ isRefresh = false } = {}) {
   if (isAnalysisRunning) {
-    return;
-  }
-
-  if (isRefresh && (isInspectingContract || replayTimer !== null)) {
-    setStatus("Auto-refresh paused while you inspect contracts.", false);
     return;
   }
 
@@ -250,6 +281,74 @@ async function runAnalysis({ isRefresh = false } = {}) {
   }
 }
 
+async function runLiveUpdate({ manual = false } = {}) {
+  if (isLiveLoading) {
+    return;
+  }
+
+  stopReplay();
+  isLiveLoading = true;
+  isInspectingContract = false;
+  liveStatus.textContent = manual ? "Live update running..." : "Live mode refreshing...";
+  liveStatus.classList.remove("error");
+
+  try {
+    await loadOptionRecommendation({ source: "live" });
+    liveStatus.textContent = `Live updated at ${new Date().toLocaleTimeString()}.`;
+  } catch (error) {
+    liveStatus.textContent = error.message;
+    liveStatus.classList.add("error");
+  } finally {
+    isLiveLoading = false;
+  }
+}
+
+function startLiveMode() {
+  stopLiveMode();
+  stopReplay();
+  const seconds = Math.max(30, Number(liveInterval.value || 60));
+  liveToggleButton.textContent = "Stop Live";
+  liveStatus.textContent = `Live mode on. Refreshing every ${seconds} seconds.`;
+  syncLiveClock();
+  liveClockTimer = setInterval(syncLiveClock, 1000);
+  runLiveUpdate();
+  liveTimer = setInterval(() => {
+    runLiveUpdate();
+  }, seconds * 1000);
+  updatePlaybackButton();
+}
+
+function stopLiveMode() {
+  if (liveTimer !== null) {
+    clearInterval(liveTimer);
+    liveTimer = null;
+  }
+  if (liveClockTimer !== null) {
+    clearInterval(liveClockTimer);
+    liveClockTimer = null;
+  }
+  liveToggleButton.textContent = "Start Live";
+  updatePlaybackButton();
+  if (!isLiveLoading) {
+    liveStatus.textContent = "Live mode is off.";
+  }
+}
+
+function toggleLiveMode() {
+  if (liveTimer !== null) {
+    stopLiveMode();
+    return;
+  }
+  startLiveMode();
+}
+
+function syncLiveClock() {
+  const market = currentPacificMarketSnapshot();
+  replayDate.value = market.date;
+  replayTime.value = String(market.clampedSeconds);
+  updateReplayClock();
+}
+
 function renderAnalysis(analysis) {
   fields.tradePermission.textContent = analysis.trade_permission;
   fields.bias.textContent = analysis.bias;
@@ -276,6 +375,7 @@ function renderAnalysis(analysis) {
   fields.classicChange.textContent = formatChange(analysis.classic_thirty_min_change);
   fields.stateChange.textContent = formatChange(analysis.state_thirty_min_change);
   fields.risk.textContent = analysis.risk_note;
+  renderTechnicals(analysis.technicals);
   renderStrikeChart(analysis);
 
   renderList(fields.reasons, analysis.reasons);
@@ -290,6 +390,51 @@ function renderAnalysis(analysis) {
   }
 
   resultsEl.classList.remove("hidden");
+}
+
+function renderTechnicals(technicals) {
+  if (!technicals) {
+    fields.technicalVwap.textContent = "-";
+    fields.technicalSma50.textContent = "-";
+    fields.technicalSma200.textContent = "-";
+    fields.technicalFib200.textContent = "-";
+    fields.technicalLean.textContent = "Unavailable";
+    fields.technicalReasons.innerHTML = "";
+    return;
+  }
+
+  fields.technicalVwap.textContent = formatOptionalNumber(technicals.vwap);
+  fields.technicalSma50.textContent = formatOptionalNumber(technicals.sma_50);
+  fields.technicalSma200.textContent = formatOptionalNumber(technicals.sma_200);
+  fields.technicalFib200.textContent = formatFibAlignment(technicals.fibonacci_near_sma_200);
+  fields.technicalLean.textContent = technicalLeanLabel(technicals.score_adjustment);
+  renderList(fields.technicalReasons, [...(technicals.reasons || []), ...(technicals.warnings || [])]);
+}
+
+function formatFibAlignment(alignment) {
+  if (!alignment) {
+    return "-";
+  }
+  const label = alignment.label || "Fib";
+  const level = formatOptionalNumber(alignment.level);
+  const distance = formatOptionalNumber(alignment.distance);
+  return `${label} at ${level} (${distance} from 200 MA)`;
+}
+
+function technicalLeanLabel(adjustment) {
+  if (adjustment >= 2) {
+    return "Bullish confirmation";
+  }
+  if (adjustment === 1) {
+    return "Slight bullish support";
+  }
+  if (adjustment <= -2) {
+    return "Bearish confirmation";
+  }
+  if (adjustment === -1) {
+    return "Slight bearish pressure";
+  }
+  return "Mixed / neutral";
 }
 
 function getFormValues() {
@@ -316,10 +461,10 @@ function scheduleRefresh() {
   }, seconds * 1000);
 }
 
-runAnalysis();
-scheduleRefresh();
-refreshAlpaca();
 initializeReplayControls();
+autoRefresh.checked = true;
+initializeMarketMode();
+scheduleRefresh();
 renderTradeHistory();
 
 function renderStrikeChart(analysis) {
@@ -467,10 +612,16 @@ function renderList(element, items) {
 }
 
 async function refreshAlpaca() {
+  if (!alpacaStatus && !fields.positionsList) {
+    return;
+  }
   await Promise.all([loadAccount(), loadPositions()]);
 }
 
 async function loadAccount() {
+  if (!fields.alpacaAccountStatus) {
+    return;
+  }
   setAlpacaStatus("Loading Alpaca account...", false);
   try {
     const account = await getJson("/api/alpaca/account");
@@ -485,6 +636,9 @@ async function loadAccount() {
 }
 
 async function loadPositions() {
+  if (!fields.positionsList) {
+    return;
+  }
   try {
     const payload = await getJson("/api/alpaca/positions");
     const positions = payload.positions || [];
@@ -505,6 +659,9 @@ async function loadPositions() {
 }
 
 async function loadLatestBar() {
+  if (!barSymbol || !latestBar) {
+    return;
+  }
   const symbol = String(barSymbol.value || "SPY").trim().toUpperCase();
   latestBar.textContent = "Loading...";
   try {
@@ -516,6 +673,9 @@ async function loadLatestBar() {
 }
 
 async function submitPaperOrder() {
+  if (!paperOrderForm) {
+    return;
+  }
   const data = new FormData(paperOrderForm);
   const payload = {
     symbol: String(data.get("symbol") || "").trim().toUpperCase(),
@@ -536,7 +696,7 @@ async function submitPaperOrder() {
   }
 }
 
-async function loadOptionRecommendation() {
+async function loadOptionRecommendation({ source = "manual" } = {}) {
   const { ticker, period } = getFormValues();
   fields.contractSummary.textContent = "Scanning Alpaca options...";
   fields.contractSummary.classList.remove("error");
@@ -556,6 +716,9 @@ async function loadOptionRecommendation() {
     fields.contractSummary.textContent = error.message;
     fields.contractSummary.classList.add("error");
     resetBestPick();
+    if (source === "live") {
+      throw error;
+    }
   }
 }
 
@@ -567,13 +730,21 @@ async function loadOptionReplay({ force = false } = {}) {
     fields.contractSummary.textContent = "Canceling previous replay request...";
   }
 
+  updateReplayClock();
+  if (replayDate.value === currentPacificDate()) {
+    stopReplay();
+    isInspectingContract = false;
+    fields.contractSummary.classList.remove("error");
+    fields.contractSummary.textContent = "Today uses live GEX and Alpaca data instead of historical replay files.";
+    await runAnalysis();
+    setStatus(`Live data updated for today at ${replayClock.textContent} Pacific time.`, false);
+    return;
+  }
+
   isReplayLoading = true;
   replayAbortController = new AbortController();
   isInspectingContract = true;
-  autoRefresh.checked = false;
-  scheduleRefresh();
   const { ticker, period } = getFormValues();
-  updateReplayClock();
   const replaySecond = Number(replayTime.value || 57540);
   const now = Date.now();
   if (
@@ -653,6 +824,7 @@ function renderOptionReplay(payload) {
     row.className = `contract-row contract-${contractSide(candidate)}`;
     row.innerHTML = `
       ${contractTitleMarkup(candidate)}
+      ${optionSparklineMarkup(candidate)}
       ${contractMetric("Price", formatCurrency(candidate.close), "What this option was worth at the selected replay time. This is the old market price, not today's price.")}
       ${contractMetric("Day", formatPercent(candidate.day_change_pct), "How much this option had moved that day by the selected replay time. Positive means it was up; negative means it was down.")}
       ${contractMetric("Volume", formatNumber(candidate.volume || 0), "How many of this exact option traded in the latest 1-minute bar. Thin liquidity: 1-10 contracts. Healthier/thicker activity: hundreds or thousands in a minute.")}
@@ -661,8 +833,6 @@ function renderOptionReplay(payload) {
     `;
     row.addEventListener("click", () => {
       isInspectingContract = true;
-      autoRefresh.checked = false;
-      scheduleRefresh();
       stageCandidate(candidate, candidate.close, `Staged ${candidate.symbol} from replay at ${replayClock.textContent} PT.`);
     });
     fields.contractList.appendChild(row);
@@ -681,6 +851,49 @@ function initializeReplayControls() {
   for (const button of speedButtons) {
     button.classList.toggle("active", Number(button.dataset.speed) === replaySpeed);
   }
+}
+
+function initializeMarketMode() {
+  const market = currentPacificMarketSnapshot();
+  replayDate.value = market.date;
+  replayTime.value = String(market.clampedSeconds);
+  updateReplayClock();
+
+  if (market.isOpen) {
+    isInspectingContract = false;
+    startLiveMode();
+    setStatus(`Market is open. Live Mode started at ${replayClock.textContent} Pacific time.`, false);
+    return;
+  }
+
+  stopLiveMode();
+  initializeReplayControls();
+  fields.contractSummary.textContent = "Market is closed. Historical replay mode is ready.";
+  setStatus("Market is closed. Use historical replay controls to analyze a prior session.", false);
+  loadOptionReplay({ force: true });
+}
+
+function currentPacificMarketSnapshot() {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Los_Angeles",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date());
+  const part = (type) => parts.find((item) => item.type === type)?.value || "00";
+  const seconds = Number(part("hour")) * 3600 + Number(part("minute")) * 60 + Number(part("second"));
+  const min = Number(replayTime.min);
+  const max = Number(replayTime.max);
+  return {
+    date: `${part("year")}-${part("month")}-${part("day")}`,
+    seconds,
+    clampedSeconds: Math.min(Math.max(seconds, min), max),
+    isOpen: seconds >= min && seconds <= max,
+  };
 }
 
 function currentPacificDate() {
@@ -749,16 +962,13 @@ async function jumpToTodayNow() {
 
 function toggleReplay() {
   if (replayTimer !== null) {
-    clearInterval(replayTimer);
-    replayTimer = null;
-    replayPlay.textContent = "Play";
+    stopReplay();
     return;
   }
 
+  stopLiveMode();
   isInspectingContract = true;
-  autoRefresh.checked = false;
-  scheduleRefresh();
-  replayPlay.textContent = "Pause";
+  updatePlaybackButton();
   replayTimer = setInterval(() => {
     if (isReplayLoading) {
       const nextValue = Math.min(Number(replayTime.value) + replaySpeed, Number(replayTime.max));
@@ -779,6 +989,19 @@ function toggleReplay() {
   }, 1000);
 }
 
+function stopReplay() {
+  if (replayTimer !== null) {
+    clearInterval(replayTimer);
+    replayTimer = null;
+  }
+  updatePlaybackButton();
+}
+
+function updatePlaybackButton() {
+  replayPlay.textContent = liveTimer !== null || replayTimer !== null ? "Pause" : "Play";
+  replayPlay.classList.toggle("active", liveTimer !== null || replayTimer !== null);
+}
+
 function formatClock(totalSeconds) {
   const hour = Math.floor(totalSeconds / 3600);
   const minute = Math.floor((totalSeconds % 3600) / 60);
@@ -787,6 +1010,10 @@ function formatClock(totalSeconds) {
 }
 
 function renderOptionRecommendation(payload) {
+  if (payload.analysis) {
+    lastAnalysis = payload.analysis;
+    renderAnalysis(payload.analysis);
+  }
   fields.contractSummary.classList.toggle("error", payload.trade_permission === "no trade");
   fields.contractSummary.textContent = `${payload.bias} ${payload.contract_type || ""} read: ${payload.recommendation}`;
 
@@ -807,6 +1034,7 @@ function renderOptionRecommendation(payload) {
     row.className = `contract-row contract-${contractSide(candidate)}`;
     row.innerHTML = `
       ${contractTitleMarkup(candidate)}
+      ${optionSparklineMarkup(candidate)}
       ${contractMetric("Mid", formatCurrency(candidate.mid), "The middle between what buyers are bidding and sellers are asking. Think of it as a fair reference price, not a guaranteed fill.")}
       ${contractMetric("Spread", formatPercent(candidate.spread_pct), "The gap between buy and sell prices. Smaller is usually better because it may cost less to enter and exit.")}
       ${contractMetric("Open int", candidate.open_interest ?? "n/a", "How many of this option are still open in the market. Bigger usually means more people are involved and the option may be easier to trade.")}
@@ -815,8 +1043,6 @@ function renderOptionRecommendation(payload) {
     `;
     row.addEventListener("click", () => {
       isInspectingContract = true;
-      autoRefresh.checked = false;
-      scheduleRefresh();
       stageCandidate(candidate, candidate.mid, `Staged ${candidate.symbol} as a paper limit order.`);
     });
     fields.contractList.appendChild(row);
@@ -834,7 +1060,10 @@ function renderBestPick(payload, mode) {
     fields.bestPickAction.textContent = "No contract pick";
     fields.bestPickContract.textContent = "No ranked candidate is available for this read.";
     fields.bestPickReason.textContent = payload.warning || "Run a scan after GEX and Alpaca both return usable data.";
-    stageBestPickButton.disabled = true;
+    fields.bestPickExit.textContent = "No sell plan until there is an entry candidate.";
+    if (stageBestPickButton) {
+      stageBestPickButton.disabled = true;
+    }
     return;
   }
 
@@ -872,7 +1101,10 @@ function renderBestPick(payload, mode) {
   fields.bestPickAction.textContent = action;
   fields.bestPickContract.textContent = `${readableContractName(candidate)} | ${priceLabel} ${formatCurrency(entryPrice)}`;
   fields.bestPickReason.textContent = reasonParts.join(" ");
-  stageBestPickButton.disabled = false;
+  fields.bestPickExit.textContent = sellPlanText(entryPrice);
+  if (stageBestPickButton) {
+    stageBestPickButton.disabled = false;
+  }
 
   if (!isStandDown) {
     recordTradePermissionPick({
@@ -894,10 +1126,17 @@ function resetBestPick() {
   fields.bestPickAction.textContent = "-";
   fields.bestPickContract.textContent = "-";
   fields.bestPickReason.textContent = "-";
-  stageBestPickButton.disabled = true;
+  fields.bestPickExit.textContent = "-";
+  if (stageBestPickButton) {
+    stageBestPickButton.disabled = true;
+  }
 }
 
 function stageCandidate(candidate, entryPrice, message) {
+  if (!paperOrderForm) {
+    fields.contractSummary.textContent = message;
+    return;
+  }
   paperOrderForm.elements.symbol.value = candidate.symbol;
   paperOrderForm.elements.side.value = "buy";
   paperOrderForm.elements.qty.value = "1";
@@ -922,6 +1161,7 @@ function recordTradePermissionPick({ candidate, recommendation, payload, mode, e
     entryPrice,
     priceLabel,
     score,
+    sellPlan: sellPlanText(entryPrice),
   };
   const history = loadTradeHistory();
   const withoutDuplicate = history.filter((existing) => existing.id !== item.id);
@@ -967,25 +1207,105 @@ function renderTradeHistory() {
     const row = document.createElement("button");
     row.type = "button";
     row.className = `trade-history-row contract-${item.side || "call"}`;
+    row.dataset.symbol = item.symbol || "";
+    row.dataset.entryPrice = item.entryPrice || "";
     row.innerHTML = `
       <span>
         <strong>${item.timestamp.label}</strong>
         <em>${item.contract}</em>
       </span>
-      <span>${formatCurrency(item.entryPrice)}</span>
-      <span>${item.bias}</span>
-      <span>${formatOptionalNumber(item.score)}</span>
+      <span><i>Recorded</i><strong>${formatCurrency(item.entryPrice)}</strong></span>
+      <span><i>Current</i><strong class="history-current">Loading...</strong></span>
+      <span><i>Change</i><strong class="history-change">-</strong></span>
+      <span><i>Exit</i><strong class="history-exit">Checking...</strong></span>
+      <span><i>Bias</i><strong>${item.bias}</strong></span>
+      <span><i>Score</i><strong>${formatOptionalNumber(item.score)}</strong></span>
     `;
     row.addEventListener("click", () => {
-      paperOrderForm.elements.symbol.value = item.symbol;
-      paperOrderForm.elements.side.value = "buy";
-      paperOrderForm.elements.qty.value = "1";
-      paperOrderForm.elements.type.value = "limit";
-      paperOrderForm.elements.limit_price.value = item.entryPrice ? Number(item.entryPrice).toFixed(2) : "";
-      setAlpacaStatus(`Staged ${item.symbol} from trade permission history.`, false);
+      stageCandidate(
+        { symbol: item.symbol },
+        item.entryPrice,
+        `${item.symbol} selected from trade permission history.`
+      );
     });
     fields.tradeHistory.appendChild(row);
   }
+  updateTradeHistoryPrices(history);
+}
+
+async function updateTradeHistoryPrices(history) {
+  const symbols = [...new Set(history.map((item) => item.symbol).filter(Boolean))];
+  if (symbols.length === 0) {
+    return;
+  }
+
+  try {
+    const query = new URLSearchParams({ symbols: symbols.join(",") });
+    const payload = await getJson(`/api/options/prices?${query.toString()}`);
+    for (const row of fields.tradeHistory.querySelectorAll(".trade-history-row")) {
+      const symbol = row.dataset.symbol;
+      const entryPrice = optionalNumber(row.dataset.entryPrice);
+      const current = payload.prices?.[symbol]?.mid;
+      const currentEl = row.querySelector(".history-current");
+      const changeEl = row.querySelector(".history-change");
+      const exitEl = row.querySelector(".history-exit");
+      currentEl.textContent = formatCurrency(current);
+      if (entryPrice && current) {
+        const change = (Number(current) - entryPrice) / entryPrice;
+        changeEl.textContent = formatPercent(change);
+        changeEl.classList.toggle("positive", change >= 0);
+        changeEl.classList.toggle("negative", change < 0);
+        const exitPlan = sellStatus(entryPrice, current);
+        exitEl.textContent = exitPlan.label;
+        exitEl.classList.toggle("positive", exitPlan.className === "positive");
+        exitEl.classList.toggle("negative", exitPlan.className === "negative");
+      } else {
+        changeEl.textContent = "n/a";
+        changeEl.classList.remove("positive", "negative");
+        exitEl.textContent = "Use plan";
+        exitEl.classList.remove("positive", "negative");
+      }
+    }
+  } catch (error) {
+    for (const row of fields.tradeHistory.querySelectorAll(".trade-history-row")) {
+      const currentEl = row.querySelector(".history-current");
+      const changeEl = row.querySelector(".history-change");
+      const exitEl = row.querySelector(".history-exit");
+      currentEl.textContent = "n/a";
+      changeEl.textContent = "n/a";
+      exitEl.textContent = "Use plan";
+    }
+  }
+}
+
+function sellPlanText(entryPrice) {
+  const entry = optionalNumber(entryPrice);
+  if (!entry) {
+    return "Sell plan: wait for a valid entry price.";
+  }
+  return `Sell plan: stop near ${formatCurrency(entry * 0.7)}, trim near ${formatCurrency(entry * 1.25)}, take profit near ${formatCurrency(entry * 1.5)}.`;
+}
+
+function sellStatus(entryPrice, currentPrice) {
+  const entry = optionalNumber(entryPrice);
+  const current = optionalNumber(currentPrice);
+  if (!entry || !current) {
+    return { label: "Use plan", className: "" };
+  }
+  const change = (current - entry) / entry;
+  if (change <= -0.3) {
+    return { label: "Sell / stop", className: "negative" };
+  }
+  if (change >= 0.5) {
+    return { label: "Take profit", className: "positive" };
+  }
+  if (change >= 0.25) {
+    return { label: "Trim / protect", className: "positive" };
+  }
+  if (change <= -0.15) {
+    return { label: "Warning", className: "negative" };
+  }
+  return { label: "Hold / watch", className: "" };
 }
 
 function historyItemDate(item) {
@@ -1037,6 +1357,76 @@ function contractMetric(label, value, description) {
       <strong>${value}</strong>
     </span>
   `;
+}
+
+function optionSparklineMarkup(candidate) {
+  const path = sparklinePath(candidate.price_path || []);
+  const first = firstFinite(candidate.price_path || []);
+  const last = lastFinite(candidate.price_path || []);
+  const trendClass = first !== null && last !== null && last >= first ? "spark-up" : "spark-down";
+  const label = path
+    ? `Day path ${formatCurrency(first)} to ${formatCurrency(last)}`
+    : "No intraday option bars yet";
+
+  if (!path) {
+    return `
+      <span class="option-sparkline spark-empty" aria-label="${label}">
+        <em>No chart</em>
+      </span>
+    `;
+  }
+
+  return `
+    <span class="option-sparkline ${trendClass}" aria-label="${label}">
+      <svg viewBox="0 0 160 46" role="img" focusable="false">
+        <path class="spark-area" d="${path.area}"></path>
+        <path class="spark-line" d="${path.line}"></path>
+      </svg>
+      <em>${formatCurrency(first)} -> ${formatCurrency(last)}</em>
+    </span>
+  `;
+}
+
+function sparklinePath(values) {
+  const points = (values || []).map(Number).filter(Number.isFinite);
+  if (points.length < 2) {
+    return null;
+  }
+
+  const width = 160;
+  const height = 46;
+  const pad = 4;
+  const min = Math.min(...points);
+  const max = Math.max(...points);
+  const range = max - min || 1;
+  const coordinates = points.map((value, index) => {
+    const x = pad + (index / (points.length - 1)) * (width - pad * 2);
+    const y = height - pad - ((value - min) / range) * (height - pad * 2);
+    return [Number(x.toFixed(2)), Number(y.toFixed(2))];
+  });
+  const line = coordinates.map(([x, y], index) => `${index === 0 ? "M" : "L"} ${x} ${y}`).join(" ");
+  const area = `${line} L ${coordinates[coordinates.length - 1][0]} ${height - pad} L ${coordinates[0][0]} ${height - pad} Z`;
+  return { line, area };
+}
+
+function firstFinite(values) {
+  for (const value of values || []) {
+    const number = Number(value);
+    if (Number.isFinite(number)) {
+      return number;
+    }
+  }
+  return null;
+}
+
+function lastFinite(values) {
+  for (let index = (values || []).length - 1; index >= 0; index -= 1) {
+    const number = Number(values[index]);
+    if (Number.isFinite(number)) {
+      return number;
+    }
+  }
+  return null;
 }
 
 function showMetricTooltip(target) {
@@ -1238,6 +1628,10 @@ function formatGreek(label, value) {
 }
 
 function setAlpacaStatus(message, isError) {
+  if (!alpacaStatus) {
+    setStatus(message, isError);
+    return;
+  }
   alpacaStatus.textContent = message;
   alpacaStatus.classList.toggle("error", isError);
 }

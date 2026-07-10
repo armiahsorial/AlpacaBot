@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from trading_bot.gex_client import GexMajorLevels, GexMaxChange
+from trading_bot.technicals import StockTechnicals
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class GexAnalysis:
     reasons: tuple[str, ...]
     score_breakdown: tuple[str, ...]
     no_trade_reasons: tuple[str, ...]
+    technicals: StockTechnicals | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -75,6 +77,7 @@ class GexAnalysis:
             "reasons": list(self.reasons),
             "score_breakdown": list(self.score_breakdown),
             "no_trade_reasons": list(self.no_trade_reasons),
+            "technicals": self.technicals.as_dict() if self.technicals else None,
         }
 
 
@@ -85,6 +88,7 @@ def analyze_gex(
     state_major_levels: GexMajorLevels,
     classic_max_change: GexMaxChange,
     state_max_change: GexMaxChange,
+    technicals: StockTechnicals | None = None,
 ) -> GexAnalysis:
     score = 0
     reasons: list[str] = []
@@ -158,6 +162,12 @@ def analyze_gex(
     else:
         score_breakdown.append("0 state 30m max imbalance change flat")
 
+    if technicals is not None:
+        score += technicals.score_adjustment
+        for reason in technicals.reasons:
+            reasons.append(reason)
+        score_breakdown.append(f"{technicals.score_adjustment:+d} VWAP/50-day/200-day technical context")
+
     if _is_too_close(spot, classic_major_levels.mpos_vol):
         no_trade_reasons.append("Spot is close to classic major positive GEX; upside chase risk is elevated.")
     if _is_too_close(spot, classic_major_levels.mneg_vol):
@@ -209,6 +219,7 @@ def analyze_gex(
         reasons=tuple(reasons),
         score_breakdown=tuple(score_breakdown),
         no_trade_reasons=tuple(no_trade_reasons),
+        technicals=technicals,
     )
 
 

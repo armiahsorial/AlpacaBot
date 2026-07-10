@@ -31,6 +31,7 @@ class ReplayCandidate:
     gamma: float | None
     implied_volatility: float | None
     replay_score: float
+    price_path: tuple[float, ...]
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -49,6 +50,7 @@ class ReplayCandidate:
             "gamma": self.gamma,
             "implied_volatility": self.implied_volatility,
             "replay_score": round(self.replay_score, 4),
+            "price_path": list(self.price_path),
         }
 
 
@@ -116,6 +118,11 @@ def replay_option_recommendation(
             change_pct = (close - first_open) / first_open
         volume = _to_float(last_bar.get("v"))
         replay_score = base.score + ((change_pct or 0) * 100) + min((volume or 0) / 1000, 10)
+        price_path = tuple(
+            close
+            for close in (_to_float(bar.get("c")) for bar in bars if isinstance(bar, dict))
+            if close is not None
+        )
 
         replay_candidates.append(
             ReplayCandidate(
@@ -134,6 +141,7 @@ def replay_option_recommendation(
                 gamma=base.gamma,
                 implied_volatility=base.implied_volatility,
                 replay_score=replay_score,
+                price_path=price_path,
             )
         )
 

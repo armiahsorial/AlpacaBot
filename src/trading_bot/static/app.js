@@ -2,7 +2,11 @@ const form = document.querySelector("#analysis-form");
 const statusEl = document.querySelector("#status");
 const resultsEl = document.querySelector("#results");
 const button = document.querySelector("#analyze-button");
-const tickerSelect = document.querySelector("#ticker");
+const tickerChecklist = document.querySelector("#ticker-checklist");
+const tickerPresetButtons = document.querySelectorAll("[data-ticker-group]");
+const saveTickerGroupButton = document.querySelector("#save-ticker-group");
+const tickerGroupName = document.querySelector("#ticker-group-name");
+const savedTickerGroups = document.querySelector("#saved-ticker-groups");
 const autoRefresh = document.querySelector("#auto-refresh");
 const refreshSeconds = document.querySelector("#refresh-seconds");
 const alpacaStatus = document.querySelector("#alpaca-status");
@@ -23,6 +27,7 @@ const replayRefresh = document.querySelector("#replay-refresh");
 const replayToday = document.querySelector("#replay-today");
 const stageBestPickButton = document.querySelector("#stage-best-pick");
 const clearTradeHistoryButton = document.querySelector("#clear-trade-history");
+const clearPaperLedgerButton = document.querySelector("#clear-paper-ledger");
 const exportTradeHistoryButton = document.querySelector("#export-trade-history");
 const exportTradeHistoryRangeButton = document.querySelector("#export-trade-history-range");
 const historyStartDate = document.querySelector("#history-start-date");
@@ -52,7 +57,14 @@ let currentBestPick = null;
 const REPLAY_FETCH_STEP_SECONDS = 300;
 const REPLAY_MIN_FETCH_INTERVAL_MS = 5000;
 const TRADE_HISTORY_STORAGE_KEY = "tradingBot.tradePermissionHistory";
+const PAPER_LEDGER_STORAGE_KEY = "tradingBot.paperSimulationLedger";
+const TICKER_GROUPS_STORAGE_KEY = "tradingBot.tickerGroups";
+const SIMULATION_STARTING_CASH = 10000;
+const OPTION_CONTRACT_MULTIPLIER = 100;
+const PAPER_PROFIT_TARGET_PCT = 0.3;
+const PAPER_STOP_LOSS_PCT = -0.3;
 const MAX_TRADE_HISTORY_ITEMS = 100;
+const MAX_PAPER_LEDGER_ITEMS = 500;
 const MAX_RECORDED_PERMISSION_CANDIDATES = 5;
 const PACIFIC_TO_EASTERN_SECONDS = 3 * 60 * 60;
 
@@ -106,6 +118,18 @@ const fields = {
   bestPickReason: document.querySelector("#best-pick-reason"),
   bestPickExit: document.querySelector("#best-pick-exit"),
   tradeHistory: document.querySelector("#trade-history"),
+  dayPerformance: document.querySelector("#day-performance"),
+  simBestValue: document.querySelector("#sim-best-value"),
+  simBestReturn: document.querySelector("#sim-best-return"),
+  simWorstValue: document.querySelector("#sim-worst-value"),
+  simWinRate: document.querySelector("#sim-win-rate"),
+  simNote: document.querySelector("#sim-note"),
+  paperLedger: document.querySelector("#paper-ledger"),
+  ledgerRealized: document.querySelector("#ledger-realized"),
+  ledgerOpenPl: document.querySelector("#ledger-open-pl"),
+  ledgerClosedCount: document.querySelector("#ledger-closed-count"),
+  ledgerOpenCount: document.querySelector("#ledger-open-count"),
+  ledgerWinRate: document.querySelector("#ledger-win-rate"),
   multiTickerPanel: document.querySelector("#multi-ticker-panel"),
   multiTickerList: document.querySelector("#multi-ticker-list"),
 };
@@ -116,9 +140,29 @@ form.addEventListener("submit", async (event) => {
   scheduleRefresh();
 });
 
-form.addEventListener("change", () => {
+form.addEventListener("change", (event) => {
+  if (event.target?.matches?.("[data-ticker-checkbox], #ticker-group-name")) {
+    return;
+  }
   runAnalysis();
   scheduleRefresh();
+});
+
+tickerChecklist?.addEventListener("change", () => {
+  runAnalysis();
+  scheduleRefresh();
+});
+
+for (const presetButton of tickerPresetButtons) {
+  presetButton.addEventListener("click", () => {
+    setSelectedTickers(parseTickerGroupValue(presetButton.dataset.tickerGroup || ""));
+    runAnalysis();
+    scheduleRefresh();
+  });
+}
+
+saveTickerGroupButton?.addEventListener("click", () => {
+  saveCurrentTickerGroup();
 });
 
 autoRefresh.addEventListener("change", () => {
@@ -209,6 +253,11 @@ clearTradeHistoryButton.addEventListener("click", () => {
   renderTradeHistory();
 });
 
+clearPaperLedgerButton?.addEventListener("click", () => {
+  clearPaperLedgerForSelectedDay();
+  renderPaperLedger();
+});
+
 exportTradeHistoryButton?.addEventListener("click", async () => {
   await downloadTradeHistoryForSelectedDay();
 });
@@ -289,6 +338,7 @@ async function runAnalysis({ isRefresh = false } = {}) {
     if (!isRefresh && !isInspectingContract) {
       await loadOptionRecommendation();
     }
+    refreshVisibleTradeHistoryPrices();
     const failedCount = analyses.filter((result) => result.error).length;
     const partial = failedCount > 0 ? ` ${failedCount} ticker${failedCount === 1 ? "" : "s"} failed.` : "";
     setStatus(`Updated ${tickers.join(", ")} ${period} at ${new Date().toLocaleTimeString()}.${partial}`, failedCount > 0);
@@ -360,12 +410,15 @@ async function runLiveUpdate({ manual = false } = {}) {
   stopReplay();
   isLiveLoading = true;
   isInspectingContract = false;
-  liveStatus.textContent = manual ? "Live update running..." : "Live mode refreshing...";
+  liveStatus.textContent = manual ? "Refreshing live contracts once..." : "Auto Live refreshing contracts...";
   liveStatus.classList.remove("error");
 
   try {
     await loadOptionRecommendation({ source: "live" });
-    liveStatus.textContent = `Live updated at ${new Date().toLocaleTimeString()}.`;
+    refreshVisibleTradeHistoryPrices();
+    liveStatus.textContent = manual
+      ? `One live refresh completed at ${new Date().toLocaleTimeString()}.`
+      : `Auto Live updated at ${new Date().toLocaleTimeString()}.`;
   } catch (error) {
     liveStatus.textContent = error.message;
     liveStatus.classList.add("error");
@@ -377,9 +430,9 @@ async function runLiveUpdate({ manual = false } = {}) {
 function startLiveMode() {
   stopLiveMode();
   stopReplay();
-  const seconds = Math.max(30, Number(liveInterval.value || 60));
-  liveToggleButton.textContent = "Stop Live";
-  liveStatus.textContent = `Live mode on. Refreshing every ${seconds} seconds.`;
+  const seconds = Math.max(30, Number(liveInterval.value || 30));
+  liveToggleButton.textContent = "Stop Auto Live";
+  liveStatus.textContent = `Auto Live is on. Refreshing contracts every ${seconds} seconds.`;
   syncLiveClock();
   liveClockTimer = setInterval(syncLiveClock, 1000);
   runLiveUpdate();
@@ -398,10 +451,10 @@ function stopLiveMode() {
     clearInterval(liveClockTimer);
     liveClockTimer = null;
   }
-  liveToggleButton.textContent = "Start Live";
+  liveToggleButton.textContent = "Start Auto Live";
   updatePlaybackButton();
   if (!isLiveLoading) {
-    liveStatus.textContent = "Live mode is off.";
+    liveStatus.textContent = "Auto Live is off. Use Refresh Once for one manual live pull.";
   }
 }
 
@@ -518,10 +571,101 @@ function getFormValues() {
 }
 
 function getSelectedTickers() {
-  const selected = Array.from(tickerSelect?.selectedOptions || [])
-    .map((option) => option.value.trim().toUpperCase())
+  const selected = Array.from(document.querySelectorAll("[data-ticker-checkbox]:checked"))
+    .map((checkbox) => checkbox.value.trim().toUpperCase())
     .filter(Boolean);
   return selected.length > 0 ? [...new Set(selected)] : ["NDX"];
+}
+
+function setSelectedTickers(tickers) {
+  const selected = new Set((tickers.length > 0 ? tickers : ["NDX"]).map((ticker) => ticker.toUpperCase()));
+  for (const checkbox of document.querySelectorAll("[data-ticker-checkbox]")) {
+    checkbox.checked = selected.has(checkbox.value.toUpperCase());
+  }
+}
+
+function parseTickerGroupValue(value) {
+  return [...new Set(
+    String(value || "")
+      .split(",")
+      .map((ticker) => ticker.trim().toUpperCase())
+      .filter(Boolean)
+  )];
+}
+
+function saveCurrentTickerGroup() {
+  const tickers = getSelectedTickers();
+  const name = String(tickerGroupName?.value || tickers.join(" + ")).trim();
+  if (!name || tickers.length === 0) {
+    setStatus("Pick at least one ticker and name the group first.", true);
+    return;
+  }
+  const groups = loadTickerGroups().filter((group) => group.name.toLowerCase() !== name.toLowerCase());
+  groups.push({ name, tickers });
+  saveTickerGroups(groups);
+  if (tickerGroupName) {
+    tickerGroupName.value = "";
+  }
+  renderTickerGroups();
+  setStatus(`Saved ticker group ${name}: ${tickers.join(", ")}.`, false);
+}
+
+function loadTickerGroups() {
+  try {
+    const raw = localStorage.getItem(TICKER_GROUPS_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed)
+      ? parsed.filter((group) => group?.name && Array.isArray(group.tickers))
+      : [];
+  } catch (_error) {
+    return [];
+  }
+}
+
+function saveTickerGroups(groups) {
+  try {
+    localStorage.setItem(TICKER_GROUPS_STORAGE_KEY, JSON.stringify(groups));
+  } catch (_error) {
+    setStatus("Ticker group could not be saved in this browser.", true);
+  }
+}
+
+function renderTickerGroups() {
+  if (!savedTickerGroups) {
+    return;
+  }
+  const groups = loadTickerGroups();
+  if (groups.length === 0) {
+    savedTickerGroups.innerHTML = "";
+    return;
+  }
+  savedTickerGroups.innerHTML = groups
+    .map((group, index) => `
+      <span class="saved-ticker-group">
+        <button type="button" data-saved-ticker-group="${index}">${escapeHtml(group.name)}</button>
+        <button type="button" data-delete-ticker-group="${index}" aria-label="Delete ${escapeAttribute(group.name)}">x</button>
+      </span>
+    `)
+    .join("");
+  for (const button of savedTickerGroups.querySelectorAll("[data-saved-ticker-group]")) {
+    button.addEventListener("click", () => {
+      const group = loadTickerGroups()[Number(button.dataset.savedTickerGroup)];
+      if (!group) {
+        return;
+      }
+      setSelectedTickers(group.tickers);
+      runAnalysis();
+      scheduleRefresh();
+    });
+  }
+  for (const button of savedTickerGroups.querySelectorAll("[data-delete-ticker-group]")) {
+    button.addEventListener("click", () => {
+      const index = Number(button.dataset.deleteTickerGroup);
+      const nextGroups = loadTickerGroups().filter((_group, groupIndex) => groupIndex !== index);
+      saveTickerGroups(nextGroups);
+      renderTickerGroups();
+    });
+  }
 }
 
 function permissionClass(permission) {
@@ -553,6 +697,7 @@ function scheduleRefresh() {
 
 initializeReplayControls();
 initializeTradeHistoryExportControls();
+renderTickerGroups();
 autoRefresh.checked = true;
 initializeMarketMode();
 scheduleRefresh();
@@ -976,10 +1121,18 @@ function initializeMarketMode() {
   }
 
   stopLiveMode();
-  initializeReplayControls();
+  if (isWeekendDate(market.date)) {
+    initializeReplayControls();
+  }
+  syncHistoryExportDatesToReplayDate();
   fields.contractSummary.textContent = "Market is closed. Historical replay mode is ready.";
-  setStatus("Market is closed. Use historical replay controls to analyze a prior session.", false);
+  setStatus("Market is closed. Today's trade history is still selected; use historical replay controls to analyze another session.", false);
   loadOptionReplay({ force: true });
+}
+
+function isWeekendDate(value) {
+  const date = new Date(`${value}T12:00:00`);
+  return date.getDay() === 0 || date.getDay() === 6;
 }
 
 function currentPacificMarketSnapshot() {
@@ -1277,6 +1430,7 @@ function recordTradePermissionPicks({ candidates, recommendation, payload, mode,
   const incomingIds = new Set(items.map((item) => item.id));
   const withoutDuplicates = history.filter((existing) => !incomingIds.has(existing.id));
   saveTradeHistory([...items, ...withoutDuplicates].slice(0, MAX_TRADE_HISTORY_ITEMS));
+  recordPaperLedgerTrade(items[0]);
   renderTradeHistory();
 }
 
@@ -1345,7 +1499,9 @@ function pickTimestamp({ recommendation, payload, mode }) {
 function renderTradeHistory() {
   const selectedDate = replayDate.value;
   const history = loadTradeHistory().filter((item) => historyItemDate(item) === selectedDate);
+  renderPaperLedger();
   if (history.length === 0) {
+    renderDailySimulation([]);
     fields.tradeHistory.textContent = selectedDate
       ? `No trade-permission picks recorded for ${formatContractDate(selectedDate)}.`
       : "No trade-permission picks yet.";
@@ -1382,12 +1538,280 @@ function renderTradeHistory() {
     });
     fields.tradeHistory.appendChild(row);
   }
+  renderDailySimulation(history);
   updateTradeHistoryOutcomes(history);
   updateTradeHistoryPrices(history);
 }
 
+function renderDailySimulation(history) {
+  if (!fields.dayPerformance) {
+    return;
+  }
+  if (!history || history.length === 0) {
+    fields.simBestValue.textContent = "-";
+    fields.simBestReturn.textContent = "-";
+    fields.simWorstValue.textContent = "-";
+    fields.simWinRate.textContent = "-";
+    fields.simNote.textContent = "Simulation appears after trade-permission picks are recorded.";
+    fields.dayPerformance.classList.remove("profitable", "losing");
+    return;
+  }
+
+  const picks = firstUniqueTradePicks(history);
+  if (picks.length === 0) {
+    fields.simBestValue.textContent = "-";
+    fields.simBestReturn.textContent = "-";
+    fields.simWorstValue.textContent = "-";
+    fields.simWinRate.textContent = "-";
+    fields.simNote.textContent = "No valid entry prices are available for this day.";
+    fields.dayPerformance.classList.remove("profitable", "losing");
+    return;
+  }
+
+  const outcomes = mergeOutcomeFallbacks(picks, {});
+  const allocation = SIMULATION_STARTING_CASH / picks.length;
+  let bestValue = 0;
+  let worstValue = 0;
+  let wins = 0;
+  let usable = 0;
+
+  for (const item of picks) {
+    const entry = optionalNumber(item.entryPrice);
+    if (!entry || entry <= 0) {
+      continue;
+    }
+    const outcome = outcomes[item.id] || item.outcome || {};
+    const high = optionalNumber(outcome.high) ?? entry;
+    const low = optionalNumber(outcome.low) ?? entry;
+    const quantity = allocation / entry;
+    bestValue += quantity * high;
+    worstValue += quantity * low;
+    wins += high > entry ? 1 : 0;
+    usable += 1;
+  }
+
+  if (usable === 0) {
+    fields.simBestValue.textContent = "-";
+    fields.simBestReturn.textContent = "-";
+    fields.simWorstValue.textContent = "-";
+    fields.simWinRate.textContent = "-";
+    fields.simNote.textContent = "No valid entry prices are available for this day.";
+    fields.dayPerformance.classList.remove("profitable", "losing");
+    return;
+  }
+
+  const unspent = SIMULATION_STARTING_CASH - allocation * usable;
+  bestValue += unspent;
+  worstValue += unspent;
+  const bestReturn = (bestValue - SIMULATION_STARTING_CASH) / SIMULATION_STARTING_CASH;
+  const worstReturn = (worstValue - SIMULATION_STARTING_CASH) / SIMULATION_STARTING_CASH;
+  fields.simBestValue.textContent = formatCurrency(bestValue);
+  fields.simBestReturn.textContent = formatPercent(bestReturn);
+  fields.simBestReturn.classList.toggle("positive", bestReturn >= 0);
+  fields.simBestReturn.classList.toggle("negative", bestReturn < 0);
+  fields.simWorstValue.textContent = `${formatCurrency(worstValue)} (${formatPercent(worstReturn)})`;
+  fields.simWorstValue.classList.toggle("positive", worstReturn >= 0);
+  fields.simWorstValue.classList.toggle("negative", worstReturn < 0);
+  fields.simWinRate.textContent = `${Math.round((wins / usable) * 100)}%`;
+  fields.simNote.textContent =
+    `Simulates $10k split equally across the first ${usable} unique contract${usable === 1 ? "" : "s"} picked that day. Best/worst use Alpaca option bars when available, otherwise saved signal prices.`;
+  fields.dayPerformance.classList.toggle("profitable", bestReturn >= 0);
+  fields.dayPerformance.classList.toggle("losing", bestReturn < 0);
+}
+
+function firstUniqueTradePicks(history) {
+  const seen = new Set();
+  return [...history]
+    .sort((a, b) => String(a.timestamp?.iso || "").localeCompare(String(b.timestamp?.iso || "")))
+    .filter((item) => {
+      const symbol = String(item.symbol || "").toUpperCase();
+      if (!symbol || seen.has(symbol) || optionalNumber(item.entryPrice) === null) {
+        return false;
+      }
+      seen.add(symbol);
+      return true;
+    });
+}
+
 function historyRankLabel(item) {
   return item.rank ? `Pick #${item.rank} - ` : "";
+}
+
+function recordPaperLedgerTrade(item) {
+  if (!item || item.rank !== 1) {
+    return;
+  }
+  const entry = optionalNumber(item.entryPrice);
+  if (!item.id || !item.symbol || !entry || entry <= 0) {
+    return;
+  }
+
+  const ledger = loadPaperLedger();
+  const ledgerId = `ledger:${item.id}`;
+  if (ledger.some((trade) => trade.id === ledgerId)) {
+    return;
+  }
+
+  const trade = {
+    id: ledgerId,
+    sourceHistoryId: item.id,
+    timestamp: item.timestamp,
+    day: historyItemDate(item),
+    mode: item.mode,
+    ticker: item.ticker,
+    contract: item.contract,
+    symbol: item.symbol,
+    side: item.side,
+    entryPrice: entry,
+    entryGreeks: item.entryGreeks || null,
+    quantity: 1,
+    status: "open",
+    currentPrice: entry,
+    openedReason: `${item.bias || "unknown"} ${item.permission || "trade permission"}`,
+    targetPrice: entry * (1 + PAPER_PROFIT_TARGET_PCT),
+    stopPrice: entry * (1 + PAPER_STOP_LOSS_PCT),
+  };
+  savePaperLedger([trade, ...ledger].slice(0, MAX_PAPER_LEDGER_ITEMS));
+}
+
+function renderPaperLedger() {
+  if (!fields.paperLedger) {
+    return;
+  }
+  const selectedDate = replayDate.value || currentPacificDate();
+  const ledger = loadPaperLedger().filter((trade) => paperLedgerDay(trade) === selectedDate);
+  renderPaperLedgerSummary(ledger);
+
+  if (ledger.length === 0) {
+    fields.paperLedger.textContent = selectedDate
+      ? `No simulated paper trades recorded for ${formatContractDate(selectedDate)}.`
+      : "No simulated paper trades yet.";
+    return;
+  }
+
+  fields.paperLedger.innerHTML = "";
+  for (const trade of ledger) {
+    const row = document.createElement("div");
+    row.className = `paper-ledger-row contract-${trade.side || "call"} status-${trade.status || "open"}`;
+    const current = optionalNumber(trade.currentPrice) ?? optionalNumber(trade.exitPrice) ?? optionalNumber(trade.entryPrice);
+    const pnl = paperTradePnl({ ...trade, currentPrice: current });
+    const pnlPct = paperTradePnlPct(trade.entryPrice, trade.status === "closed" ? trade.exitPrice : current);
+    row.innerHTML = `
+      <span class="ledger-contract">
+        <strong>${trade.timestamp?.label || "-"}</strong>
+        <em>${trade.contract || trade.symbol}</em>
+      </span>
+      <span class="history-pill">${trade.status === "closed" ? "Closed" : "Open"}</span>
+      <span class="history-stat"><i>Entry</i><strong>${formatCurrency(trade.entryPrice)}</strong></span>
+      <span class="history-stat"><i>Now / exit</i><strong>${formatCurrency(trade.status === "closed" ? trade.exitPrice : current)}</strong></span>
+      <span class="history-stat"><i>P/L</i><strong class="${pnl >= 0 ? "positive" : "negative"}">${formatCurrency(pnl)}</strong></span>
+      <span class="history-stat"><i>Move</i><strong class="${pnlPct >= 0 ? "positive" : "negative"}">${formatPercent(pnlPct)}</strong></span>
+      <span class="history-stat"><i>Rule</i><strong>${trade.status === "closed" ? trade.exitReason : "Hold"}</strong></span>
+    `;
+    fields.paperLedger.appendChild(row);
+  }
+}
+
+function renderPaperLedgerSummary(ledger) {
+  if (!fields.ledgerRealized) {
+    return;
+  }
+  const closed = ledger.filter((trade) => trade.status === "closed");
+  const open = ledger.filter((trade) => trade.status !== "closed");
+  const realized = closed.reduce((sum, trade) => sum + paperTradePnl(trade), 0);
+  const openPl = open.reduce((sum, trade) => sum + paperTradePnl(trade), 0);
+  const wins = closed.filter((trade) => paperTradePnl(trade) > 0).length;
+  const winRate = closed.length > 0 ? wins / closed.length : null;
+
+  fields.ledgerRealized.textContent = formatCurrency(realized);
+  fields.ledgerRealized.classList.toggle("positive", realized >= 0);
+  fields.ledgerRealized.classList.toggle("negative", realized < 0);
+  fields.ledgerOpenPl.textContent = formatCurrency(openPl);
+  fields.ledgerOpenPl.classList.toggle("positive", openPl >= 0);
+  fields.ledgerOpenPl.classList.toggle("negative", openPl < 0);
+  fields.ledgerClosedCount.textContent = String(closed.length);
+  fields.ledgerOpenCount.textContent = String(open.length);
+  fields.ledgerWinRate.textContent = winRate === null ? "-" : formatPercent(winRate);
+}
+
+function updatePaperLedgerPrices(priceMap) {
+  const ledger = loadPaperLedger();
+  let changed = false;
+  const now = new Date();
+  const updated = ledger.map((trade) => {
+    if (trade.status === "closed") {
+      return trade;
+    }
+    const current = optionalNumber(priceMap?.[trade.symbol]?.mid);
+    if (!current || current <= 0) {
+      return trade;
+    }
+    const entry = optionalNumber(trade.entryPrice);
+    if (!entry || entry <= 0) {
+      return trade;
+    }
+    const move = (current - entry) / entry;
+    const next = { ...trade, currentPrice: current, lastUpdatedIso: now.toISOString() };
+    if (move >= PAPER_PROFIT_TARGET_PCT) {
+      changed = true;
+      return closePaperTrade(next, current, "Take profit +30%", now);
+    }
+    if (move <= PAPER_STOP_LOSS_PCT) {
+      changed = true;
+      return closePaperTrade(next, current, "Stop loss -30%", now);
+    }
+    changed = true;
+    return next;
+  });
+
+  if (changed) {
+    savePaperLedger(updated);
+    renderPaperLedger();
+  }
+}
+
+function closePaperTrade(trade, exitPrice, reason, now) {
+  return {
+    ...trade,
+    status: "closed",
+    exitPrice,
+    exitReason: reason,
+    exitTimestamp: {
+      iso: now.toISOString(),
+      day: now.toISOString().slice(0, 10),
+      label: formatHistoryDate(now),
+    },
+  };
+}
+
+function paperTradePnl(trade) {
+  const entry = optionalNumber(trade.entryPrice);
+  const exit = optionalNumber(trade.status === "closed" ? trade.exitPrice : trade.currentPrice);
+  const quantity = optionalNumber(trade.quantity) || 1;
+  if (!entry || !exit) {
+    return 0;
+  }
+  return (exit - entry) * OPTION_CONTRACT_MULTIPLIER * quantity;
+}
+
+function paperTradePnlPct(entryPrice, currentPrice) {
+  const entry = optionalNumber(entryPrice);
+  const current = optionalNumber(currentPrice);
+  if (!entry || !current) {
+    return 0;
+  }
+  return (current - entry) / entry;
+}
+
+function clearPaperLedgerForSelectedDay() {
+  const selectedDate = replayDate.value || currentPacificDate();
+  const remaining = loadPaperLedger().filter((trade) => paperLedgerDay(trade) !== selectedDate);
+  savePaperLedger(remaining);
+  setStatus(`Cleared simulated paper ledger for ${formatContractDate(selectedDate)}.`, false);
+}
+
+function paperLedgerDay(trade) {
+  return trade.day || trade.timestamp?.day || String(trade.timestamp?.iso || "").slice(0, 10);
 }
 
 function clearTradeHistoryForSelectedDay() {
@@ -1533,6 +1957,7 @@ async function updateTradeHistoryOutcomes(history) {
     const outcomes = await fetchTradeHistoryOutcomes(history);
     const mergedOutcomes = mergeOutcomeFallbacks(history, outcomes);
     saveTradeHistoryOutcomes(mergedOutcomes);
+    renderDailySimulation(history.map((item) => mergedOutcomes[item.id] ? { ...item, outcome: mergedOutcomes[item.id] } : item));
     for (const row of fields.tradeHistory.querySelectorAll(".trade-history-row")) {
       const id = row.dataset.historyId;
       renderHistoryOutcome(row, mergedOutcomes[id]);
@@ -1540,6 +1965,7 @@ async function updateTradeHistoryOutcomes(history) {
   } catch (_error) {
     const fallbackOutcomes = mergeOutcomeFallbacks(history, {});
     saveTradeHistoryOutcomes(fallbackOutcomes);
+    renderDailySimulation(history.map((item) => fallbackOutcomes[item.id] ? { ...item, outcome: fallbackOutcomes[item.id] } : item));
     for (const row of fields.tradeHistory.querySelectorAll(".trade-history-row")) {
       renderHistoryOutcome(row, fallbackOutcomes[row.dataset.historyId] || null);
     }
@@ -1727,6 +2153,7 @@ async function updateTradeHistoryPrices(history) {
   try {
     const query = new URLSearchParams({ symbols: symbols.join(",") });
     const payload = await getJson(`/api/options/prices?${query.toString()}`);
+    updatePaperLedgerPrices(payload.prices || {});
     for (const row of fields.tradeHistory.querySelectorAll(".trade-history-row")) {
       const symbol = row.dataset.symbol;
       const entryPrice = optionalNumber(row.dataset.entryPrice);
@@ -1761,6 +2188,18 @@ async function updateTradeHistoryPrices(history) {
       exitEl.textContent = "Use plan";
     }
   }
+}
+
+function refreshVisibleTradeHistoryPrices() {
+  if (!fields.tradeHistory || fields.tradeHistory.querySelectorAll(".trade-history-row").length === 0) {
+    return;
+  }
+  const selectedDate = replayDate.value;
+  const history = loadTradeHistory().filter((item) => historyItemDate(item) === selectedDate);
+  if (history.length === 0) {
+    return;
+  }
+  updateTradeHistoryPrices(history);
 }
 
 function sellPlanText(entryPrice) {
@@ -1821,6 +2260,26 @@ function saveTradeHistory(history) {
     localStorage.setItem(TRADE_HISTORY_STORAGE_KEY, JSON.stringify(history));
   } catch (_error) {
     fields.tradeHistory.textContent = "Trade history could not be saved in this browser.";
+  }
+}
+
+function loadPaperLedger() {
+  try {
+    const raw = localStorage.getItem(PAPER_LEDGER_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_error) {
+    return [];
+  }
+}
+
+function savePaperLedger(ledger) {
+  try {
+    localStorage.setItem(PAPER_LEDGER_STORAGE_KEY, JSON.stringify(ledger));
+  } catch (_error) {
+    if (fields.paperLedger) {
+      fields.paperLedger.textContent = "Paper simulation ledger could not be saved in this browser.";
+    }
   }
 }
 
@@ -2014,6 +2473,15 @@ function formatStrike(value) {
 
 function capitalize(value) {
   return value ? `${value.charAt(0).toUpperCase()}${value.slice(1)}` : "";
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 function escapeAttribute(value) {

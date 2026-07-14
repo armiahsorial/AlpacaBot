@@ -15,38 +15,50 @@
         </div>
 
         <form id="analysis-form" class="controls">
-          <label>
-            <span>Ticker</span>
-            <select id="ticker" name="ticker" multiple size="6" aria-describedby="ticker-help">
-              <option value="NDX" selected>NDX</option>
-              <option value="SPX">SPX</option>
-              <option value="RUT">RUT</option>
-              <option value="VIX">VIX</option>
-              <option value="NQ_NDX">NQ_NDX</option>
-              <option value="ES_SPX">ES_SPX</option>
-              <option value="QQQ">QQQ</option>
-              <option value="SPY">SPY</option>
-              <option value="IWM">IWM</option>
-              <option value="AAPL">AAPL</option>
-              <option value="AMD">AMD</option>
-              <option value="AMZN">AMZN</option>
-              <option value="AVGO">AVGO</option>
-              <option value="COIN">COIN</option>
-              <option value="GOOG">GOOG</option>
-              <option value="GOOGL">GOOGL</option>
-              <option value="META">META</option>
-              <option value="MSFT">MSFT</option>
-              <option value="MSTR">MSTR</option>
-              <option value="NVDA">NVDA</option>
-              <option value="PLTR">PLTR</option>
-              <option value="SNDK">SNDK</option>
-              <option value="SNXX">SNXX</option>
-              <option value="TSLA">TSLA</option>
-              <option value="WDC">WDC</option>
-              <option value="WDCX">WDCX</option>
-            </select>
-            <small id="ticker-help">Hold Command/Ctrl to pick more than one. The first selected ticker drives the contract watchlist.</small>
-          </label>
+          <div class="ticker-control" aria-describedby="ticker-help">
+            <div class="ticker-control-heading">
+              <span>Ticker</span>
+              <button id="save-ticker-group" type="button">Save Group</button>
+            </div>
+            <div class="ticker-presets" aria-label="Ticker groups">
+              <button type="button" data-ticker-group="NDX">NDX</button>
+              <button type="button" data-ticker-group="QQQ,SPY">QQQ + SPY</button>
+              <button type="button" data-ticker-group="AAPL,MSFT,NVDA,AMZN,META">Mega Cap</button>
+              <button type="button" data-ticker-group="SPX,NDX,RUT,SPY,QQQ,IWM">Indexes</button>
+              <button type="button" data-ticker-group="">Clear</button>
+            </div>
+            <div id="saved-ticker-groups" class="saved-ticker-groups" aria-label="Saved ticker groups"></div>
+            <input id="ticker-group-name" type="text" placeholder="Group name, e.g. Morning watch" />
+            <div id="ticker-checklist" class="ticker-checklist" aria-label="Ticker checklist">
+              <label><input type="checkbox" value="NDX" data-ticker-checkbox checked />NDX</label>
+              <label><input type="checkbox" value="SPX" data-ticker-checkbox />SPX</label>
+              <label><input type="checkbox" value="RUT" data-ticker-checkbox />RUT</label>
+              <label><input type="checkbox" value="VIX" data-ticker-checkbox />VIX</label>
+              <label><input type="checkbox" value="NQ_NDX" data-ticker-checkbox />NQ_NDX</label>
+              <label><input type="checkbox" value="ES_SPX" data-ticker-checkbox />ES_SPX</label>
+              <label><input type="checkbox" value="QQQ" data-ticker-checkbox />QQQ</label>
+              <label><input type="checkbox" value="SPY" data-ticker-checkbox />SPY</label>
+              <label><input type="checkbox" value="IWM" data-ticker-checkbox />IWM</label>
+              <label><input type="checkbox" value="AAPL" data-ticker-checkbox />AAPL</label>
+              <label><input type="checkbox" value="AMD" data-ticker-checkbox />AMD</label>
+              <label><input type="checkbox" value="AMZN" data-ticker-checkbox />AMZN</label>
+              <label><input type="checkbox" value="AVGO" data-ticker-checkbox />AVGO</label>
+              <label><input type="checkbox" value="COIN" data-ticker-checkbox />COIN</label>
+              <label><input type="checkbox" value="GOOG" data-ticker-checkbox />GOOG</label>
+              <label><input type="checkbox" value="GOOGL" data-ticker-checkbox />GOOGL</label>
+              <label><input type="checkbox" value="META" data-ticker-checkbox />META</label>
+              <label><input type="checkbox" value="MSFT" data-ticker-checkbox />MSFT</label>
+              <label><input type="checkbox" value="MSTR" data-ticker-checkbox />MSTR</label>
+              <label><input type="checkbox" value="NVDA" data-ticker-checkbox />NVDA</label>
+              <label><input type="checkbox" value="PLTR" data-ticker-checkbox />PLTR</label>
+              <label><input type="checkbox" value="SNDK" data-ticker-checkbox />SNDK</label>
+              <label><input type="checkbox" value="SNXX" data-ticker-checkbox />SNXX</label>
+              <label><input type="checkbox" value="TSLA" data-ticker-checkbox />TSLA</label>
+              <label><input type="checkbox" value="WDC" data-ticker-checkbox />WDC</label>
+              <label><input type="checkbox" value="WDCX" data-ticker-checkbox />WDCX</label>
+            </div>
+            <small id="ticker-help">Check one or more tickers. The first checked ticker drives the contract watchlist.</small>
+          </div>
 
           <label>
             <span>Period</span>
@@ -69,8 +81,8 @@
             <select id="refresh-seconds">
               <option value="1">1 sec</option>
               <option value="5">5 sec</option>
-              <option value="15" selected>15 sec</option>
-              <option value="30">30 sec</option>
+              <option value="15">15 sec</option>
+              <option value="30" selected>30 sec</option>
               <option value="60">60 sec</option>
             </select>
           </label>
@@ -92,18 +104,18 @@
             <h2>Contract Watchlist</h2>
           </div>
           <div class="live-controls">
-            <button id="live-update" type="button">Live Now</button>
-            <button id="live-toggle" type="button">Start Live</button>
+            <button id="live-update" type="button">Refresh Once</button>
+            <button id="live-toggle" type="button">Start Auto Live</button>
             <label>
               <span>Refresh</span>
               <select id="live-interval">
-                <option value="30">30 sec</option>
-                <option value="60" selected>60 sec</option>
+                <option value="30" selected>30 sec</option>
+                <option value="60">60 sec</option>
                 <option value="120">2 min</option>
                 <option value="300">5 min</option>
               </select>
             </label>
-            <div id="live-status" class="mini-status">Live mode is off.</div>
+            <div id="live-status" class="mini-status">Auto Live is off. Use Refresh Once for one manual live pull.</div>
           </div>
           <div class="replay-controls">
             <label>
@@ -159,6 +171,59 @@
                 <span>Tickers</span>
                 <input id="history-tickers" type="text" placeholder="All, or QQQ,AAPL" />
               </label>
+            </div>
+            <div id="day-performance" class="day-performance" aria-live="polite">
+              <div>
+                <span>Sim input</span>
+                <strong>$10,000</strong>
+              </div>
+              <div>
+                <span>Best-case value</span>
+                <strong id="sim-best-value">-</strong>
+              </div>
+              <div>
+                <span>Best-case return</span>
+                <strong id="sim-best-return">-</strong>
+              </div>
+              <div>
+                <span>Worst-case value</span>
+                <strong id="sim-worst-value">-</strong>
+              </div>
+              <div>
+                <span>Win rate</span>
+                <strong id="sim-win-rate">-</strong>
+              </div>
+              <p id="sim-note">Simulation appears after trade-permission picks are recorded.</p>
+            </div>
+            <div class="paper-ledger-panel">
+              <div class="panel-heading compact-heading">
+                <h3>Paper Simulation Ledger</h3>
+                <button id="clear-paper-ledger" type="button">Clear Ledger Day</button>
+              </div>
+              <div id="paper-ledger-summary" class="paper-ledger-summary">
+                <div>
+                  <span>Realized P/L</span>
+                  <strong id="ledger-realized">-</strong>
+                </div>
+                <div>
+                  <span>Open P/L</span>
+                  <strong id="ledger-open-pl">-</strong>
+                </div>
+                <div>
+                  <span>Closed trades</span>
+                  <strong id="ledger-closed-count">-</strong>
+                </div>
+                <div>
+                  <span>Open trades</span>
+                  <strong id="ledger-open-count">-</strong>
+                </div>
+                <div>
+                  <span>Win rate</span>
+                  <strong id="ledger-win-rate">-</strong>
+                </div>
+                <p>Buys one simulated contract from Pick #1 when trade permission appears. Sells at +30% profit or -30% stop.</p>
+              </div>
+              <div id="paper-ledger" class="paper-ledger-list">No simulated paper trades yet.</div>
             </div>
             <div id="trade-history" class="trade-history-list">No trade-permission picks yet.</div>
           </div>

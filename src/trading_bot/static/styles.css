@@ -73,8 +73,9 @@ body {
 
 .controls {
   display: grid;
-  grid-template-columns: repeat(2, minmax(120px, 1fr)) minmax(96px, 0.7fr) minmax(88px, 0.55fr) minmax(120px, 0.8fr);
+  grid-template-columns: minmax(360px, 1.55fr) minmax(120px, 0.55fr) minmax(96px, 0.45fr) minmax(88px, 0.4fr) minmax(120px, 0.55fr);
   gap: 10px;
+  align-items: start;
 }
 
 label {
@@ -142,6 +143,103 @@ label small {
   font-weight: 750;
   line-height: 1.2;
   text-transform: none;
+}
+
+.ticker-control {
+  display: grid;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.ticker-control-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ticker-control-heading button,
+.ticker-presets button,
+.saved-ticker-group button {
+  height: 28px;
+  border-color: rgba(119, 255, 218, 0.22);
+  background: rgba(15, 29, 42, 0.9);
+  color: var(--ink);
+  padding: 0 9px;
+  font-size: 11px;
+  line-height: 1;
+  box-shadow: none;
+}
+
+.ticker-presets,
+.saved-ticker-groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.saved-ticker-group {
+  display: inline-flex;
+  overflow: hidden;
+  border: 1px solid rgba(119, 255, 218, 0.22);
+  border-radius: 999px;
+  background: rgba(53, 231, 176, 0.08);
+}
+
+.saved-ticker-group button {
+  border: 0;
+  border-radius: 0;
+}
+
+.saved-ticker-group button:first-child {
+  color: var(--accent-dark);
+}
+
+.saved-ticker-group button:last-child {
+  width: 26px;
+  padding: 0;
+  color: var(--danger);
+}
+
+.ticker-checklist {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(82px, 1fr));
+  gap: 5px;
+  max-height: 118px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(6, 16, 24, 0.54);
+  padding: 7px;
+}
+
+.ticker-checklist label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 24px;
+  border: 1px solid rgba(119, 255, 218, 0.16);
+  border-radius: 5px;
+  background: rgba(15, 29, 42, 0.7);
+  color: var(--ink);
+  padding: 3px 6px;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.ticker-checklist input {
+  width: 14px;
+  min-width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+}
+
+#ticker-group-name {
+  height: 32px;
+  font-size: 12px;
 }
 
 input:focus,
@@ -506,6 +604,188 @@ button:disabled {
 
 .history-filters input {
   height: 36px;
+}
+
+.day-performance {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  gap: 8px;
+  border: 1px solid rgba(119, 255, 218, 0.22);
+  border-radius: 7px;
+  background:
+    linear-gradient(135deg, rgba(53, 231, 176, 0.11), rgba(8, 15, 24, 0.88)),
+    var(--panel);
+  padding: 10px;
+}
+
+.day-performance div {
+  display: grid;
+  gap: 3px;
+  min-height: 56px;
+  border: 1px solid rgba(119, 255, 218, 0.13);
+  border-radius: 6px;
+  background: rgba(6, 16, 24, 0.55);
+  padding: 9px;
+}
+
+.day-performance span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 850;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.day-performance strong {
+  color: var(--ink);
+  font-size: 18px;
+  line-height: 1.1;
+}
+
+.day-performance p {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.day-performance .positive {
+  color: var(--accent);
+}
+
+.day-performance .negative {
+  color: var(--danger);
+}
+
+.day-performance.profitable {
+  border-color: rgba(53, 231, 176, 0.42);
+}
+
+.day-performance.losing {
+  border-color: rgba(255, 92, 122, 0.42);
+}
+
+.paper-ledger-panel {
+  display: grid;
+  gap: 8px;
+  border: 1px solid rgba(119, 255, 218, 0.18);
+  border-radius: 7px;
+  background:
+    linear-gradient(135deg, rgba(53, 231, 176, 0.08), rgba(8, 15, 24, 0.86)),
+    var(--panel);
+  padding: 10px;
+}
+
+.paper-ledger-panel .panel-heading {
+  align-items: center;
+}
+
+.paper-ledger-panel .panel-heading button {
+  height: 32px;
+  padding: 0 12px;
+}
+
+.paper-ledger-summary {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(110px, 1fr));
+  gap: 8px;
+}
+
+.paper-ledger-summary div {
+  display: grid;
+  gap: 3px;
+  min-height: 54px;
+  border: 1px solid rgba(119, 255, 218, 0.13);
+  border-radius: 6px;
+  background: rgba(6, 16, 24, 0.58);
+  padding: 9px;
+}
+
+.paper-ledger-summary span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 850;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.paper-ledger-summary strong {
+  color: var(--ink);
+  font-size: 18px;
+  line-height: 1.1;
+}
+
+.paper-ledger-summary p {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.paper-ledger-summary .positive,
+.paper-ledger-row .positive {
+  color: var(--accent);
+}
+
+.paper-ledger-summary .negative,
+.paper-ledger-row .negative {
+  color: var(--danger);
+}
+
+.paper-ledger-list {
+  display: grid;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.paper-ledger-row {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.3fr) auto repeat(5, minmax(96px, 0.65fr));
+  gap: 8px 12px;
+  align-items: center;
+  min-height: 70px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: linear-gradient(180deg, rgba(17, 31, 45, 0.92), rgba(9, 18, 28, 0.92));
+  color: var(--ink);
+  padding: 10px 12px;
+}
+
+.paper-ledger-row.contract-call {
+  border-left: 5px solid var(--accent);
+}
+
+.paper-ledger-row.contract-put {
+  border-left: 5px solid var(--danger);
+}
+
+.paper-ledger-row.status-closed {
+  opacity: 0.84;
+}
+
+.ledger-contract {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.ledger-contract strong,
+.ledger-contract em {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ledger-contract em {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
 }
 
 .trade-history-list {
@@ -1473,7 +1753,11 @@ td:nth-child(2) {
   }
 
   .controls {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .ticker-control {
+    grid-column: 1 / -1;
   }
 
   .summary {
@@ -1540,7 +1824,21 @@ td:nth-child(2) {
     grid-template-columns: 1fr 1fr;
   }
 
+  .history-filters,
+  .day-performance,
+  .paper-ledger-summary {
+    grid-template-columns: 1fr;
+  }
+
   .trade-history-row span:first-child {
+    grid-column: 1 / -1;
+  }
+
+  .paper-ledger-row {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .ledger-contract {
     grid-column: 1 / -1;
   }
 

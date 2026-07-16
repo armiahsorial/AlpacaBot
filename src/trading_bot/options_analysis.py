@@ -12,7 +12,6 @@ from trading_bot.alpaca_client import AlpacaClient
 from trading_bot.analysis import GexAnalysis
 
 OPTIONABLE_GEX_TICKER_OVERRIDES = {
-    "SPX": "SPY",
     "NDX": "QQQ",
     "RUT": "IWM",
 }
@@ -102,6 +101,7 @@ def recommend_option_contracts(
     alpaca_client: AlpacaClient,
     max_expiration_days: int = 14,
     max_candidates: int = 5,
+    max_contract_cost: float | None = None,
 ) -> OptionRecommendation:
     ticker = gex_analysis.ticker.upper()
     underlying_symbol = OPTIONABLE_GEX_TICKER_OVERRIDES.get(ticker, ticker)
@@ -150,6 +150,10 @@ def recommend_option_contracts(
                     for contract in side_contracts
                 )
                 if candidate is not None
+                and (
+                    max_contract_cost is None
+                    or (candidate.mid is not None and candidate.mid * 100 <= max_contract_cost)
+                )
             ),
             key=lambda candidate: candidate.score,
             reverse=True,
@@ -170,7 +174,11 @@ def recommend_option_contracts(
             trade_permission=gex_analysis.trade_permission,
             recommendation="No liquid option contract candidate was found in the near-dated Alpaca chain.",
             candidates=(),
-            warnings=tuple(warnings + ["No candidate had usable bid/ask quote data."]),
+            warnings=tuple(warnings + [
+                "No candidate had usable bid/ask quote data within the selected contract-price limit."
+                if max_contract_cost is not None
+                else "No candidate had usable bid/ask quote data."
+            ]),
         )
 
     best = candidates[0]

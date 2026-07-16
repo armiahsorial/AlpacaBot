@@ -455,6 +455,43 @@ class GexClient:
             "state_available": isinstance(state_payload, dict) and isinstance(state_payload.get("url"), str),
         }
 
+    def prefetch_historical_gex_date(self, ticker: str, aggregation_period: str, replay_date: str) -> dict[str, Any]:
+        """Download each daily history file once for a rate-safe whole-day replay."""
+        ticker, aggregation_period = _normalize_ticker_and_period(ticker, aggregation_period)
+        loaded: list[str] = []
+        cached: list[str] = []
+        for mode in ("classic", "state"):
+            history_key = f"{ticker}:{mode}:{aggregation_period}:{replay_date}"
+            rows = _HISTORICAL_ROWS_CACHE.get(history_key) or _read_disk_history_cache(history_key)
+            if rows is not None:
+                cached.append(mode)
+                continue
+            url = self._get_historical_signed_url(
+                history_key=history_key,
+                safe_ticker=quote(ticker, safe=""),
+                safe_mode=quote(mode, safe=""),
+                safe_period=quote(aggregation_period, safe=""),
+                safe_date=quote(replay_date, safe=""),
+            )
+            try:
+                rows = self._get_signed_history_rows(url)
+            except GexApiError as exc:
+                if not _is_expired_signed_url_error(exc):
+                    raise
+                _HISTORICAL_URL_CACHE.pop(history_key, None)
+                url = self._get_historical_signed_url(
+                    history_key=history_key,
+                    safe_ticker=quote(ticker, safe=""),
+                    safe_mode=quote(mode, safe=""),
+                    safe_period=quote(aggregation_period, safe=""),
+                    safe_date=quote(replay_date, safe=""),
+                )
+                rows = self._get_signed_history_rows(url)
+            _HISTORICAL_ROWS_CACHE[history_key] = rows
+            _write_disk_history_cache(history_key, rows)
+            loaded.append(mode)
+        return {"ticker": ticker, "period": aggregation_period, "date": replay_date, "loaded": loaded, "cached": cached}
+
     def _get_json(self, path: str) -> Any:
         global _GEX_HISTORY_RATE_LIMITED_UNTIL
         if path.startswith("/hist/") and time.time() < _GEX_HISTORY_RATE_LIMITED_UNTIL:

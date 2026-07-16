@@ -5,6 +5,23 @@ from trading_bot.options_analysis import recommend_option_contracts
 
 
 class OptionRecommendationTests(unittest.TestCase):
+    def test_uses_native_spx_option_contracts(self):
+        client = _FakeAlpacaClient()
+
+        recommendation = recommend_option_contracts(
+            gex_analysis=_analysis(
+                ticker="SPX",
+                bias="bullish",
+                score=4,
+                permission="possible trade after confirmation",
+            ),
+            alpaca_client=client,
+        )
+
+        self.assertEqual(client.requested_underlying, "SPX")
+        self.assertEqual(recommendation.underlying_symbol, "SPX")
+        self.assertFalse(any("using SPY as proxy" in warning for warning in recommendation.warnings))
+
     def test_recommends_call_for_bullish_gex(self):
         recommendation = recommend_option_contracts(
             gex_analysis=_analysis(bias="bullish", score=4, permission="possible trade after confirmation"),
@@ -27,6 +44,16 @@ class OptionRecommendationTests(unittest.TestCase):
         self.assertIsNotNone(candidate.gamma)
         self.assertIsNotNone(candidate.implied_volatility)
 
+    def test_filters_candidates_above_maximum_contract_cost(self):
+        recommendation = recommend_option_contracts(
+            gex_analysis=_analysis(bias="bullish", score=4, permission="possible trade after confirmation"),
+            alpaca_client=_FakeAlpacaClient(),
+            max_contract_cost=200,
+        )
+
+        self.assertEqual(recommendation.candidates, ())
+        self.assertIn("contract-price limit", recommendation.warnings[-1])
+
     def test_returns_no_contract_for_neutral_gex(self):
         recommendation = recommend_option_contracts(
             gex_analysis=_analysis(bias="neutral", score=0, permission="no trade"),
@@ -41,8 +68,10 @@ class OptionRecommendationTests(unittest.TestCase):
 class _FakeAlpacaClient:
     def __init__(self, *, include_greeks: bool = True):
         self._include_greeks = include_greeks
+        self.requested_underlying = None
 
-    def get_option_contracts(self, *_args, **_kwargs):
+    def get_option_contracts(self, underlying, **_kwargs):
+        self.requested_underlying = underlying
         return [
             {
                 "symbol": "AAPL260110C00200000",
@@ -85,9 +114,9 @@ class _FakeAlpacaClient:
         return {symbol: [] for symbol in symbols}
 
 
-def _analysis(*, bias: str, score: int, permission: str) -> GexAnalysis:
+def _analysis(*, bias: str, score: int, permission: str, ticker: str = "AAPL") -> GexAnalysis:
     return GexAnalysis(
-        ticker="AAPL",
+        ticker=ticker,
         period="zero",
         timestamp=1782919290,
         spot=195.0,

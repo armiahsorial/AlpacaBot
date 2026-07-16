@@ -5,7 +5,12 @@ from http import HTTPStatus
 from unittest.mock import MagicMock, patch
 
 from trading_bot.alpaca_client import AlpacaApiError
-from trading_bot.web_app import TradingBotWebHandler, _option_outcomes, _stock_technicals
+from trading_bot.web_app import (
+    TradingBotWebHandler,
+    _historical_option_prices,
+    _option_outcomes,
+    _stock_technicals,
+)
 
 
 class WebAppTests(unittest.TestCase):
@@ -105,7 +110,9 @@ class WebAppTests(unittest.TestCase):
         with patch("trading_bot.web_app._analyze_ticker", return_value=analysis) as analyze_mock:
             with patch("trading_bot.web_app._alpaca_client", return_value=MagicMock()) as alpaca_mock:
                 with patch("trading_bot.web_app.recommend_option_contracts", return_value=recommendation) as recommend_mock:
-                    handler._handle_option_recommendation("ticker=aapl&period=zero&limit=3")
+                    handler._handle_option_recommendation(
+                        "ticker=aapl&period=zero&limit=3&max_contract_cost=500"
+                    )
 
         self.assertEqual(handler.status, HTTPStatus.OK)
         payload = json.loads(handler.body.decode("utf-8"))
@@ -114,6 +121,7 @@ class WebAppTests(unittest.TestCase):
         analyze_mock.assert_called_once_with("AAPL", "zero")
         alpaca_mock.assert_called_once_with()
         self.assertEqual(recommend_mock.call_args.kwargs["max_candidates"], 3)
+        self.assertEqual(recommend_mock.call_args.kwargs["max_contract_cost"], 500)
 
     def test_handle_option_prices_returns_current_mids(self):
         handler = _handler()
@@ -263,6 +271,26 @@ class WebAppTests(unittest.TestCase):
         )
 
         self.assertEqual(outcomes["signal-3"]["error"], "option bars unavailable")
+
+    def test_historical_option_prices_uses_latest_bar_close(self):
+        alpaca = MagicMock()
+        alpaca.get_option_bars.return_value = {
+            "QQQ260717C00720000": [
+                {"t": "2026-07-13T14:30:00Z", "c": 2.1},
+                {"t": "2026-07-13T15:00:00Z", "c": 2.85},
+            ]
+        }
+
+        prices = _historical_option_prices(
+            alpaca,
+            ["QQQ260717C00720000"],
+            "2026-07-13",
+            "11:00:00",
+        )
+
+        self.assertEqual(prices["QQQ260717C00720000"]["mid"], 2.85)
+        self.assertEqual(prices["QQQ260717C00720000"]["source"], "historical option bar")
+        alpaca.get_option_bars.assert_called_once()
 
 def _handler(body: bytes = b""):
     handler = object.__new__(TradingBotWebHandler)

@@ -337,6 +337,36 @@ class GexClientTests(unittest.TestCase):
         self.assertEqual(gex_client._HISTORICAL_URL_CACHE[history_key], "https://history.example.test/fresh.json")
         get_json.assert_called_once_with("/hist/SPX/classic/zero/2026-07-01?noredirect")
 
+    def test_prefetch_historical_gex_date_downloads_classic_and_state_once(self):
+        settings = Settings(api_key="secret", base_url="https://api.example.test")
+        client = GexClient(settings)
+        gex_client._HISTORICAL_ROWS_CACHE.clear()
+        gex_client._HISTORICAL_URL_CACHE.clear()
+
+        with (
+            patch("trading_bot.gex_client._read_disk_history_cache", return_value=None),
+            patch("trading_bot.gex_client._write_disk_history_cache") as write_cache,
+            patch.object(
+                client,
+                "_get_json",
+                side_effect=[
+                    {"url": "https://history.example.test/classic.json"},
+                    {"url": "https://history.example.test/state.json"},
+                ],
+            ),
+            patch.object(
+                client,
+                "_get_signed_history_rows",
+                side_effect=[[_gex_chain_payload()], [_gex_chain_payload()]],
+            ) as get_rows,
+        ):
+            result = client.prefetch_historical_gex_date("spx", "zero", "2026-07-01")
+
+        self.assertEqual(result["loaded"], ["classic", "state"])
+        self.assertEqual(result["cached"], [])
+        self.assertEqual(get_rows.call_count, 2)
+        self.assertEqual(write_cache.call_count, 2)
+
 
 def _mock_response(payload):
     response = MagicMock()

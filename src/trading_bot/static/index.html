@@ -18,7 +18,23 @@
           <div class="ticker-control" aria-describedby="ticker-help">
             <div class="ticker-control-heading">
               <span>Ticker</span>
-              <button id="save-ticker-group" type="button">Save Group</button>
+              <div class="ticker-heading-actions">
+                <label class="max-contract-control">
+                  <span>Max contract</span>
+                  <select id="max-contract-cost" aria-label="Maximum total price for one option contract">
+                    <option value="">Any price</option>
+                    <option value="100">$100</option>
+                    <option value="250">$250</option>
+                    <option value="500">$500</option>
+                    <option value="750">$750</option>
+                    <option value="1000">$1,000</option>
+                    <option value="1500">$1,500</option>
+                    <option value="2500">$2,500</option>
+                    <option value="5000">$5,000</option>
+                  </select>
+                </label>
+                <button id="save-ticker-group" type="button">Save Group</button>
+              </div>
             </div>
             <div class="ticker-presets" aria-label="Ticker groups">
               <button type="button" data-ticker-group="NDX">NDX</button>
@@ -57,7 +73,7 @@
               <label><input type="checkbox" value="WDC" data-ticker-checkbox />WDC</label>
               <label><input type="checkbox" value="WDCX" data-ticker-checkbox />WDCX</label>
             </div>
-            <small id="ticker-help">Check one or more tickers. The first checked ticker drives the contract watchlist.</small>
+            <small id="ticker-help">Check one or more tickers. Max contract is the most the bot may spend for one 100-share option contract.</small>
           </div>
 
           <label>
@@ -130,6 +146,7 @@
             <button id="replay-today" type="button">Today Now</button>
             <button id="replay-play" type="button">Play</button>
             <button id="replay-refresh" type="button">Update Data</button>
+            <button id="run-day-simulation" type="button">Run Day Simulation</button>
             <div class="speed-buttons" aria-label="Replay speed">
               <button type="button" data-speed="1">1x</button>
               <button type="button" data-speed="2">2x</button>
@@ -139,6 +156,7 @@
               <button type="button" data-speed="50">50x</button>
             </div>
           </div>
+          <div id="day-simulation-status" class="mini-status hidden" aria-live="polite"></div>
           <div id="contract-summary" class="mini-status">Run GEX analysis to scan contracts.</div>
           <div id="best-pick" class="best-pick hidden">
             <div>
@@ -172,6 +190,7 @@
                 <input id="history-tickers" type="text" placeholder="All, or QQQ,AAPL" />
               </label>
             </div>
+            <div id="history-export-status" class="mini-status" aria-live="polite">Choose a date range to download.</div>
             <div id="day-performance" class="day-performance" aria-live="polite">
               <div>
                 <span>Sim input</span>
@@ -221,7 +240,7 @@
                   <span>Win rate</span>
                   <strong id="ledger-win-rate">-</strong>
                 </div>
-                <p>Buys one simulated contract from Pick #1 when trade permission appears. Sells at +30% profit or -30% stop.</p>
+                <p>Buys each exact Pick #1 contract once per day. Repeated confirmations stay in history without multiplying P/L. Sells at +30% profit or -30% stop.</p>
               </div>
               <div id="paper-ledger" class="paper-ledger-list">No simulated paper trades yet.</div>
             </div>
@@ -274,6 +293,22 @@
         <section class="panel">
           <h2>Action</h2>
           <p id="action"></p>
+        </section>
+
+        <section class="panel daily-report-card">
+          <h2>Daily Report Card</h2>
+          <div class="report-card-grid">
+            <div><span>Total trades</span><strong id="report-total-trades">0</strong></div>
+            <div><span>Win rate</span><strong id="report-win-rate">-</strong></div>
+            <div><span>Average win</span><strong id="report-average-win">-</strong></div>
+            <div><span>Average loss</span><strong id="report-average-loss">-</strong></div>
+            <div><span>Profit factor</span><strong id="report-profit-factor">-</strong></div>
+            <div><span>Max drawdown</span><strong id="report-max-drawdown">-</strong></div>
+            <div><span>Best ticker</span><strong id="report-best-ticker">-</strong></div>
+            <div><span>Worst ticker</span><strong id="report-worst-ticker">-</strong></div>
+            <div class="report-verdict"><span>Would this day have been profitable?</span><strong id="report-profitable">No trades yet</strong></div>
+          </div>
+          <p>Uses the selected day's original paper-ledger rules and marks open positions at their latest recorded price.</p>
         </section>
 
         <section class="panel chart-panel">

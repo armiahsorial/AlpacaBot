@@ -7,6 +7,7 @@ const tickerPresetButtons = document.querySelectorAll("[data-ticker-group]");
 const saveTickerGroupButton = document.querySelector("#save-ticker-group");
 const tickerGroupName = document.querySelector("#ticker-group-name");
 const savedTickerGroups = document.querySelector("#saved-ticker-groups");
+const maxContractCostSelect = document.querySelector("#max-contract-cost");
 const autoRefresh = document.querySelector("#auto-refresh");
 const refreshSeconds = document.querySelector("#refresh-seconds");
 const alpacaStatus = document.querySelector("#alpaca-status");
@@ -25,6 +26,8 @@ const replayClock = document.querySelector("#replay-clock");
 const replayPlay = document.querySelector("#replay-play");
 const replayRefresh = document.querySelector("#replay-refresh");
 const replayToday = document.querySelector("#replay-today");
+const runDaySimulationButton = document.querySelector("#run-day-simulation");
+const daySimulationStatus = document.querySelector("#day-simulation-status");
 const stageBestPickButton = document.querySelector("#stage-best-pick");
 const clearTradeHistoryButton = document.querySelector("#clear-trade-history");
 const clearPaperLedgerButton = document.querySelector("#clear-paper-ledger");
@@ -33,6 +36,7 @@ const exportTradeHistoryRangeButton = document.querySelector("#export-trade-hist
 const historyStartDate = document.querySelector("#history-start-date");
 const historyEndDate = document.querySelector("#history-end-date");
 const historyTickers = document.querySelector("#history-tickers");
+const historyExportStatus = document.querySelector("#history-export-status");
 const speedButtons = document.querySelectorAll("[data-speed]");
 const barSymbol = document.querySelector("#bar-symbol");
 const latestBar = document.querySelector("#latest-bar");
@@ -54,16 +58,22 @@ let replayAbortController = null;
 let lastReplayFetchSecond = null;
 let lastReplayFetchStartedAt = 0;
 let currentBestPick = null;
+let daySimulationRunning = false;
+let daySimulationStopRequested = false;
 const REPLAY_FETCH_STEP_SECONDS = 300;
+const DAY_SIMULATION_STEP_SECONDS = 15 * 60;
 const REPLAY_MIN_FETCH_INTERVAL_MS = 5000;
 const TRADE_HISTORY_STORAGE_KEY = "tradingBot.tradePermissionHistory";
 const PAPER_LEDGER_STORAGE_KEY = "tradingBot.paperSimulationLedger";
 const TICKER_GROUPS_STORAGE_KEY = "tradingBot.tickerGroups";
+const MAX_CONTRACT_COST_STORAGE_KEY = "tradingBot.maxContractCost";
 const SIMULATION_STARTING_CASH = 10000;
 const OPTION_CONTRACT_MULTIPLIER = 100;
 const PAPER_PROFIT_TARGET_PCT = 0.3;
 const PAPER_STOP_LOSS_PCT = -0.3;
-const MAX_TRADE_HISTORY_ITEMS = 100;
+// Keep enough signals for multi-day exports instead of allowing one busy session
+// to evict the previous day's history.
+const MAX_TRADE_HISTORY_ITEMS = 2000;
 const MAX_PAPER_LEDGER_ITEMS = 500;
 const MAX_RECORDED_PERMISSION_CANDIDATES = 5;
 const PACIFIC_TO_EASTERN_SECONDS = 3 * 60 * 60;
@@ -130,6 +140,15 @@ const fields = {
   ledgerClosedCount: document.querySelector("#ledger-closed-count"),
   ledgerOpenCount: document.querySelector("#ledger-open-count"),
   ledgerWinRate: document.querySelector("#ledger-win-rate"),
+  reportTotalTrades: document.querySelector("#report-total-trades"),
+  reportWinRate: document.querySelector("#report-win-rate"),
+  reportAverageWin: document.querySelector("#report-average-win"),
+  reportAverageLoss: document.querySelector("#report-average-loss"),
+  reportProfitFactor: document.querySelector("#report-profit-factor"),
+  reportMaxDrawdown: document.querySelector("#report-max-drawdown"),
+  reportBestTicker: document.querySelector("#report-best-ticker"),
+  reportWorstTicker: document.querySelector("#report-worst-ticker"),
+  reportProfitable: document.querySelector("#report-profitable"),
   multiTickerPanel: document.querySelector("#multi-ticker-panel"),
   multiTickerList: document.querySelector("#multi-ticker-list"),
 };
@@ -144,20 +163,22 @@ form.addEventListener("change", (event) => {
   if (event.target?.matches?.("[data-ticker-checkbox], #ticker-group-name")) {
     return;
   }
+  if (event.target === maxContractCostSelect) {
+    localStorage.setItem(MAX_CONTRACT_COST_STORAGE_KEY, maxContractCostSelect.value);
+    isInspectingContract = false;
+  }
   runAnalysis();
   scheduleRefresh();
 });
 
 tickerChecklist?.addEventListener("change", () => {
-  runAnalysis();
-  scheduleRefresh();
+  refreshForTickerSelection();
 });
 
 for (const presetButton of tickerPresetButtons) {
   presetButton.addEventListener("click", () => {
     setSelectedTickers(parseTickerGroupValue(presetButton.dataset.tickerGroup || ""));
-    runAnalysis();
-    scheduleRefresh();
+    refreshForTickerSelection();
   });
 }
 
@@ -241,6 +262,15 @@ replayToday.addEventListener("click", () => {
   jumpToTodayNow();
 });
 
+runDaySimulationButton?.addEventListener("click", () => {
+  if (daySimulationRunning) {
+    daySimulationStopRequested = true;
+    setDaySimulationStatus("Stopping after the current replay point...", false);
+    return;
+  }
+  runDaySimulation();
+});
+
 stageBestPickButton?.addEventListener("click", () => {
   if (!currentBestPick) {
     return;
@@ -263,8 +293,18 @@ exportTradeHistoryButton?.addEventListener("click", async () => {
 });
 
 exportTradeHistoryRangeButton?.addEventListener("click", async () => {
-  await downloadTradeHistoryForRange();
+  exportTradeHistoryRangeButton.disabled = true;
+  try {
+    await downloadTradeHistoryForRange();
+  } finally {
+    exportTradeHistoryRangeButton.disabled = false;
+  }
 });
+
+for (const control of [historyStartDate, historyEndDate, historyTickers]) {
+  control?.addEventListener("input", updateHistoryRangeCount);
+  control?.addEventListener("change", updateHistoryRangeCount);
+}
 
 document.addEventListener("pointerover", (event) => {
   const target = event.target.closest(".info-dot");
@@ -577,11 +617,47 @@ function getSelectedTickers() {
   return selected.length > 0 ? [...new Set(selected)] : ["NDX"];
 }
 
+function getMaxContractCost() {
+  const value = Number(maxContractCostSelect?.value || 0);
+  return value > 0 ? value : null;
+}
+
+function addContractCostLimit(query) {
+  const maxContractCost = getMaxContractCost();
+  if (maxContractCost !== null) {
+    query.set("max_contract_cost", String(maxContractCost));
+  }
+  return query;
+}
+
+function initializeMaxContractCost() {
+  if (!maxContractCostSelect) {
+    return;
+  }
+  const saved = localStorage.getItem(MAX_CONTRACT_COST_STORAGE_KEY) || "";
+  if ([...maxContractCostSelect.options].some((option) => option.value === saved)) {
+    maxContractCostSelect.value = saved;
+  }
+}
+
 function setSelectedTickers(tickers) {
   const selected = new Set((tickers.length > 0 ? tickers : ["NDX"]).map((ticker) => ticker.toUpperCase()));
   for (const checkbox of document.querySelectorAll("[data-ticker-checkbox]")) {
     checkbox.checked = selected.has(checkbox.value.toUpperCase());
   }
+}
+
+async function refreshForTickerSelection() {
+  isInspectingContract = false;
+  lastReplayFetchSecond = null;
+  renderTradeHistory();
+  if (replayDate.value && replayDate.value !== currentPacificDate()) {
+    stopLiveMode();
+    await loadOptionReplay({ force: true });
+  } else {
+    await runAnalysis();
+  }
+  scheduleRefresh();
 }
 
 function parseTickerGroupValue(value) {
@@ -654,8 +730,7 @@ function renderTickerGroups() {
         return;
       }
       setSelectedTickers(group.tickers);
-      runAnalysis();
-      scheduleRefresh();
+      refreshForTickerSelection();
     });
   }
   for (const button of savedTickerGroups.querySelectorAll("[data-delete-ticker-group]")) {
@@ -698,6 +773,7 @@ function scheduleRefresh() {
 initializeReplayControls();
 initializeTradeHistoryExportControls();
 renderTickerGroups();
+initializeMaxContractCost();
 autoRefresh.checked = true;
 initializeMarketMode();
 scheduleRefresh();
@@ -933,28 +1009,81 @@ async function submitPaperOrder() {
 }
 
 async function loadOptionRecommendation({ source = "manual" } = {}) {
-  const { ticker, period } = getFormValues();
-  fields.contractSummary.textContent = "Scanning Alpaca options...";
+  const { period } = getFormValues();
+  const tickers = getSelectedTickers();
+  fields.contractSummary.textContent = `Scanning Alpaca options for ${tickers.join(", ")}...`;
   fields.contractSummary.classList.remove("error");
   fields.contractList.textContent = "-";
   resetBestPick();
 
-  try {
-    const query = new URLSearchParams({
-      ticker,
-      period,
-      max_expiration_days: "14",
-      limit: "5",
-    });
-    const payload = await getJson(`/api/options/recommend?${query.toString()}`);
-    renderOptionRecommendation(payload);
-  } catch (error) {
+  const payloads = [];
+  const errors = [];
+  for (const ticker of tickers) {
+    try {
+      const query = addContractCostLimit(new URLSearchParams({
+        ticker,
+        period,
+        max_expiration_days: "14",
+        limit: "5",
+      }));
+      payloads.push(await getJson(`/api/options/recommend?${query.toString()}`));
+    } catch (error) {
+      errors.push({ ticker, message: error.message || "Options request failed." });
+    }
+  }
+
+  if (payloads.length > 0) {
+    renderOptionRecommendations(payloads, errors);
+    return;
+  }
+
+  const message = errors.map((error) => `${error.ticker}: ${error.message}`).join(" | ") || "Options scan failed.";
+  fields.contractSummary.textContent = message;
+  fields.contractSummary.classList.add("error");
+  resetBestPick();
+  if (source === "live") {
+    throw new Error(message);
+  }
+}
+
+async function loadOptionReplaysForTickers(tickers, period, { signal } = {}) {
+  const payloads = [];
+  const errors = [];
+  for (const ticker of tickers) {
+    try {
+      const query = addContractCostLimit(new URLSearchParams({
+        ticker,
+        period,
+        date: replayDate.value,
+        time: getReplayMarketClock(),
+        max_expiration_days: "14",
+        limit: "5",
+      }));
+      payloads.push(await getJsonWithTimeout(`/api/options/replay?${query.toString()}`, {
+        signal,
+        timeoutMs: 90000,
+      }));
+    } catch (error) {
+      if (error.name === "AbortError") {
+        throw error;
+      }
+      errors.push({ ticker, message: error.message || "Replay request failed." });
+    }
+  }
+  return { payloads, errors };
+}
+
+function replayErrorMessage(errors) {
+  return errors.map((error) => `${error.ticker}: ${error.message}`).join(" | ") || "Replay request failed.";
+}
+
+function showReplayError(error) {
+  if (error.name === "AbortError") {
+    fields.contractSummary.textContent = "Previous replay request canceled. Press Update Data to try again.";
+  } else {
     fields.contractSummary.textContent = error.message;
     fields.contractSummary.classList.add("error");
     resetBestPick();
-    if (source === "live") {
-      throw error;
-    }
   }
 }
 
@@ -980,7 +1109,8 @@ async function loadOptionReplay({ force = false } = {}) {
   isReplayLoading = true;
   replayAbortController = new AbortController();
   isInspectingContract = true;
-  const { ticker, period } = getFormValues();
+  const { period } = getFormValues();
+  const tickers = getSelectedTickers();
   const replaySecond = Number(replayTime.value || 57540);
   const now = Date.now();
   if (
@@ -1007,61 +1137,202 @@ async function loadOptionReplay({ force = false } = {}) {
   resetBestPick();
 
   try {
-    const query = new URLSearchParams({
-      ticker,
-      period,
-      date: replayDate.value,
-      time: getReplayMarketClock(),
-      max_expiration_days: "14",
-      limit: "5",
-    });
-    const payload = await getJsonWithTimeout(`/api/options/replay?${query.toString()}`, {
+    const { payloads, errors } = await loadOptionReplaysForTickers(tickers, period, {
       signal: replayAbortController.signal,
-      timeoutMs: 90000,
     });
-    lastReplayFetchSecond = replaySecond;
-    renderOptionReplay(payload);
-  } catch (error) {
-    if (error.name === "AbortError") {
-      fields.contractSummary.textContent = "Previous replay request canceled. Press Scan to try again.";
-    } else {
-      fields.contractSummary.textContent = error.message;
-      fields.contractSummary.classList.add("error");
-      resetBestPick();
+    if (payloads.length === 0) {
+      throw new Error(replayErrorMessage(errors));
     }
+    lastReplayFetchSecond = replaySecond;
+    renderOptionReplays(payloads, errors);
+  } catch (error) {
+    showReplayError(error);
   } finally {
     isReplayLoading = false;
     replayAbortController = null;
   }
 }
 
-function renderOptionReplay(payload) {
-  const recommendation = payload.recommendation || {};
-  const warning = payload.warning ? ` ${payload.warning}` : "";
-  const gexTime = recommendation.gex_timestamp ? ` GEX ${new Date(recommendation.gex_timestamp * 1000).toLocaleTimeString()}.` : "";
-  if (payload.analysis) {
-    lastAnalysis = payload.analysis;
-    renderAnalysis(payload.analysis);
-    setStatus(`Replay GEX map updated for ${payload.date} ${replayClock.textContent} Pacific time.`, false);
+async function runDaySimulation() {
+  const simulationDate = replayDate.value;
+  if (!simulationDate || simulationDate >= currentPacificDate() || isWeekendDate(simulationDate)) {
+    setDaySimulationStatus("Choose a completed weekday before today.", true);
+    return;
   }
-  fields.contractSummary.classList.toggle("error", Boolean(payload.warning));
-  fields.contractSummary.textContent = `${payload.date} ${replayClock.textContent} PT: ${recommendation.recommendation || "No recommendation."}${gexTime}${warning}`;
-  renderBestPick(payload, "replay");
 
-  if (!payload.candidates || payload.candidates.length === 0) {
+  daySimulationRunning = true;
+  daySimulationStopRequested = false;
+  runDaySimulationButton.disabled = false;
+  runDaySimulationButton.textContent = "Stop Simulation";
+  stopLiveMode();
+  stopReplay();
+  if (refreshTimer !== null) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
+  if (replayAbortController) {
+    replayAbortController.abort();
+  }
+
+  const { period } = getFormValues();
+  const tickers = getSelectedTickers();
+  const start = Number(replayTime.min) + DAY_SIMULATION_STEP_SECONDS;
+  const end = Number(replayTime.max) - 60;
+  const checkpoints = [];
+  for (let second = start; second <= end; second += DAY_SIMULATION_STEP_SECONDS) {
+    checkpoints.push(second);
+  }
+
+  try {
+    const simulationTickers = [];
+    const prefetchErrors = [];
+    for (let tickerIndex = 0; tickerIndex < tickers.length; tickerIndex += 1) {
+      const ticker = tickers[tickerIndex];
+      setDaySimulationStatus(
+        `Preparing ${ticker} (${tickerIndex + 1} of ${tickers.length}) for ${formatContractDate(simulationDate)}...`,
+        false
+      );
+      try {
+        const prefetchQuery = new URLSearchParams({ ticker, period, date: simulationDate });
+        await getJsonWithTimeout(`/api/options/replay/prefetch?${prefetchQuery.toString()}`, {
+          timeoutMs: 120000,
+        });
+        simulationTickers.push(ticker);
+      } catch (error) {
+        prefetchErrors.push({ ticker, message: error.message || "History prefetch failed." });
+      }
+    }
+    if (simulationTickers.length === 0) {
+      throw new Error(replayErrorMessage(prefetchErrors));
+    }
+
+    for (let index = 0; index < checkpoints.length; index += 1) {
+      if (daySimulationStopRequested) {
+        break;
+      }
+      const second = checkpoints[index];
+      replayTime.value = String(second);
+      updateReplayClock();
+      setDaySimulationStatus(
+        `Replaying ${simulationTickers.join(", ")} at ${replayClock.textContent} PT (${index + 1} of ${checkpoints.length})...`,
+        false
+      );
+      const { payloads, errors } = await loadOptionReplaysForTickers(simulationTickers, period);
+      if (payloads.length === 0) {
+        throw new Error(replayErrorMessage(errors));
+      }
+      renderOptionReplays(payloads, [...prefetchErrors, ...errors]);
+      await refreshReplayLedgerPrices(simulationDate, getReplayMarketClock(), second);
+      await simulationDelay(250);
+    }
+
+    renderTradeHistory();
+    renderPaperLedger();
+    setDaySimulationStatus(
+      daySimulationStopRequested
+        ? "Day simulation stopped. Saved results up to the last completed checkpoint."
+        : `Day simulation complete for ${formatContractDate(simulationDate)}.`,
+      false
+    );
+  } catch (error) {
+    setDaySimulationStatus(error.message, true);
+  } finally {
+    daySimulationRunning = false;
+    daySimulationStopRequested = false;
+    runDaySimulationButton.disabled = false;
+    runDaySimulationButton.textContent = "Run Day Simulation";
+    scheduleRefresh();
+  }
+}
+
+async function refreshReplayLedgerPrices(simulationDate, easternClock, pacificSecond) {
+  const openSymbols = [...new Set(
+    loadPaperLedger()
+      .filter((trade) => trade.status !== "closed" && paperLedgerDay(trade) === simulationDate)
+      .map((trade) => trade.symbol)
+      .filter(Boolean)
+  )];
+  if (openSymbols.length === 0) {
+    return;
+  }
+  const query = new URLSearchParams({
+    symbols: openSymbols.join(","),
+    date: simulationDate,
+    time: easternClock,
+  });
+  const payload = await getJson(`/api/options/prices?${query.toString()}`);
+  updatePaperLedgerPrices(payload.prices || {}, `${simulationDate}T${formatClock(pacificSecond)}`);
+}
+
+function simulationDelay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function setDaySimulationStatus(message, isError) {
+  if (!daySimulationStatus) {
+    return;
+  }
+  daySimulationStatus.textContent = message;
+  daySimulationStatus.classList.remove("hidden");
+  daySimulationStatus.classList.toggle("error", Boolean(isError));
+}
+
+function renderOptionReplay(payload) {
+  renderOptionReplays([payload], []);
+}
+
+function renderOptionReplays(payloads, errors = []) {
+  const primary = payloads[0];
+  if (primary?.analysis) {
+    lastAnalysis = primary.analysis;
+    renderAnalysis(primary.analysis);
+  }
+  renderMultiTickerSummary(payloads.map((payload) => ({
+    ticker: payload.analysis?.ticker || payload.recommendation?.ticker || "Unknown",
+    payload: payload.analysis,
+  })).concat(errors.map((error) => ({ ticker: error.ticker, error: error.message }))));
+  setStatus(`Replay maps updated for ${payloads.length} ticker${payloads.length === 1 ? "" : "s"} at ${replayClock.textContent} Pacific time.`, false);
+
+  const summaries = payloads.map((payload) => {
+    const recommendation = payload.recommendation || {};
+    const ticker = recommendation.ticker || payload.analysis?.ticker || "Ticker";
+    return `${ticker}: ${recommendation.trade_permission || "no read"}`;
+  });
+  if (errors.length) {
+    summaries.push(...errors.map((error) => `${error.ticker}: unavailable`));
+  }
+  fields.contractSummary.classList.toggle("error", payloads.length === 0);
+  fields.contractSummary.textContent = `${primary?.date || replayDate.value} ${replayClock.textContent} PT | ${summaries.join(" | ")}`;
+
+  let recorded = false;
+  for (const payload of payloads) {
+    recorded = recordPayloadTradePermission(payload, "replay", { render: false }) || recorded;
+  }
+  if (recorded) {
+    renderTradeHistory();
+  }
+  const bestPayload = selectBestPayload(payloads, "replay");
+  if (bestPayload) {
+    renderBestPick(bestPayload, "replay", { record: false });
+  } else {
+    resetBestPick();
+  }
+
+  const candidates = payloads.flatMap((payload) => payload.candidates || []);
+  if (candidates.length === 0) {
     fields.contractList.textContent = "No replay bars found for this time.";
     return;
   }
 
   fields.contractList.innerHTML = "";
-  for (const candidate of payload.candidates) {
+  for (const candidate of candidates) {
     const row = document.createElement("button");
     row.type = "button";
     row.className = `contract-row contract-${contractSide(candidate)}`;
     row.innerHTML = `
       ${contractTitleMarkup(candidate)}
       ${optionSparklineMarkup(candidate)}
-      ${contractMetric("Price", formatCurrency(candidate.close), "What this option was worth at the selected replay time. This is the old market price, not today's price.")}
+      ${contractMetric("Price / cost", formatOptionPriceAndCost(candidate.close), "The old quoted option price and the total cost for one 100-share contract at the selected replay time.")}
       ${contractMetric("Day", formatPercent(candidate.day_change_pct), "How much this option had moved that day by the selected replay time. Positive means it was up; negative means it was down.")}
       ${contractMetric("Volume", formatNumber(candidate.volume || 0), "How many of this exact option traded in the latest 1-minute bar. Thin liquidity: 1-10 contracts. Healthier/thicker activity: hundreds or thousands in a minute.")}
       ${contractMetric("Replay score", formatNumber(candidate.replay_score), "The bot's replay rank. It starts with the contract quality score, then adds what happened to price and volume during that historical day. Higher means it ranked better.")}
@@ -1097,6 +1368,7 @@ function initializeTradeHistoryExportControls() {
   if (historyEndDate && !historyEndDate.value) {
     historyEndDate.value = selectedDate;
   }
+  updateHistoryRangeCount();
 }
 
 function syncHistoryExportDatesToReplayDate() {
@@ -1272,32 +1544,59 @@ function formatClock(totalSeconds) {
 }
 
 function renderOptionRecommendation(payload) {
-  if (payload.analysis) {
-    lastAnalysis = payload.analysis;
-    renderAnalysis(payload.analysis);
-  }
-  fields.contractSummary.classList.toggle("error", payload.trade_permission === "no trade");
-  fields.contractSummary.textContent = `${payload.bias} ${payload.contract_type || ""} read: ${payload.recommendation}`;
+  renderOptionRecommendations([payload], []);
+}
 
-  if (payload.warnings && payload.warnings.length > 0) {
-    fields.contractSummary.textContent += ` ${payload.warnings.join(" ")}`;
+function renderOptionRecommendations(payloads, errors = []) {
+  const primary = payloads[0];
+  if (primary?.analysis) {
+    lastAnalysis = primary.analysis;
+    renderAnalysis(primary.analysis);
   }
-  renderBestPick(payload, "live");
+  renderMultiTickerSummary(payloads.map((payload) => ({
+    ticker: payload.analysis?.ticker || payload.ticker || "Unknown",
+    payload: payload.analysis || payload,
+  })).concat(errors.map((error) => ({ ticker: error.ticker, error: error.message }))));
 
-  if (!payload.candidates || payload.candidates.length === 0) {
+  const summaries = payloads.map((payload) => {
+    const ticker = payload.ticker || payload.analysis?.ticker || "Ticker";
+    return `${ticker}: ${payload.trade_permission || "no read"}`;
+  });
+  if (errors.length) {
+    summaries.push(...errors.map((error) => `${error.ticker}: unavailable`));
+  }
+  fields.contractSummary.classList.toggle("error", payloads.length === 0);
+  fields.contractSummary.textContent = summaries.join(" | ");
+
+  let recorded = false;
+  for (const payload of payloads) {
+    recorded = recordPayloadTradePermission(payload, "live", { render: false }) || recorded;
+  }
+  if (recorded) {
+    renderTradeHistory();
+  }
+  const bestPayload = selectBestPayload(payloads, "live");
+  if (bestPayload) {
+    renderBestPick(bestPayload, "live", { record: false });
+  } else {
+    resetBestPick();
+  }
+
+  const candidates = payloads.flatMap((payload) => payload.candidates || []);
+  if (candidates.length === 0) {
     fields.contractList.textContent = "No contract candidates.";
     return;
   }
 
   fields.contractList.innerHTML = "";
-  for (const candidate of payload.candidates) {
+  for (const candidate of candidates) {
     const row = document.createElement("button");
     row.type = "button";
     row.className = `contract-row contract-${contractSide(candidate)}`;
     row.innerHTML = `
       ${contractTitleMarkup(candidate)}
       ${optionSparklineMarkup(candidate)}
-      ${contractMetric("Mid", formatCurrency(candidate.mid), "The middle between what buyers are bidding and sellers are asking. Think of it as a fair reference price, not a guaranteed fill.")}
+      ${contractMetric("Mid / cost", formatOptionPriceAndCost(candidate.mid), "The quote midpoint and approximate total debit for one 100-share contract. The selected maximum applies to the total debit.")}
       ${contractMetric("Spread", formatPercent(candidate.spread_pct), "The gap between buy and sell prices. Smaller is usually better because it may cost less to enter and exit.")}
       ${contractMetric("Open int", candidate.open_interest ?? "n/a", "How many of this option are still open in the market. Bigger usually means more people are involved and the option may be easier to trade.")}
       ${contractMetric("Score", formatNumber(candidate.score), "The bot's quality rank for this contract. It favors options near the GEX target, with tighter pricing and better activity.")}
@@ -1311,8 +1610,53 @@ function renderOptionRecommendation(payload) {
   }
 }
 
-function renderBestPick(payload, mode) {
-  const recommendation = mode === "replay" ? payload.recommendation || {} : payload;
+function payloadRecommendation(payload, mode) {
+  return mode === "replay" ? payload.recommendation || {} : payload;
+}
+
+function payloadWarning(payload, mode) {
+  if (mode === "replay") {
+    return payload.warning || "";
+  }
+  return Array.isArray(payload.warnings) ? payload.warnings.join(" ") : payload.warning || "";
+}
+
+function payloadHasTradePermission(payload, mode) {
+  const recommendation = payloadRecommendation(payload, mode);
+  return String(recommendation.trade_permission || "").toLowerCase().includes("possible trade") && !payloadWarning(payload, mode);
+}
+
+function selectBestPayload(payloads, mode) {
+  const withCandidates = payloads.filter((payload) => (payload.candidates || []).length > 0);
+  const eligible = withCandidates.filter((payload) => payloadHasTradePermission(payload, mode));
+  const pool = eligible.length > 0 ? eligible : withCandidates;
+  return [...pool].sort((left, right) => {
+    const leftCandidate = left.candidates[0] || {};
+    const rightCandidate = right.candidates[0] || {};
+    const leftScore = Number(mode === "replay" ? leftCandidate.replay_score : leftCandidate.score) || 0;
+    const rightScore = Number(mode === "replay" ? rightCandidate.replay_score : rightCandidate.score) || 0;
+    return rightScore - leftScore;
+  })[0] || null;
+}
+
+function recordPayloadTradePermission(payload, mode, { render = true } = {}) {
+  if (!payloadHasTradePermission(payload, mode)) {
+    return false;
+  }
+  const recommendation = payloadRecommendation(payload, mode);
+  recordTradePermissionPicks({
+    candidates: payload.candidates || [],
+    recommendation,
+    payload,
+    mode,
+    priceLabel: mode === "replay" ? "last replay close" : "mid",
+    render,
+  });
+  return true;
+}
+
+function renderBestPick(payload, mode, { record = true } = {}) {
+  const recommendation = payloadRecommendation(payload, mode);
   const candidate = (payload.candidates || [])[0];
 
   if (!candidate) {
@@ -1335,8 +1679,9 @@ function renderBestPick(payload, mode) {
   const entryPrice = mode === "replay" ? candidate.close : candidate.mid;
   const priceLabel = mode === "replay" ? "last replay close" : "mid";
   const hasTradePermission = permission.includes("possible trade");
-  const isStandDown = !hasTradePermission || Boolean(payload.warning);
-  const action = hasTradePermission && !payload.warning ? "Buy candidate after confirmation" : "Wait / watch only";
+  const warning = payloadWarning(payload, mode);
+  const isStandDown = !hasTradePermission || Boolean(warning);
+  const action = hasTradePermission && !warning ? "Buy candidate after confirmation" : "Wait / watch only";
   const reasonParts = [
     `GEX is ${bias}${permission ? ` with ${permission} permission` : ""}.`,
     `${candidate.symbol} is the top ranked ${candidate.contract_type} with score ${formatNumber(score)}.`,
@@ -1345,8 +1690,8 @@ function renderBestPick(payload, mode) {
   if (entryPrice) {
     reasonParts.push(`Reference ${priceLabel}: ${formatCurrency(entryPrice)}.`);
   }
-  if (payload.warning) {
-    reasonParts.push(payload.warning);
+  if (warning) {
+    reasonParts.push(warning);
   }
 
   currentBestPick = {
@@ -1361,14 +1706,14 @@ function renderBestPick(payload, mode) {
   fields.bestPick.classList.remove("hidden", "best-pick-wait");
   fields.bestPick.classList.toggle("best-pick-wait", isStandDown);
   fields.bestPickAction.textContent = action;
-  fields.bestPickContract.textContent = `${readableContractName(candidate)} | ${priceLabel} ${formatCurrency(entryPrice)}`;
+  fields.bestPickContract.textContent = `${readableContractName(candidate)} | ${priceLabel} ${formatOptionPriceAndCost(entryPrice)}`;
   fields.bestPickReason.textContent = reasonParts.join(" ");
   fields.bestPickExit.textContent = sellPlanText(entryPrice);
   if (stageBestPickButton) {
     stageBestPickButton.disabled = false;
   }
 
-  if (!isStandDown) {
+  if (record && !isStandDown) {
     recordTradePermissionPicks({
       candidates: payload.candidates || [],
       recommendation,
@@ -1405,7 +1750,7 @@ function stageCandidate(candidate, entryPrice, message) {
   setAlpacaStatus(message, false);
 }
 
-function recordTradePermissionPicks({ candidates, recommendation, payload, mode, priceLabel }) {
+function recordTradePermissionPicks({ candidates, recommendation, payload, mode, priceLabel, render = true }) {
   const timestamp = pickTimestamp({ recommendation, payload, mode });
   const items = (candidates || [])
     .slice(0, MAX_RECORDED_PERMISSION_CANDIDATES)
@@ -1431,7 +1776,9 @@ function recordTradePermissionPicks({ candidates, recommendation, payload, mode,
   const withoutDuplicates = history.filter((existing) => !incomingIds.has(existing.id));
   saveTradeHistory([...items, ...withoutDuplicates].slice(0, MAX_TRADE_HISTORY_ITEMS));
   recordPaperLedgerTrade(items[0]);
-  renderTradeHistory();
+  if (render) {
+    renderTradeHistory();
+  }
 }
 
 function buildTradePermissionItem({ candidate, recommendation, payload, mode, priceLabel, timestamp, rank }) {
@@ -1441,6 +1788,45 @@ function buildTradePermissionItem({ candidate, recommendation, payload, mode, pr
 
   const entryPrice = mode === "replay" ? candidate.close : candidate.mid;
   const score = mode === "replay" ? candidate.replay_score : candidate.score;
+  const analysis = payload.analysis || recommendation.analysis || lastAnalysis || {};
+  const technicals = analysis.technicals || {};
+  const baseCandidate = (recommendation.candidates || payload.candidates || [])
+    .find((item) => item.symbol === candidate.symbol) || candidate;
+  const decisionSnapshot = {
+    timestamp: timestamp.iso,
+    gex: {
+      bias: analysis.bias || recommendation.bias || "unknown",
+      score: analysis.score ?? null,
+      permission: analysis.trade_permission || recommendation.trade_permission || "unknown",
+      spot: analysis.spot ?? recommendation.gex_spot ?? null,
+      zeroGamma: analysis.zero_gamma ?? null,
+    },
+    technicals: {
+      lastPrice: technicals.last_price ?? null,
+      vwap: technicals.vwap ?? null,
+      sma50: technicals.sma_50 ?? null,
+      sma200: technicals.sma_200 ?? null,
+      scoreAdjustment: technicals.score_adjustment ?? null,
+      reasons: Array.isArray(technicals.reasons) ? technicals.reasons : [],
+    },
+    contract: {
+      symbol: candidate.symbol,
+      type: candidate.contract_type || contractSide(candidate),
+      expiration: candidate.expiration_date ?? baseCandidate.expiration_date ?? null,
+      strike: candidate.strike_price ?? baseCandidate.strike_price ?? null,
+      entry: entryPrice ?? null,
+      bid: baseCandidate.bid ?? null,
+      ask: baseCandidate.ask ?? null,
+      mid: baseCandidate.mid ?? candidate.close ?? null,
+      spreadPercent: baseCandidate.spread_pct ?? null,
+      openInterest: baseCandidate.open_interest ?? null,
+      volume: candidate.volume ?? baseCandidate.volume ?? null,
+      delta: candidate.delta ?? baseCandidate.delta ?? null,
+      gamma: candidate.gamma ?? baseCandidate.gamma ?? null,
+      impliedVolatility: candidate.implied_volatility ?? baseCandidate.implied_volatility ?? null,
+      rankingScore: score ?? null,
+    },
+  };
   return {
     id: `${mode}:${timestamp.iso}:${rank}:${candidate.symbol}`,
     timestamp,
@@ -1469,6 +1855,7 @@ function buildTradePermissionItem({ candidate, recommendation, payload, mode, pr
     priceLabel,
     score,
     sellPlan: sellPlanText(entryPrice),
+    decisionSnapshot,
   };
 }
 
@@ -1498,12 +1885,15 @@ function pickTimestamp({ recommendation, payload, mode }) {
 
 function renderTradeHistory() {
   const selectedDate = replayDate.value;
-  const history = loadTradeHistory().filter((item) => historyItemDate(item) === selectedDate);
+  const selectedTickers = getSelectedTickers();
+  const history = loadTradeHistory().filter((item) =>
+    historyItemDate(item) === selectedDate && matchesTickerFilter(item, selectedTickers)
+  );
   renderPaperLedger();
   if (history.length === 0) {
     renderDailySimulation([]);
     fields.tradeHistory.textContent = selectedDate
-      ? `No trade-permission picks recorded for ${formatContractDate(selectedDate)}.`
+      ? `No trade-permission picks recorded for ${selectedTickers.join(", ")} on ${formatContractDate(selectedDate)}.`
       : "No trade-permission picks yet.";
     return;
   }
@@ -1539,8 +1929,10 @@ function renderTradeHistory() {
     fields.tradeHistory.appendChild(row);
   }
   renderDailySimulation(history);
-  updateTradeHistoryOutcomes(history);
-  updateTradeHistoryPrices(history);
+  if (!daySimulationRunning) {
+    updateTradeHistoryOutcomes(history);
+    updateTradeHistoryPrices(history);
+  }
 }
 
 function renderDailySimulation(history) {
@@ -1648,7 +2040,11 @@ function recordPaperLedgerTrade(item) {
 
   const ledger = loadPaperLedger();
   const ledgerId = `ledger:${item.id}`;
-  if (ledger.some((trade) => trade.id === ledgerId)) {
+  const tradeDay = historyItemDate(item);
+  const normalizedSymbol = String(item.symbol).toUpperCase();
+  if (ledger.some((trade) =>
+    paperLedgerDay(trade) === tradeDay && String(trade.symbol || "").toUpperCase() === normalizedSymbol
+  )) {
     return;
   }
 
@@ -1656,7 +2052,7 @@ function recordPaperLedgerTrade(item) {
     id: ledgerId,
     sourceHistoryId: item.id,
     timestamp: item.timestamp,
-    day: historyItemDate(item),
+    day: tradeDay,
     mode: item.mode,
     ticker: item.ticker,
     contract: item.contract,
@@ -1670,6 +2066,7 @@ function recordPaperLedgerTrade(item) {
     openedReason: `${item.bias || "unknown"} ${item.permission || "trade permission"}`,
     targetPrice: entry * (1 + PAPER_PROFIT_TARGET_PCT),
     stopPrice: entry * (1 + PAPER_STOP_LOSS_PCT),
+    decisionSnapshot: item.decisionSnapshot || null,
   };
   savePaperLedger([trade, ...ledger].slice(0, MAX_PAPER_LEDGER_ITEMS));
 }
@@ -1679,12 +2076,16 @@ function renderPaperLedger() {
     return;
   }
   const selectedDate = replayDate.value || currentPacificDate();
-  const ledger = loadPaperLedger().filter((trade) => paperLedgerDay(trade) === selectedDate);
+  const selectedTickers = getSelectedTickers();
+  const ledger = loadPaperLedger().filter((trade) =>
+    paperLedgerDay(trade) === selectedDate && matchesTickerFilter(trade, selectedTickers)
+  );
   renderPaperLedgerSummary(ledger);
+  renderDailyReportCard(ledger);
 
   if (ledger.length === 0) {
     fields.paperLedger.textContent = selectedDate
-      ? `No simulated paper trades recorded for ${formatContractDate(selectedDate)}.`
+      ? `No simulated paper trades recorded for ${selectedTickers.join(", ")} on ${formatContractDate(selectedDate)}.`
       : "No simulated paper trades yet.";
     return;
   }
@@ -1707,6 +2108,10 @@ function renderPaperLedger() {
       <span class="history-stat"><i>P/L</i><strong class="${pnl >= 0 ? "positive" : "negative"}">${formatCurrency(pnl)}</strong></span>
       <span class="history-stat"><i>Move</i><strong class="${pnlPct >= 0 ? "positive" : "negative"}">${formatPercent(pnlPct)}</strong></span>
       <span class="history-stat"><i>Rule</i><strong>${trade.status === "closed" ? trade.exitReason : "Hold"}</strong></span>
+      <details class="ledger-reason">
+        <summary>Why the bot bought this contract</summary>
+        ${tradeDecisionSnapshotMarkup(trade)}
+      </details>
     `;
     fields.paperLedger.appendChild(row);
   }
@@ -1734,10 +2139,89 @@ function renderPaperLedgerSummary(ledger) {
   fields.ledgerWinRate.textContent = winRate === null ? "-" : formatPercent(winRate);
 }
 
-function updatePaperLedgerPrices(priceMap) {
+function renderDailyReportCard(ledger) {
+  if (!fields.reportTotalTrades) {
+    return;
+  }
+  const trades = [...ledger].sort((a, b) =>
+    String(a.timestamp?.iso || "").localeCompare(String(b.timestamp?.iso || ""))
+  );
+  const results = trades.map((trade) => ({ trade, pnl: paperTradePnl(trade) }));
+  const wins = results.filter((result) => result.pnl > 0);
+  const losses = results.filter((result) => result.pnl < 0);
+  const grossProfit = wins.reduce((sum, result) => sum + result.pnl, 0);
+  const grossLoss = Math.abs(losses.reduce((sum, result) => sum + result.pnl, 0));
+  const totalPnl = results.reduce((sum, result) => sum + result.pnl, 0);
+  const tickerPnl = new Map();
+  let equity = 0;
+  let peak = 0;
+  let maxDrawdown = 0;
+
+  for (const result of results) {
+    equity += result.pnl;
+    peak = Math.max(peak, equity);
+    maxDrawdown = Math.max(maxDrawdown, peak - equity);
+    const ticker = result.trade.ticker || contractUnderlying(result.trade) || "Unknown";
+    tickerPnl.set(ticker, (tickerPnl.get(ticker) || 0) + result.pnl);
+  }
+
+  const rankedTickers = [...tickerPnl.entries()].sort((a, b) => b[1] - a[1]);
+  fields.reportTotalTrades.textContent = String(trades.length);
+  fields.reportWinRate.textContent = trades.length ? formatPercent(wins.length / trades.length) : "-";
+  fields.reportAverageWin.textContent = wins.length
+    ? formatSignedCurrency(grossProfit / wins.length)
+    : "-";
+  fields.reportAverageLoss.textContent = losses.length
+    ? formatSignedCurrency(-grossLoss / losses.length)
+    : "-";
+  fields.reportProfitFactor.textContent = grossLoss > 0
+    ? (grossProfit / grossLoss).toFixed(2)
+    : grossProfit > 0 ? "Unlimited" : "-";
+  fields.reportMaxDrawdown.textContent = formatCurrency(maxDrawdown);
+  fields.reportBestTicker.textContent = rankedTickers.length
+    ? `${rankedTickers[0][0]} ${formatSignedCurrency(rankedTickers[0][1])}`
+    : "-";
+  fields.reportWorstTicker.textContent = rankedTickers.length
+    ? `${rankedTickers[rankedTickers.length - 1][0]} ${formatSignedCurrency(rankedTickers[rankedTickers.length - 1][1])}`
+    : "-";
+  fields.reportProfitable.textContent = trades.length
+    ? `${totalPnl > 0 ? "Yes" : totalPnl < 0 ? "No" : "Break-even"} (${formatSignedCurrency(totalPnl)})`
+    : "No trades yet";
+  fields.reportProfitable.classList.toggle("positive", totalPnl > 0);
+  fields.reportProfitable.classList.toggle("negative", totalPnl < 0);
+}
+
+function tradeDecisionSnapshotMarkup(trade) {
+  const snapshot = trade.decisionSnapshot;
+  if (!snapshot) {
+    return `<p>No reason snapshot was saved for this older ledger entry.</p>`;
+  }
+  const gex = snapshot.gex || {};
+  const technicals = snapshot.technicals || {};
+  const contract = snapshot.contract || {};
+  const reasons = Array.isArray(technicals.reasons) && technicals.reasons.length
+    ? technicals.reasons.map((reason) => `<li>${escapeHtml(reason)}</li>`).join("")
+    : "<li>No technical explanations were available.</li>";
+  return `
+    <div class="ledger-reason-grid">
+      <div><span>GEX bias</span><strong>${escapeHtml(gex.bias || "n/a")}</strong></div>
+      <div><span>GEX score</span><strong>${formatOptionalNumber(gex.score)}</strong></div>
+      <div><span>Spot / zero gamma</span><strong>${formatOptionalNumber(gex.spot)} / ${formatOptionalNumber(gex.zeroGamma)}</strong></div>
+      <div><span>VWAP</span><strong>${formatOptionalNumber(technicals.vwap)}</strong></div>
+      <div><span>50 / 200-day MA</span><strong>${formatOptionalNumber(technicals.sma50)} / ${formatOptionalNumber(technicals.sma200)}</strong></div>
+      <div><span>Contract score</span><strong>${formatOptionalNumber(contract.rankingScore)}</strong></div>
+      <div><span>Spread</span><strong>${formatPercent(contract.spreadPercent)}</strong></div>
+      <div><span>Open interest / volume</span><strong>${formatOptionalNumber(contract.openInterest)} / ${formatOptionalNumber(contract.volume)}</strong></div>
+      <div><span>Entry Greeks</span><strong>${formatGreek("delta", contract.delta)} ${formatGreek("gamma", contract.gamma)} ${formatGreek("iv", contract.impliedVolatility)}</strong></div>
+    </div>
+    <ul>${reasons}</ul>
+  `;
+}
+
+function updatePaperLedgerPrices(priceMap, asOfIso = null) {
   const ledger = loadPaperLedger();
   let changed = false;
-  const now = new Date();
+  const now = asOfIso ? new Date(asOfIso) : new Date();
   const updated = ledger.map((trade) => {
     if (trade.status === "closed") {
       return trade;
@@ -1835,36 +2319,50 @@ async function downloadTradeHistoryForSelectedDay() {
 async function downloadTradeHistoryForRange() {
   const startDate = historyStartDate?.value || replayDate.value || currentPacificDate();
   const endDate = historyEndDate?.value || startDate;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
+    setStatus("Choose a valid From and To date before downloading the range.", true);
+    return;
+  }
   const from = startDate <= endDate ? startDate : endDate;
   const to = startDate <= endDate ? endDate : startDate;
   const tickers = parseTickerFilter(historyTickers?.value || "");
-  const history = loadTradeHistory().filter((item) => {
-    const day = historyItemDate(item);
-    return day >= from && day <= to && matchesTickerFilter(item, tickers);
-  });
+  const history = tradeHistoryForRange(from, to, tickers);
   const tickerLabel = tickers.length > 0 ? `-${tickers.join("-")}` : "";
   await downloadTradeHistoryItems({
     history,
     emptyMessage: `No trade-permission picks found from ${formatContractDate(from)} to ${formatContractDate(to)}${tickers.length ? ` for ${tickers.join(", ")}` : ""}.`,
     filename: `trade-permissions-${from}-to-${to}${tickerLabel}.csv`,
     label: `${formatContractDate(from)} to ${formatContractDate(to)}`,
+    refreshOutcomes: false,
   });
 }
 
-async function downloadTradeHistoryItems({ history, emptyMessage, filename, label }) {
+async function downloadTradeHistoryItems({ history, emptyMessage, filename, label, refreshOutcomes = true }) {
   if (history.length === 0) {
     setStatus(emptyMessage, true);
+    setHistoryExportStatus(emptyMessage, true);
     return;
   }
 
-  setStatus(`Refreshing outcome data for ${history.length} saved picks...`, false);
-  let outcomes = {};
+  const savedOutcomes = mergeOutcomeFallbacks(history, {});
+  const missingHistory = refreshOutcomes
+    ? history.filter((item) => !hasCompleteOutcome(savedOutcomes[item.id]))
+    : [];
+  setStatus(
+    missingHistory.length > 0
+      ? `Refreshing missing outcome data for ${missingHistory.length} of ${history.length} saved picks...`
+      : `Preparing ${history.length} saved picks...`,
+    false
+  );
+  let refreshedOutcomes = {};
   try {
-    outcomes = await fetchTradeHistoryOutcomes(history);
+    if (missingHistory.length > 0) {
+      refreshedOutcomes = await fetchTradeHistoryOutcomes(missingHistory);
+    }
   } catch (_error) {
     setStatus("Could not refresh high/low outcomes. Downloading saved values instead.", true);
   }
-  const mergedOutcomes = mergeOutcomeFallbacks(history, outcomes);
+  const mergedOutcomes = mergeOutcomeFallbacks(history, { ...savedOutcomes, ...refreshedOutcomes });
   const hydrated = history.map((item) => mergedOutcomes[item.id] ? { ...item, outcome: mergedOutcomes[item.id] } : item);
   saveTradeHistoryOutcomes(mergedOutcomes);
   const csv = tradeHistoryCsv(hydrated);
@@ -1876,8 +2374,52 @@ async function downloadTradeHistoryItems({ history, emptyMessage, filename, labe
   document.body.appendChild(link);
   link.click();
   link.remove();
-  URL.revokeObjectURL(url);
+  // Safari may cancel a download when its object URL is revoked in the same task.
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   setStatus(`Downloaded ${hydrated.length} trade-permission picks for ${label}.`, false);
+  setHistoryExportStatus(`Downloaded ${hydrated.length} saved picks for ${label}.`, false);
+}
+
+function tradeHistoryForRange(from, to, tickers) {
+  return loadTradeHistory().filter((item) => {
+    const day = historyItemDate(item);
+    return day >= from && day <= to && matchesTickerFilter(item, tickers);
+  });
+}
+
+function updateHistoryRangeCount() {
+  const startDate = historyStartDate?.value || "";
+  const endDate = historyEndDate?.value || startDate;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
+    setHistoryExportStatus("Choose both a From and To date.", false);
+    return;
+  }
+  const from = startDate <= endDate ? startDate : endDate;
+  const to = startDate <= endDate ? endDate : startDate;
+  const tickers = parseTickerFilter(historyTickers?.value || "");
+  const count = tradeHistoryForRange(from, to, tickers).length;
+  const tickerText = tickers.length > 0 ? ` for ${tickers.join(", ")}` : "";
+  setHistoryExportStatus(
+    `${count} saved trade-permission pick${count === 1 ? "" : "s"} from ${formatContractDate(from)} to ${formatContractDate(to)}${tickerText}.`,
+    count === 0
+  );
+}
+
+function setHistoryExportStatus(message, isError) {
+  if (!historyExportStatus) {
+    return;
+  }
+  historyExportStatus.textContent = message;
+  historyExportStatus.classList.toggle("error", Boolean(isError));
+}
+
+function hasCompleteOutcome(outcome) {
+  return Boolean(
+    outcome &&
+    !outcome.error &&
+    Number.isFinite(optionalNumber(outcome.high)) &&
+    Number.isFinite(optionalNumber(outcome.low))
+  );
 }
 
 function tradeHistoryCsv(history) {
@@ -1902,6 +2444,16 @@ function tradeHistoryCsv(history) {
     "permission",
     "score",
     "mode",
+    "gex_score_at_buy",
+    "spot_at_buy",
+    "zero_gamma_at_buy",
+    "vwap_at_buy",
+    "sma_50_at_buy",
+    "sma_200_at_buy",
+    "contract_spread_pct_at_buy",
+    "contract_open_interest_at_buy",
+    "contract_volume_at_buy",
+    "buy_reason_snapshot",
   ];
   const rows = history.map((item) => [
     item.timestamp?.label || "",
@@ -1924,6 +2476,16 @@ function tradeHistoryCsv(history) {
     item.permission || "",
     item.score ?? "",
     item.mode || "",
+    item.decisionSnapshot?.gex?.score ?? "",
+    item.decisionSnapshot?.gex?.spot ?? "",
+    item.decisionSnapshot?.gex?.zeroGamma ?? "",
+    item.decisionSnapshot?.technicals?.vwap ?? "",
+    item.decisionSnapshot?.technicals?.sma50 ?? "",
+    item.decisionSnapshot?.technicals?.sma200 ?? "",
+    item.decisionSnapshot?.contract?.spreadPercent ?? "",
+    item.decisionSnapshot?.contract?.openInterest ?? "",
+    item.decisionSnapshot?.contract?.volume ?? "",
+    item.decisionSnapshot ? JSON.stringify(item.decisionSnapshot) : "",
   ]);
   return [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\n");
 }
@@ -2195,7 +2757,10 @@ function refreshVisibleTradeHistoryPrices() {
     return;
   }
   const selectedDate = replayDate.value;
-  const history = loadTradeHistory().filter((item) => historyItemDate(item) === selectedDate);
+  const selectedTickers = getSelectedTickers();
+  const history = loadTradeHistory().filter((item) =>
+    historyItemDate(item) === selectedDate && matchesTickerFilter(item, selectedTickers)
+  );
   if (history.length === 0) {
     return;
   }
@@ -2267,7 +2832,14 @@ function loadPaperLedger() {
   try {
     const raw = localStorage.getItem(PAPER_LEDGER_STORAGE_KEY);
     const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    const unique = uniquePaperLedgerTrades(parsed);
+    if (unique.length !== parsed.length) {
+      localStorage.setItem(PAPER_LEDGER_STORAGE_KEY, JSON.stringify(unique));
+    }
+    return unique;
   } catch (_error) {
     return [];
   }
@@ -2275,12 +2847,29 @@ function loadPaperLedger() {
 
 function savePaperLedger(ledger) {
   try {
-    localStorage.setItem(PAPER_LEDGER_STORAGE_KEY, JSON.stringify(ledger));
+    localStorage.setItem(PAPER_LEDGER_STORAGE_KEY, JSON.stringify(uniquePaperLedgerTrades(ledger)));
   } catch (_error) {
     if (fields.paperLedger) {
       fields.paperLedger.textContent = "Paper simulation ledger could not be saved in this browser.";
     }
   }
+}
+
+function uniquePaperLedgerTrades(ledger) {
+  const seen = new Set();
+  return [...ledger]
+    .sort((a, b) => String(a.timestamp?.iso || "").localeCompare(String(b.timestamp?.iso || "")))
+    .filter((trade) => {
+      const day = paperLedgerDay(trade);
+      const symbol = String(trade.symbol || "").toUpperCase();
+      const key = day && symbol ? `${day}:${symbol}` : String(trade.id || "");
+      if (!key || seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => String(b.timestamp?.iso || "").localeCompare(String(a.timestamp?.iso || "")));
 }
 
 function contractTitleMarkup(candidate) {
@@ -2558,6 +3147,20 @@ function formatCurrency(value) {
     currency: "USD",
     maximumFractionDigits: 2,
   });
+}
+
+function formatOptionPriceAndCost(value) {
+  const price = optionalNumber(value);
+  if (price === null) {
+    return "-";
+  }
+  return `${formatCurrency(price)} / ${formatCurrency(price * OPTION_CONTRACT_MULTIPLIER)}`;
+}
+
+function formatSignedCurrency(value) {
+  const number = Number(value || 0);
+  const formatted = formatCurrency(Math.abs(number));
+  return `${number > 0 ? "+" : number < 0 ? "-" : ""}${formatted}`;
 }
 
 function formatPercent(value) {

@@ -161,6 +161,26 @@ label small {
   gap: 8px;
 }
 
+.ticker-heading-actions {
+  display: flex;
+  align-items: end;
+  gap: 7px;
+}
+
+.max-contract-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.max-contract-control select {
+  width: 104px;
+  height: 28px;
+  padding: 0 7px;
+  font-size: 11px;
+}
+
 .ticker-control-heading button,
 .ticker-presets button,
 .saved-ticker-group button {
@@ -766,6 +786,103 @@ button:disabled {
 
 .paper-ledger-row.status-closed {
   opacity: 0.84;
+}
+
+.ledger-reason {
+  grid-column: 1 / -1;
+  border-top: 1px solid rgba(119, 255, 218, 0.14);
+  padding-top: 8px;
+}
+
+.ledger-reason summary {
+  width: fit-content;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.ledger-reason p,
+.ledger-reason ul {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.ledger-reason-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+  margin-top: 9px;
+}
+
+.ledger-reason-grid > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  border: 1px solid rgba(119, 255, 218, 0.12);
+  border-radius: 5px;
+  background: rgba(6, 16, 24, 0.48);
+  padding: 7px;
+}
+
+.ledger-reason-grid span {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.ledger-reason-grid strong {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.daily-report-card > p {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.report-card-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.report-card-grid > div {
+  display: grid;
+  gap: 5px;
+  min-height: 70px;
+  border: 1px solid rgba(119, 255, 218, 0.15);
+  border-radius: 6px;
+  background: rgba(6, 16, 24, 0.58);
+  padding: 10px;
+}
+
+.report-card-grid span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.report-card-grid strong {
+  align-self: end;
+  color: var(--ink);
+  font-size: 18px;
+  overflow-wrap: anywhere;
+}
+
+.report-card-grid .report-verdict {
+  grid-column: span 2;
+}
+
+.report-card-grid .positive {
+  color: var(--accent);
+}
+
+.report-card-grid .negative {
+  color: var(--danger);
 }
 
 .ledger-contract {
@@ -1747,6 +1864,14 @@ td:nth-child(2) {
 }
 
 @media (max-width: 1120px) {
+  .report-card-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .ledger-reason-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .toolbar {
     grid-template-columns: 1fr;
     align-items: stretch;
@@ -1786,6 +1911,16 @@ td:nth-child(2) {
 
   .brand h1 {
     font-size: 22px;
+  }
+
+  .ticker-control-heading,
+  .ticker-heading-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .max-contract-control {
+    justify-content: space-between;
   }
 
   .controls,
@@ -1836,6 +1971,15 @@ td:nth-child(2) {
 
   .paper-ledger-row {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .report-card-grid,
+  .ledger-reason-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .report-card-grid .report-verdict {
+    grid-column: auto;
   }
 
   .ledger-contract {

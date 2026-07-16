@@ -86,6 +86,10 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             self._handle_option_replay_validate(parsed_url.query)
             return
 
+        if parsed_url.path == "/api/options/replay/prefetch":
+            self._handle_option_replay_prefetch(parsed_url.query)
+            return
+
         self._send_json({"error": "Not found."}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
@@ -169,11 +173,15 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
         period = params.get("period", ["zero"])[0].strip().lower()
         max_expiration_days_raw = params.get("max_expiration_days", ["14"])[0]
         limit_raw = params.get("limit", ["5"])[0]
+        max_contract_cost_raw = params.get("max_contract_cost", [""])[0].strip()
 
         try:
             if period not in AGGREGATION_PERIODS:
                 allowed = ", ".join(AGGREGATION_PERIODS)
                 raise ValueError(f"period must be one of: {allowed}.")
+            max_contract_cost = float(max_contract_cost_raw) if max_contract_cost_raw else None
+            if max_contract_cost is not None and max_contract_cost <= 0:
+                raise ValueError("max_contract_cost must be greater than zero.")
 
             analysis = _analyze_ticker(ticker, period)
             recommendation = recommend_option_contracts(
@@ -181,6 +189,7 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
                 alpaca_client=_alpaca_client(),
                 max_expiration_days=int(max_expiration_days_raw),
                 max_candidates=int(limit_raw),
+                max_contract_cost=max_contract_cost,
             )
         except (AlpacaApiError, GexApiError, ValueError) as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
@@ -200,6 +209,11 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
                 raise ValueError("symbols are required.")
             if len(symbols) > 100:
                 raise ValueError("At most 100 option symbols can be priced at once.")
+            replay_date = params.get("date", [""])[0].strip()
+            replay_time = params.get("time", [""])[0].strip()
+            if replay_date and replay_time:
+                self._send_json({"prices": _historical_option_prices(_alpaca_client(), symbols, replay_date, replay_time)})
+                return
             snapshots = _alpaca_client().get_option_snapshots(symbols)
         except (AlpacaApiError, ValueError) as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
@@ -211,6 +225,22 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
         }
         self._send_json({"prices": prices})
 
+    def _handle_option_replay_prefetch(self, query: str) -> None:
+        params = parse_qs(query)
+        ticker = params.get("ticker", ["AAPL"])[0].strip().upper()
+        period = params.get("period", ["zero"])[0].strip().lower()
+        replay_date = params.get("date", [""])[0].strip()
+        try:
+            if not replay_date:
+                raise ValueError("date is required.")
+            if period not in AGGREGATION_PERIODS:
+                raise ValueError(f"period must be one of: {', '.join(AGGREGATION_PERIODS)}.")
+            payload = GexClient(Settings.from_env()).prefetch_historical_gex_date(ticker, period, replay_date)
+        except (GexApiError, ValueError) as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        self._send_json(payload)
+
     def _handle_option_replay(self, query: str) -> None:
         params = parse_qs(query)
         ticker = params.get("ticker", ["AAPL"])[0].strip().upper()
@@ -219,6 +249,7 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
         replay_time = params.get("time", ["15:59"])[0].strip()
         max_expiration_days_raw = params.get("max_expiration_days", ["14"])[0]
         limit_raw = params.get("limit", ["5"])[0]
+        max_contract_cost_raw = params.get("max_contract_cost", [""])[0].strip()
 
         try:
             if not replay_date:
@@ -226,13 +257,17 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             if period not in AGGREGATION_PERIODS:
                 allowed = ", ".join(AGGREGATION_PERIODS)
                 raise ValueError(f"period must be one of: {allowed}.")
+            max_contract_cost = float(max_contract_cost_raw) if max_contract_cost_raw else None
+            if max_contract_cost is not None and max_contract_cost <= 0:
+                raise ValueError("max_contract_cost must be greater than zero.")
+            requested_limit = int(limit_raw)
             alpaca_client = _alpaca_client()
             analysis = _analyze_ticker(ticker, period, replay_date=replay_date, replay_time=replay_time)
             recommendation = recommend_option_contracts(
                 gex_analysis=analysis,
                 alpaca_client=alpaca_client,
                 max_expiration_days=int(max_expiration_days_raw),
-                max_candidates=int(limit_raw),
+                max_candidates=max(requested_limit, 25 if max_contract_cost is not None else requested_limit),
             )
             replay = replay_option_recommendation(
                 recommendation=recommendation,
@@ -245,6 +280,22 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             return
 
         payload = replay.as_dict()
+        if max_contract_cost is not None:
+            payload["candidates"] = [
+                candidate
+                for candidate in payload["candidates"]
+                if candidate.get("close") is not None and float(candidate["close"]) * 100 <= max_contract_cost
+            ][:requested_limit]
+            allowed_symbols = {candidate["symbol"] for candidate in payload["candidates"]}
+            payload["recommendation"]["candidates"] = [
+                candidate
+                for candidate in payload["recommendation"].get("candidates", [])
+                if candidate.get("symbol") in allowed_symbols
+            ]
+            if not payload["candidates"]:
+                payload["warning"] = (
+                    f"No historical option candidate was priced at or below ${max_contract_cost:,.0f} per contract."
+                )
         payload["analysis"] = analysis.as_dict()
         self._send_json(payload)
 
@@ -316,6 +367,7 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store, max-age=0")
         self.end_headers()
         self.wfile.write(body)
 
@@ -734,6 +786,35 @@ def _option_price_from_snapshot(snapshot: object) -> dict[str, float | None]:
         "last": last,
         "mid": mid,
     }
+
+
+def _historical_option_prices(
+    alpaca_client: AlpacaClient,
+    symbols: list[str],
+    replay_date: str,
+    replay_time: str,
+) -> dict[str, dict[str, float | str | None]]:
+    as_of = _technical_as_of(replay_date, replay_time)
+    market_open = datetime.combine(as_of.date(), time(9, 30), tzinfo=EASTERN)
+    bars_by_symbol = alpaca_client.get_option_bars(
+        symbols,
+        start=_to_utc_iso(market_open),
+        end=_to_utc_iso(as_of),
+        timeframe="1Min",
+    )
+    prices: dict[str, dict[str, float | str | None]] = {}
+    for symbol in symbols:
+        bars = bars_by_symbol.get(symbol, [])
+        latest = bars[-1] if isinstance(bars, list) and bars else {}
+        close = _optional_snapshot_float(latest.get("c")) if isinstance(latest, dict) else None
+        prices[symbol] = {
+            "bid": None,
+            "ask": None,
+            "last": close,
+            "mid": close,
+            "source": "historical option bar",
+        }
+    return prices
 
 
 def _optional_snapshot_float(value: object) -> float | None:

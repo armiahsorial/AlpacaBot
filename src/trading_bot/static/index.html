@@ -192,29 +192,6 @@
               </label>
             </div>
             <div id="history-export-status" class="mini-status" aria-live="polite">Choose a date range to download.</div>
-            <div id="day-performance" class="day-performance" aria-live="polite">
-              <div>
-                <span>Sim input</span>
-                <strong>$10,000</strong>
-              </div>
-              <div>
-                <span>Best-case value</span>
-                <strong id="sim-best-value">-</strong>
-              </div>
-              <div>
-                <span>Best-case return</span>
-                <strong id="sim-best-return">-</strong>
-              </div>
-              <div>
-                <span>Worst-case value</span>
-                <strong id="sim-worst-value">-</strong>
-              </div>
-              <div>
-                <span>Win rate</span>
-                <strong id="sim-win-rate">-</strong>
-              </div>
-              <p id="sim-note">Simulation appears after trade-permission picks are recorded.</p>
-            </div>
             <div class="paper-ledger-panel">
               <div class="panel-heading compact-heading">
                 <h3>Paper Simulation Ledger</h3>
@@ -241,7 +218,7 @@
                   <span>Win rate</span>
                   <strong id="ledger-win-rate">-</strong>
                 </div>
-                <p>Records each exact Pick #1 contract once per day. Repeated confirmations do not multiply P/L. Positions remain open while the ledger tracks current, high, low, and GEX exit guidance.</p>
+                <p>Records each exact Pick #1 contract once per day. The bot closes a simulated position after two consecutive adverse GEX, zero-gamma, or VWAP readings and saves the exit reason.</p>
               </div>
               <div id="paper-ledger" class="paper-ledger-list">No simulated paper trades yet.</div>
             </div>
@@ -309,7 +286,7 @@
             <div><span>Worst ticker</span><strong id="report-worst-ticker">-</strong></div>
             <div class="report-verdict"><span>Would this day have been profitable?</span><strong id="report-profitable">No trades yet</strong></div>
           </div>
-          <p>Marks simulated entries at their latest recorded price and tracks the highest and lowest price seen after entry.</p>
+          <p>Uses one simulated contract per unique Pick #1 and the bot's recorded entry and exit decisions.</p>
         </section>
 
         <section class="panel chart-panel">

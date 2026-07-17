@@ -25,6 +25,38 @@ class WebAppTests(unittest.TestCase):
         self.assertIn('Math.max(15, Number(liveInterval.value || 15))', javascript)
         self.assertIn('return selected.length > 0 ? [...new Set(selected)] : ["SPX"]', javascript)
 
+    def test_frontend_uses_confirmed_market_exit_rules_without_fixed_cash_simulation(self):
+        html = (STATIC_DIR / "index.html").read_text()
+        javascript = (STATIC_DIR / "app.js").read_text()
+
+        self.assertNotIn("$10,000", html)
+        self.assertNotIn('id="day-performance"', html)
+        self.assertIn("const EXIT_CONFIRMATION_REFRESHES = 2", javascript)
+        self.assertIn("Sell: trade permission disappeared", javascript)
+        self.assertIn("Sell: spot fell below zero gamma", javascript)
+        self.assertIn("Sell: underlying fell below VWAP", javascript)
+
+    def test_frontend_groups_three_contract_picks_per_ticker(self):
+        javascript = (STATIC_DIR / "app.js").read_text()
+        stylesheet = (STATIC_DIR / "styles.css").read_text()
+
+        self.assertIn("const MAX_RECORDED_PERMISSION_CANDIDATES = 3", javascript)
+        self.assertEqual(javascript.count('limit: "3"'), 2)
+        self.assertIn("renderTickerContractColumns(payloads, errors, \"live\")", javascript)
+        self.assertIn("renderTickerContractColumns(payloads, errors, \"replay\")", javascript)
+        self.assertIn(".contract-list.multi-ticker-columns", stylesheet)
+        self.assertIn(".ticker-contract-column", stylesheet)
+
+    def test_frontend_preserves_scroll_during_auto_refresh(self):
+        javascript = (STATIC_DIR / "app.js").read_text()
+
+        self.assertIn("function captureViewportAnchor()", javascript)
+        self.assertIn("function restoreViewportAnchor(anchor)", javascript)
+        self.assertIn('fields.contractList.classList.add("is-refreshing")', javascript)
+        self.assertNotIn('fields.contractList.textContent = "-"', javascript)
+        self.assertIn("column.dataset.scrollKey", javascript)
+        self.assertIn("row.dataset.scrollKey", javascript)
+
     def test_handle_analyze_returns_analysis_json(self):
         handler = _handler()
         classic_major_levels = MagicMock()

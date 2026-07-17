@@ -57,6 +57,14 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("column.dataset.scrollKey", javascript)
         self.assertIn("row.dataset.scrollKey", javascript)
 
+    def test_frontend_compacts_trade_history_when_browser_storage_is_full(self):
+        javascript = (STATIC_DIR / "app.js").read_text()
+
+        self.assertIn("const COMPACT_TRADE_HISTORY_ITEMS = 600", javascript)
+        self.assertIn("function compactTradeHistoryForStorage(history, limit)", javascript)
+        self.assertIn("function compactDecisionSnapshot(snapshot)", javascript)
+        self.assertNotIn('fields.tradeHistory.textContent = "Trade history could not be saved in this browser."', javascript)
+
     def test_handle_analyze_returns_analysis_json(self):
         handler = _handler()
         classic_major_levels = MagicMock()

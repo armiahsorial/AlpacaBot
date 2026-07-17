@@ -1948,8 +1948,7 @@ function renderTradeHistory() {
   }
   renderDailySimulation(history);
   if (!daySimulationRunning) {
-    updateTradeHistoryOutcomes(history);
-    updateTradeHistoryPrices(history);
+    updateTradeHistoryOutcomes(history).finally(() => updateTradeHistoryPrices(history));
   }
 }
 
@@ -2763,17 +2762,21 @@ async function updateTradeHistoryPrices(history) {
     const query = new URLSearchParams({ symbols: symbols.join(",") });
     const payload = await getJson(`/api/options/prices?${query.toString()}`);
     updatePaperLedgerPrices(payload.prices || {});
+    const savedHistoryById = new Map(loadTradeHistory().map((item) => [item.id, item]));
     const historyById = new Map(history.map((item) => [item.id, item]));
     for (const row of fields.tradeHistory.querySelectorAll(".trade-history-row")) {
       const item = historyById.get(row.dataset.historyId);
       const symbol = row.dataset.symbol;
       const entryPrice = optionalNumber(row.dataset.entryPrice);
-      const current = payload.prices?.[symbol]?.mid;
+      const savedItem = savedHistoryById.get(row.dataset.historyId);
+      const current = optionalNumber(payload.prices?.[symbol]?.mid)
+        ?? optionalNumber(savedItem?.outcome?.current)
+        ?? optionalNumber(item?.outcome?.current);
       const currentEl = row.querySelector(".history-current");
       const changeEl = row.querySelector(".history-change");
       const exitEl = row.querySelector(".history-exit");
       currentEl.textContent = formatCurrency(current);
-      if (entryPrice && current) {
+      if (entryPrice && current !== null) {
         const change = (Number(current) - entryPrice) / entryPrice;
         changeEl.textContent = formatPercent(change);
         changeEl.classList.toggle("positive", change >= 0);

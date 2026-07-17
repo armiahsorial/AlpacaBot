@@ -607,8 +607,13 @@ def _outcome_for_entry(
 
     high_bar = max(bars, key=lambda bar: _optional_snapshot_float(bar.get("h")) or float("-inf"))
     low_bar = min(bars, key=lambda bar: _optional_snapshot_float(bar.get("l")) or float("inf"))
+    latest_bar = max(
+        enumerate(bars),
+        key=lambda item: (_bar_datetime(item[1]) or datetime.min.replace(tzinfo=EASTERN), item[0]),
+    )[1]
     high_price = _optional_snapshot_float(high_bar.get("h"))
     low_price = _optional_snapshot_float(low_bar.get("l"))
+    current_price = _optional_snapshot_float(latest_bar.get("c"))
     entry_price = entry.get("entry_price")
     went_up = high_price is not None and isinstance(entry_price, float) and high_price > entry_price
 
@@ -621,6 +626,7 @@ def _outcome_for_entry(
         "low": low_price,
         "low_time": low_time.isoformat() if low_time else None,
         "low_greeks": _estimate_outcome_greeks(entry, low_price, low_time, stock_bars),
+        "current": current_price,
         "went_up": went_up,
         "source": "market-data option bars",
     }
@@ -645,6 +651,7 @@ def _fallback_outcome_for_entry(entry: dict[str, object], option_bars_error: str
         "low": low_price,
         "low_time": None,
         "low_greeks": greeks,
+        "current": prices[-1],
         "went_up": went_up,
         "source": "saved intraday path fallback",
     }

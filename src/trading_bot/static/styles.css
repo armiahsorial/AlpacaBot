@@ -765,7 +765,7 @@ button:disabled {
 
 .paper-ledger-row {
   display: grid;
-  grid-template-columns: minmax(260px, 1.3fr) auto repeat(5, minmax(96px, 0.65fr));
+  grid-template-columns: minmax(240px, 1.3fr) auto repeat(7, minmax(88px, 0.65fr));
   gap: 8px 12px;
   align-items: center;
   min-height: 70px;

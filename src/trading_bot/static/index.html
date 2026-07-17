@@ -46,8 +46,8 @@
             <div id="saved-ticker-groups" class="saved-ticker-groups" aria-label="Saved ticker groups"></div>
             <input id="ticker-group-name" type="text" placeholder="Group name, e.g. Morning watch" />
             <div id="ticker-checklist" class="ticker-checklist" aria-label="Ticker checklist">
-              <label><input type="checkbox" value="NDX" data-ticker-checkbox checked />NDX</label>
-              <label><input type="checkbox" value="SPX" data-ticker-checkbox />SPX</label>
+              <label><input type="checkbox" value="NDX" data-ticker-checkbox />NDX</label>
+              <label><input type="checkbox" value="SPX" data-ticker-checkbox checked />SPX</label>
               <label><input type="checkbox" value="RUT" data-ticker-checkbox />RUT</label>
               <label><input type="checkbox" value="VIX" data-ticker-checkbox />VIX</label>
               <label><input type="checkbox" value="NQ_NDX" data-ticker-checkbox />NQ_NDX</label>
@@ -97,8 +97,8 @@
             <select id="refresh-seconds">
               <option value="1">1 sec</option>
               <option value="5">5 sec</option>
-              <option value="15">15 sec</option>
-              <option value="30" selected>30 sec</option>
+              <option value="15" selected>15 sec</option>
+              <option value="30">30 sec</option>
               <option value="60">60 sec</option>
             </select>
           </label>
@@ -125,7 +125,8 @@
             <label>
               <span>Refresh</span>
               <select id="live-interval">
-                <option value="30" selected>30 sec</option>
+                <option value="15" selected>15 sec</option>
+                <option value="30">30 sec</option>
                 <option value="60">60 sec</option>
                 <option value="120">2 min</option>
                 <option value="300">5 min</option>
@@ -240,7 +241,7 @@
                   <span>Win rate</span>
                   <strong id="ledger-win-rate">-</strong>
                 </div>
-                <p>Buys each exact Pick #1 contract once per day. Repeated confirmations stay in history without multiplying P/L. Sells at +30% profit or -30% stop.</p>
+                <p>Records each exact Pick #1 contract once per day. Repeated confirmations do not multiply P/L. Positions remain open while the ledger tracks current, high, low, and GEX exit guidance.</p>
               </div>
               <div id="paper-ledger" class="paper-ledger-list">No simulated paper trades yet.</div>
             </div>
@@ -308,7 +309,7 @@
             <div><span>Worst ticker</span><strong id="report-worst-ticker">-</strong></div>
             <div class="report-verdict"><span>Would this day have been profitable?</span><strong id="report-profitable">No trades yet</strong></div>
           </div>
-          <p>Uses the selected day's original paper-ledger rules and marks open positions at their latest recorded price.</p>
+          <p>Marks simulated entries at their latest recorded price and tracks the highest and lowest price seen after entry.</p>
         </section>
 
         <section class="panel chart-panel">

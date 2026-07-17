@@ -50,6 +50,7 @@ let liveClockTimer = null;
 let replayTimer = null;
 let replaySpeed = 1;
 let lastAnalysis = null;
+const latestAnalysisByTicker = new Map();
 let isAnalysisRunning = false;
 let isInspectingContract = false;
 let isLiveLoading = false;
@@ -69,8 +70,6 @@ const TICKER_GROUPS_STORAGE_KEY = "tradingBot.tickerGroups";
 const MAX_CONTRACT_COST_STORAGE_KEY = "tradingBot.maxContractCost";
 const SIMULATION_STARTING_CASH = 10000;
 const OPTION_CONTRACT_MULTIPLIER = 100;
-const PAPER_PROFIT_TARGET_PCT = 0.3;
-const PAPER_STOP_LOSS_PCT = -0.3;
 // Keep enough signals for multi-day exports instead of allowing one busy session
 // to evict the previous day's history.
 const MAX_TRADE_HISTORY_ITEMS = 2000;
@@ -359,7 +358,7 @@ async function runAnalysis({ isRefresh = false } = {}) {
   isAnalysisRunning = true;
   const { period } = getFormValues();
   const tickers = getSelectedTickers();
-  const primaryTicker = tickers[0] || "NDX";
+  const primaryTicker = tickers[0] || "SPX";
 
   setStatus(isRefresh ? `Refreshing ${tickers.join(", ")} GEX data...` : `Pulling ${tickers.join(", ")} GEX data...`, false);
   if (button) {
@@ -368,6 +367,7 @@ async function runAnalysis({ isRefresh = false } = {}) {
 
   try {
     const analyses = await Promise.all(tickers.map((ticker) => loadTickerAnalysis(ticker, period)));
+    rememberTickerAnalyses(analyses);
     renderMultiTickerSummary(analyses);
     const primaryResult = analyses.find((result) => result.ticker === primaryTicker && result.payload) || analyses.find((result) => result.payload);
     if (!primaryResult) {
@@ -442,6 +442,16 @@ function renderMultiTickerSummary(results) {
   }
 }
 
+function rememberTickerAnalyses(results) {
+  for (const result of results || []) {
+    const analysis = result?.payload?.analysis || result?.payload;
+    const ticker = String(result?.ticker || analysis?.ticker || "").toUpperCase();
+    if (ticker && analysis && !result?.error) {
+      latestAnalysisByTicker.set(ticker, analysis);
+    }
+  }
+}
+
 async function runLiveUpdate({ manual = false } = {}) {
   if (isLiveLoading) {
     return;
@@ -470,7 +480,7 @@ async function runLiveUpdate({ manual = false } = {}) {
 function startLiveMode() {
   stopLiveMode();
   stopReplay();
-  const seconds = Math.max(30, Number(liveInterval.value || 30));
+  const seconds = Math.max(15, Number(liveInterval.value || 15));
   liveToggleButton.textContent = "Stop Auto Live";
   liveStatus.textContent = `Auto Live is on. Refreshing contracts every ${seconds} seconds.`;
   syncLiveClock();
@@ -605,7 +615,7 @@ function getFormValues() {
   const data = new FormData(form);
   const tickers = getSelectedTickers();
   return {
-    ticker: tickers[0] || "NDX",
+    ticker: tickers[0] || "SPX",
     period: String(data.get("period") || "zero"),
   };
 }
@@ -614,7 +624,7 @@ function getSelectedTickers() {
   const selected = Array.from(document.querySelectorAll("[data-ticker-checkbox]:checked"))
     .map((checkbox) => checkbox.value.trim().toUpperCase())
     .filter(Boolean);
-  return selected.length > 0 ? [...new Set(selected)] : ["NDX"];
+  return selected.length > 0 ? [...new Set(selected)] : ["SPX"];
 }
 
 function getMaxContractCost() {
@@ -641,7 +651,7 @@ function initializeMaxContractCost() {
 }
 
 function setSelectedTickers(tickers) {
-  const selected = new Set((tickers.length > 0 ? tickers : ["NDX"]).map((ticker) => ticker.toUpperCase()));
+  const selected = new Set((tickers.length > 0 ? tickers : ["SPX"]).map((ticker) => ticker.toUpperCase()));
   for (const checkbox of document.querySelectorAll("[data-ticker-checkbox]")) {
     checkbox.checked = selected.has(checkbox.value.toUpperCase());
   }
@@ -1287,6 +1297,10 @@ function renderOptionReplays(payloads, errors = []) {
     lastAnalysis = primary.analysis;
     renderAnalysis(primary.analysis);
   }
+  rememberTickerAnalyses(payloads.map((payload) => ({
+    ticker: payload.analysis?.ticker || payload.recommendation?.ticker,
+    payload: payload.analysis || payload,
+  })));
   renderMultiTickerSummary(payloads.map((payload) => ({
     ticker: payload.analysis?.ticker || payload.recommendation?.ticker || "Unknown",
     payload: payload.analysis,
@@ -1553,6 +1567,10 @@ function renderOptionRecommendations(payloads, errors = []) {
     lastAnalysis = primary.analysis;
     renderAnalysis(primary.analysis);
   }
+  rememberTickerAnalyses(payloads.map((payload) => ({
+    ticker: payload.analysis?.ticker || payload.ticker,
+    payload: payload.analysis || payload,
+  })));
   renderMultiTickerSummary(payloads.map((payload) => ({
     ticker: payload.analysis?.ticker || payload.ticker || "Unknown",
     payload: payload.analysis || payload,
@@ -2063,9 +2081,11 @@ function recordPaperLedgerTrade(item) {
     quantity: 1,
     status: "open",
     currentPrice: entry,
+    highPrice: entry,
+    lowPrice: entry,
+    highTimestampIso: item.timestamp?.iso || null,
+    lowTimestampIso: item.timestamp?.iso || null,
     openedReason: `${item.bias || "unknown"} ${item.permission || "trade permission"}`,
-    targetPrice: entry * (1 + PAPER_PROFIT_TARGET_PCT),
-    stopPrice: entry * (1 + PAPER_STOP_LOSS_PCT),
     decisionSnapshot: item.decisionSnapshot || null,
   };
   savePaperLedger([trade, ...ledger].slice(0, MAX_PAPER_LEDGER_ITEMS));
@@ -2097,6 +2117,7 @@ function renderPaperLedger() {
     const current = optionalNumber(trade.currentPrice) ?? optionalNumber(trade.exitPrice) ?? optionalNumber(trade.entryPrice);
     const pnl = paperTradePnl({ ...trade, currentPrice: current });
     const pnlPct = paperTradePnlPct(trade.entryPrice, trade.status === "closed" ? trade.exitPrice : current);
+    const advisory = gexSellAdvisory(trade);
     row.innerHTML = `
       <span class="ledger-contract">
         <strong>${trade.timestamp?.label || "-"}</strong>
@@ -2104,10 +2125,12 @@ function renderPaperLedger() {
       </span>
       <span class="history-pill">${trade.status === "closed" ? "Closed" : "Open"}</span>
       <span class="history-stat"><i>Entry</i><strong>${formatCurrency(trade.entryPrice)}</strong></span>
-      <span class="history-stat"><i>Now / exit</i><strong>${formatCurrency(trade.status === "closed" ? trade.exitPrice : current)}</strong></span>
+      <span class="history-stat"><i>High since entry</i><strong class="positive">${formatCurrency(trade.highPrice ?? current)}</strong></span>
+      <span class="history-stat"><i>Low since entry</i><strong class="negative">${formatCurrency(trade.lowPrice ?? current)}</strong></span>
+      <span class="history-stat"><i>Now</i><strong>${formatCurrency(current)}</strong></span>
       <span class="history-stat"><i>P/L</i><strong class="${pnl >= 0 ? "positive" : "negative"}">${formatCurrency(pnl)}</strong></span>
       <span class="history-stat"><i>Move</i><strong class="${pnlPct >= 0 ? "positive" : "negative"}">${formatPercent(pnlPct)}</strong></span>
-      <span class="history-stat"><i>Rule</i><strong>${trade.status === "closed" ? trade.exitReason : "Hold"}</strong></span>
+      <span class="history-stat"><i>GEX exit read</i><strong class="${advisory.className}">${advisory.label}</strong></span>
       <details class="ledger-reason">
         <summary>Why the bot bought this contract</summary>
         ${tradeDecisionSnapshotMarkup(trade)}
@@ -2234,16 +2257,20 @@ function updatePaperLedgerPrices(priceMap, asOfIso = null) {
     if (!entry || entry <= 0) {
       return trade;
     }
-    const move = (current - entry) / entry;
-    const next = { ...trade, currentPrice: current, lastUpdatedIso: now.toISOString() };
-    if (move >= PAPER_PROFIT_TARGET_PCT) {
-      changed = true;
-      return closePaperTrade(next, current, "Take profit +30%", now);
-    }
-    if (move <= PAPER_STOP_LOSS_PCT) {
-      changed = true;
-      return closePaperTrade(next, current, "Stop loss -30%", now);
-    }
+    const previousHigh = optionalNumber(trade.highPrice) ?? entry;
+    const previousLow = optionalNumber(trade.lowPrice) ?? entry;
+    const madeHigh = current > previousHigh;
+    const madeLow = current < previousLow;
+    const next = {
+      ...trade,
+      status: "open",
+      currentPrice: current,
+      highPrice: madeHigh ? current : previousHigh,
+      lowPrice: madeLow ? current : previousLow,
+      highTimestampIso: madeHigh ? now.toISOString() : trade.highTimestampIso || trade.timestamp?.iso || null,
+      lowTimestampIso: madeLow ? now.toISOString() : trade.lowTimestampIso || trade.timestamp?.iso || null,
+      lastUpdatedIso: now.toISOString(),
+    };
     changed = true;
     return next;
   });
@@ -2252,20 +2279,6 @@ function updatePaperLedgerPrices(priceMap, asOfIso = null) {
     savePaperLedger(updated);
     renderPaperLedger();
   }
-}
-
-function closePaperTrade(trade, exitPrice, reason, now) {
-  return {
-    ...trade,
-    status: "closed",
-    exitPrice,
-    exitReason: reason,
-    exitTimestamp: {
-      iso: now.toISOString(),
-      day: now.toISOString().slice(0, 10),
-      label: formatHistoryDate(now),
-    },
-  };
 }
 
 function paperTradePnl(trade) {
@@ -2519,6 +2532,7 @@ async function updateTradeHistoryOutcomes(history) {
     const outcomes = await fetchTradeHistoryOutcomes(history);
     const mergedOutcomes = mergeOutcomeFallbacks(history, outcomes);
     saveTradeHistoryOutcomes(mergedOutcomes);
+    updatePaperLedgerExtremesFromOutcomes(mergedOutcomes);
     renderDailySimulation(history.map((item) => mergedOutcomes[item.id] ? { ...item, outcome: mergedOutcomes[item.id] } : item));
     for (const row of fields.tradeHistory.querySelectorAll(".trade-history-row")) {
       const id = row.dataset.historyId;
@@ -2527,10 +2541,43 @@ async function updateTradeHistoryOutcomes(history) {
   } catch (_error) {
     const fallbackOutcomes = mergeOutcomeFallbacks(history, {});
     saveTradeHistoryOutcomes(fallbackOutcomes);
+    updatePaperLedgerExtremesFromOutcomes(fallbackOutcomes);
     renderDailySimulation(history.map((item) => fallbackOutcomes[item.id] ? { ...item, outcome: fallbackOutcomes[item.id] } : item));
     for (const row of fields.tradeHistory.querySelectorAll(".trade-history-row")) {
       renderHistoryOutcome(row, fallbackOutcomes[row.dataset.historyId] || null);
     }
+  }
+}
+
+function updatePaperLedgerExtremesFromOutcomes(outcomes) {
+  const ledger = loadPaperLedger();
+  let changed = false;
+  const updated = ledger.map((trade) => {
+    const outcome = outcomes?.[trade.sourceHistoryId];
+    if (!outcome || outcome.error) {
+      return trade;
+    }
+    const high = optionalNumber(outcome.high);
+    const low = optionalNumber(outcome.low);
+    const previousHigh = optionalNumber(trade.highPrice) ?? optionalNumber(trade.entryPrice);
+    const previousLow = optionalNumber(trade.lowPrice) ?? optionalNumber(trade.entryPrice);
+    const nextHigh = high !== null && (previousHigh === null || high > previousHigh) ? high : previousHigh;
+    const nextLow = low !== null && (previousLow === null || low < previousLow) ? low : previousLow;
+    if (nextHigh === previousHigh && nextLow === previousLow) {
+      return trade;
+    }
+    changed = true;
+    return {
+      ...trade,
+      highPrice: nextHigh,
+      lowPrice: nextLow,
+      highTimestampIso: nextHigh !== previousHigh ? outcome.high_time || trade.highTimestampIso : trade.highTimestampIso,
+      lowTimestampIso: nextLow !== previousLow ? outcome.low_time || trade.lowTimestampIso : trade.lowTimestampIso,
+    };
+  });
+  if (changed) {
+    savePaperLedger(updated);
+    renderPaperLedger();
   }
 }
 
@@ -2716,7 +2763,9 @@ async function updateTradeHistoryPrices(history) {
     const query = new URLSearchParams({ symbols: symbols.join(",") });
     const payload = await getJson(`/api/options/prices?${query.toString()}`);
     updatePaperLedgerPrices(payload.prices || {});
+    const historyById = new Map(history.map((item) => [item.id, item]));
     for (const row of fields.tradeHistory.querySelectorAll(".trade-history-row")) {
+      const item = historyById.get(row.dataset.historyId);
       const symbol = row.dataset.symbol;
       const entryPrice = optionalNumber(row.dataset.entryPrice);
       const current = payload.prices?.[symbol]?.mid;
@@ -2729,15 +2778,17 @@ async function updateTradeHistoryPrices(history) {
         changeEl.textContent = formatPercent(change);
         changeEl.classList.toggle("positive", change >= 0);
         changeEl.classList.toggle("negative", change < 0);
-        const exitPlan = sellStatus(entryPrice, current);
+        const exitPlan = gexSellAdvisory(item);
         exitEl.textContent = exitPlan.label;
         exitEl.classList.toggle("positive", exitPlan.className === "positive");
         exitEl.classList.toggle("negative", exitPlan.className === "negative");
       } else {
         changeEl.textContent = "n/a";
         changeEl.classList.remove("positive", "negative");
-        exitEl.textContent = "Use plan";
-        exitEl.classList.remove("positive", "negative");
+        const exitPlan = gexSellAdvisory(item);
+        exitEl.textContent = exitPlan.label;
+        exitEl.classList.toggle("positive", exitPlan.className === "positive");
+        exitEl.classList.toggle("negative", exitPlan.className === "negative");
       }
     }
   } catch (error) {
@@ -2768,33 +2819,45 @@ function refreshVisibleTradeHistoryPrices() {
 }
 
 function sellPlanText(entryPrice) {
-  const entry = optionalNumber(entryPrice);
-  if (!entry) {
-    return "Sell plan: wait for a valid entry price.";
-  }
-  return `Sell plan: stop near ${formatCurrency(entry * 0.7)}, trim near ${formatCurrency(entry * 1.25)}, take profit near ${formatCurrency(entry * 1.5)}.`;
+  return optionalNumber(entryPrice)
+    ? "Tracking plan: record the high and low after entry. GEX will flag possible exit conditions without automatically selling."
+    : "Tracking begins after a valid entry price is recorded.";
 }
 
-function sellStatus(entryPrice, currentPrice) {
-  const entry = optionalNumber(entryPrice);
-  const current = optionalNumber(currentPrice);
-  if (!entry || !current) {
-    return { label: "Use plan", className: "" };
+function gexSellAdvisory(trade) {
+  const ticker = String(trade?.ticker || trade?.underlying || contractUnderlying(trade || {})).toUpperCase();
+  const analysis = latestAnalysisByTicker.get(ticker) || (
+    String(lastAnalysis?.ticker || "").toUpperCase() === ticker ? lastAnalysis : null
+  );
+  if (!analysis) {
+    return { label: "Waiting for GEX", className: "" };
   }
-  const change = (current - entry) / entry;
-  if (change <= -0.3) {
-    return { label: "Sell / stop", className: "negative" };
+
+  const side = String(trade?.side || trade?.contractType || "").toLowerCase();
+  const bias = String(analysis.bias || "neutral").toLowerCase();
+  const permission = String(analysis.trade_permission || "").toLowerCase();
+  const spot = optionalNumber(analysis.spot);
+  const zeroGamma = optionalNumber(analysis.zero_gamma);
+  const biasFlipped = (
+    side === "call" && bias.includes("bearish")
+  ) || (
+    side === "put" && bias.includes("bullish")
+  );
+  if (biasFlipped) {
+    return { label: `Consider selling: GEX ${bias}`, className: "negative" };
   }
-  if (change >= 0.5) {
-    return { label: "Take profit", className: "positive" };
+  if (permission && !permission.includes("possible trade")) {
+    return { label: `Review exit: ${permission}`, className: "negative" };
   }
-  if (change >= 0.25) {
-    return { label: "Trim / protect", className: "positive" };
+  if (spot !== null && zeroGamma !== null) {
+    if (side === "call" && spot < zeroGamma) {
+      return { label: "Review exit: below zero gamma", className: "negative" };
+    }
+    if (side === "put" && spot > zeroGamma) {
+      return { label: "Review exit: above zero gamma", className: "negative" };
+    }
   }
-  if (change <= -0.15) {
-    return { label: "Warning", className: "negative" };
-  }
-  return { label: "Hold / watch", className: "" };
+  return { label: "GEX aligned / keep watching", className: "positive" };
 }
 
 function historyItemDate(item) {
@@ -2835,14 +2898,43 @@ function loadPaperLedger() {
     if (!Array.isArray(parsed)) {
       return [];
     }
-    const unique = uniquePaperLedgerTrades(parsed);
-    if (unique.length !== parsed.length) {
+    const normalized = parsed.map(normalizePaperLedgerTrade);
+    const unique = uniquePaperLedgerTrades(normalized);
+    if (JSON.stringify(unique) !== JSON.stringify(parsed)) {
       localStorage.setItem(PAPER_LEDGER_STORAGE_KEY, JSON.stringify(unique));
     }
     return unique;
   } catch (_error) {
     return [];
   }
+}
+
+function normalizePaperLedgerTrade(trade) {
+  const { targetPrice: _targetPrice, stopPrice: _stopPrice, ...withoutPercentageRules } = trade || {};
+  const entry = optionalNumber(withoutPercentageRules.entryPrice);
+  const current = optionalNumber(withoutPercentageRules.currentPrice)
+    ?? optionalNumber(withoutPercentageRules.exitPrice)
+    ?? entry;
+  const observed = [
+    entry,
+    current,
+    optionalNumber(withoutPercentageRules.highPrice),
+    optionalNumber(withoutPercentageRules.lowPrice),
+  ].filter((value) => value !== null && Number.isFinite(value));
+  const legacyPercentageExit = ["Take profit +30%", "Stop loss -30%"].includes(withoutPercentageRules.exitReason);
+  const normalized = {
+    ...withoutPercentageRules,
+    status: legacyPercentageExit ? "open" : withoutPercentageRules.status || "open",
+    currentPrice: current,
+    highPrice: observed.length ? Math.max(...observed) : null,
+    lowPrice: observed.length ? Math.min(...observed) : null,
+  };
+  if (legacyPercentageExit) {
+    delete normalized.exitPrice;
+    delete normalized.exitReason;
+    delete normalized.exitTimestamp;
+  }
+  return normalized;
 }
 
 function savePaperLedger(ledger) {

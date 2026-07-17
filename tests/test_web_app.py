@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from trading_bot.alpaca_client import AlpacaApiError
 from trading_bot.web_app import (
+    STATIC_DIR,
     TradingBotWebHandler,
     _historical_option_prices,
     _option_outcomes,
@@ -14,6 +15,16 @@ from trading_bot.web_app import (
 
 
 class WebAppTests(unittest.TestCase):
+    def test_frontend_defaults_to_spx_and_fifteen_second_refreshes(self):
+        html = (STATIC_DIR / "index.html").read_text()
+        javascript = (STATIC_DIR / "app.js").read_text()
+
+        self.assertIn('value="SPX" data-ticker-checkbox checked', html)
+        self.assertNotIn('value="NDX" data-ticker-checkbox checked', html)
+        self.assertEqual(html.count('<option value="15" selected>15 sec</option>'), 2)
+        self.assertIn('Math.max(15, Number(liveInterval.value || 15))', javascript)
+        self.assertIn('return selected.length > 0 ? [...new Set(selected)] : ["SPX"]', javascript)
+
     def test_handle_analyze_returns_analysis_json(self):
         handler = _handler()
         classic_major_levels = MagicMock()

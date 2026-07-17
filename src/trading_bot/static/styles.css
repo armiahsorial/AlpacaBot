@@ -915,7 +915,7 @@ button:disabled {
 
 .trade-history-row {
   display: grid;
-  grid-template-columns: minmax(280px, 1.4fr) auto auto repeat(6, minmax(96px, 0.62fr));
+  grid-template-columns: minmax(280px, 1.4fr) auto auto repeat(5, minmax(96px, 0.62fr)) minmax(190px, 1fr);
   gap: 8px 12px;
   align-items: center;
   min-height: 78px;
@@ -1005,6 +1005,12 @@ button:disabled {
 .trade-history-row strong {
   font-size: 14px;
   line-height: 1.15;
+}
+
+.trade-history-row .history-exit {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
 }
 
 .trade-history-row .positive {

@@ -194,9 +194,9 @@ class WebAppTests(unittest.TestCase):
         alpaca = MagicMock()
         alpaca.get_option_bars.return_value = {
             "AAPL260710C00100000": [
-                {"t": "2026-07-10T14:30:00Z", "h": 2.6, "l": 2.1},
-                {"t": "2026-07-10T15:00:00Z", "h": 4.2, "l": 3.8},
-                {"t": "2026-07-10T16:00:00Z", "h": 1.9, "l": 1.4},
+                {"t": "2026-07-10T14:30:00Z", "h": 2.6, "l": 2.1, "c": 2.4},
+                {"t": "2026-07-10T15:00:00Z", "h": 4.2, "l": 3.8, "c": 4.0},
+                {"t": "2026-07-10T16:00:00Z", "h": 1.9, "l": 1.4, "c": 1.6},
             ]
         }
         alpaca.get_stock_bars.return_value = [
@@ -227,6 +227,7 @@ class WebAppTests(unittest.TestCase):
         outcome = outcomes["signal-1"]
         self.assertEqual(outcome["high"], 4.2)
         self.assertEqual(outcome["low"], 1.4)
+        self.assertEqual(outcome["current"], 1.6)
         self.assertTrue(outcome["went_up"])
         self.assertTrue(outcome["high_greeks"]["estimated"])
         self.assertTrue(outcome["low_greeks"]["estimated"])
@@ -260,6 +261,7 @@ class WebAppTests(unittest.TestCase):
         outcome = outcomes["signal-2"]
         self.assertEqual(outcome["high"], 12.5)
         self.assertEqual(outcome["low"], 9.5)
+        self.assertEqual(outcome["current"], 9.5)
         self.assertEqual(outcome["source"], "saved intraday path fallback")
         self.assertEqual(outcome["high_greeks"]["delta"], 0.4)
 

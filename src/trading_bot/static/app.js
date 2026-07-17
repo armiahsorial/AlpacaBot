@@ -2742,7 +2742,7 @@ function outcomeStatus(outcome) {
   if (outcome.source) {
     return outcome.source;
   }
-  return "alpaca option bars";
+  return "market-data option bars";
 }
 
 function greekOutcomeSummary(greeks) {

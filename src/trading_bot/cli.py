@@ -21,6 +21,7 @@ from trading_bot.gex_client import (
     StateGreekProfile,
     Tickers,
 )
+from trading_bot.market_data import MarketDataError, create_market_data_client
 from trading_bot.options_analysis import OptionRecommendation, recommend_option_contracts
 
 
@@ -132,7 +133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             gex_analysis = _analyze_ticker(args.ticker, args.period)
             recommendation = recommend_option_contracts(
                 gex_analysis=gex_analysis,
-                alpaca_client=_alpaca_client(),
+                alpaca_client=create_market_data_client(),
                 max_expiration_days=args.max_expiration_days,
                 max_candidates=args.limit,
             )
@@ -141,7 +142,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         parser.print_help()
         return 2
-    except (AlpacaApiError, GexApiError, ValueError) as exc:
+    except (AlpacaApiError, MarketDataError, GexApiError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

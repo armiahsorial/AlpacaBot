@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime, time, timedelta
+from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,6 +15,7 @@ from trading_bot.alpaca_client import AlpacaApiError, AlpacaClient, PaperOrderRe
 from trading_bot.analysis import analyze_gex
 from trading_bot.config import AlpacaSettings, Settings
 from trading_bot.gex_client import AGGREGATION_PERIODS, GexApiError, GexClient
+from trading_bot.market_data import MarketDataClient, MarketDataError, create_market_data_client
 from trading_bot.options_analysis import _black_scholes_delta, _black_scholes_gamma, _solve_implied_volatility, recommend_option_contracts
 from trading_bot.options_replay import replay_option_recommendation
 from trading_bot.technicals import StockTechnicals, calculate_stock_technicals
@@ -186,12 +188,12 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             analysis = _analyze_ticker(ticker, period)
             recommendation = recommend_option_contracts(
                 gex_analysis=analysis,
-                alpaca_client=_alpaca_client(),
+                alpaca_client=_market_data_client(),
                 max_expiration_days=int(max_expiration_days_raw),
                 max_candidates=int(limit_raw),
                 max_contract_cost=max_contract_cost,
             )
-        except (AlpacaApiError, GexApiError, ValueError) as exc:
+        except (MarketDataError, GexApiError, ValueError) as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
 
@@ -212,10 +214,10 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             replay_date = params.get("date", [""])[0].strip()
             replay_time = params.get("time", [""])[0].strip()
             if replay_date and replay_time:
-                self._send_json({"prices": _historical_option_prices(_alpaca_client(), symbols, replay_date, replay_time)})
+                self._send_json({"prices": _historical_option_prices(_market_data_client(), symbols, replay_date, replay_time)})
                 return
-            snapshots = _alpaca_client().get_option_snapshots(symbols)
-        except (AlpacaApiError, ValueError) as exc:
+            snapshots = _market_data_client().get_option_snapshots(symbols)
+        except (MarketDataError, ValueError) as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
 
@@ -261,7 +263,7 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             if max_contract_cost is not None and max_contract_cost <= 0:
                 raise ValueError("max_contract_cost must be greater than zero.")
             requested_limit = int(limit_raw)
-            alpaca_client = _alpaca_client()
+            alpaca_client = _market_data_client()
             analysis = _analyze_ticker(ticker, period, replay_date=replay_date, replay_time=replay_time)
             recommendation = recommend_option_contracts(
                 gex_analysis=analysis,
@@ -275,7 +277,7 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
                 replay_date=replay_date,
                 replay_time=replay_time,
             )
-        except (AlpacaApiError, GexApiError, ValueError) as exc:
+        except (MarketDataError, GexApiError, ValueError) as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
 
@@ -352,9 +354,9 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
                 raise ValueError("entries are required.")
             if len(entries) > 100:
                 raise ValueError("At most 100 option entries can be evaluated at once.")
-            outcomes = _option_outcomes(_alpaca_client(), entries)
+            outcomes = _option_outcomes(_market_data_client(), entries)
             self._send_json({"outcomes": outcomes})
-        except (AlpacaApiError, ValueError) as exc:
+        except (MarketDataError, ValueError) as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
 
     def _send_file(self, path: Path, content_type: str) -> None:
@@ -405,6 +407,11 @@ def _alpaca_client() -> AlpacaClient:
     return AlpacaClient(AlpacaSettings.from_env())
 
 
+@lru_cache(maxsize=1)
+def _market_data_client() -> MarketDataClient:
+    return create_market_data_client()
+
+
 def _analyze_ticker(ticker: str, period: str, replay_date: str | None = None, replay_time: str | None = None):
     settings = Settings.from_env()
     client = GexClient(settings)
@@ -436,7 +443,8 @@ def _analyze_ticker(ticker: str, period: str, replay_date: str | None = None, re
 
 
 def _stock_technicals(ticker: str, replay_date: str | None = None, replay_time: str | None = None) -> StockTechnicals:
-    alpaca_client = _alpaca_client()
+    alpaca_client = _market_data_client()
+    stock_feed = None if getattr(alpaca_client, "provider_name", "alpaca") == "databento" else DEFAULT_STOCK_DATA_FEED
     ticker = ticker.strip().upper()
     symbol = TECHNICAL_UNDERLYING_OVERRIDES.get(ticker, ticker)
     as_of = _technical_as_of(replay_date, replay_time)
@@ -449,7 +457,7 @@ def _stock_technicals(ticker: str, replay_date: str | None = None, replay_time: 
         start=_to_utc_iso(market_open),
         end=_to_utc_iso(as_of),
         timeframe="1Min",
-        feed=DEFAULT_STOCK_DATA_FEED,
+        feed=stock_feed,
         limit=10000,
     )
     daily_bars = alpaca_client.get_stock_bars(
@@ -457,7 +465,7 @@ def _stock_technicals(ticker: str, replay_date: str | None = None, replay_time: 
         start=daily_start.isoformat(),
         end=daily_end.isoformat(),
         timeframe="1Day",
-        feed=DEFAULT_STOCK_DATA_FEED,
+        feed=stock_feed,
         limit=300,
     )
     return calculate_stock_technicals(
@@ -468,7 +476,7 @@ def _stock_technicals(ticker: str, replay_date: str | None = None, replay_time: 
     )
 
 
-def _option_outcomes(alpaca_client: AlpacaClient, raw_entries: list[object]) -> dict[str, dict[str, object]]:
+def _option_outcomes(alpaca_client: MarketDataClient, raw_entries: list[object]) -> dict[str, dict[str, object]]:
     entries = [_normalize_option_outcome_entry(entry) for entry in raw_entries]
     entries = [entry for entry in entries if entry is not None]
     if not entries:
@@ -491,7 +499,7 @@ def _option_outcomes(alpaca_client: AlpacaClient, raw_entries: list[object]) -> 
                 timeframe="1Min",
             )
             option_bars_error = None
-        except AlpacaApiError as exc:
+        except MarketDataError as exc:
             option_bars = {}
             option_bars_error = str(exc)
         stock_bars_by_underlying = _load_outcome_stock_bars(alpaca_client, date_entries, start_dt, end_dt)
@@ -567,12 +575,13 @@ def _option_outcome_end_dt(outcome_date: str) -> datetime:
 
 
 def _load_outcome_stock_bars(
-    alpaca_client: AlpacaClient,
+    alpaca_client: MarketDataClient,
     entries: list[dict[str, object]],
     start_dt: datetime,
     end_dt: datetime,
 ) -> dict[str, list[dict[str, object]]]:
     bars_by_underlying: dict[str, list[dict[str, object]]] = {}
+    stock_feed = None if getattr(alpaca_client, "provider_name", "alpaca") == "databento" else DEFAULT_STOCK_DATA_FEED
     for underlying in sorted({str(entry["underlying"]) for entry in entries if entry.get("underlying")}):
         try:
             bars_by_underlying[underlying] = alpaca_client.get_stock_bars(
@@ -580,10 +589,10 @@ def _load_outcome_stock_bars(
                 start=_to_utc_iso(start_dt),
                 end=_to_utc_iso(end_dt),
                 timeframe="1Min",
-                feed=DEFAULT_STOCK_DATA_FEED,
+                feed=stock_feed,
                 limit=10000,
             )
-        except AlpacaApiError:
+        except MarketDataError:
             bars_by_underlying[underlying] = []
     return bars_by_underlying
 
@@ -613,7 +622,7 @@ def _outcome_for_entry(
         "low_time": low_time.isoformat() if low_time else None,
         "low_greeks": _estimate_outcome_greeks(entry, low_price, low_time, stock_bars),
         "went_up": went_up,
-        "source": "alpaca option bars",
+        "source": "market-data option bars",
     }
 
 
@@ -789,7 +798,7 @@ def _option_price_from_snapshot(snapshot: object) -> dict[str, float | None]:
 
 
 def _historical_option_prices(
-    alpaca_client: AlpacaClient,
+    alpaca_client: MarketDataClient,
     symbols: list[str],
     replay_date: str,
     replay_time: str,

@@ -10,13 +10,14 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from trading_bot.config import AlpacaSettings
+from trading_bot.market_data import MarketDataError
 
 ORDER_SIDES = ("buy", "sell")
 ORDER_TYPES = ("market", "limit", "stop", "stop_limit", "trailing_stop")
 TIME_IN_FORCE = ("day", "gtc", "opg", "cls", "ioc", "fok")
 
 
-class AlpacaApiError(RuntimeError):
+class AlpacaApiError(MarketDataError):
     """Raised when Alpaca returns an error or invalid response."""
 
 
@@ -75,6 +76,8 @@ class PaperOrderRequest:
 
 
 class AlpacaClient:
+    provider_name = "alpaca"
+
     def __init__(self, settings: AlpacaSettings) -> None:
         self._settings = settings
 

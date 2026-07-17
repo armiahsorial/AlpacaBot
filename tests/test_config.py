@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from trading_bot.config import AlpacaSettings, Settings
+from trading_bot.config import AlpacaSettings, DatabentoSettings, MarketDataSettings, Settings
 
 
 class SettingsTests(unittest.TestCase):
@@ -92,6 +92,48 @@ class SettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.api_key_id, "paper-key")
         self.assertEqual(settings.api_secret_key, "paper-secret")
+
+    def test_market_data_provider_defaults_to_alpaca(self):
+        with patch.dict(os.environ, {}, clear=True):
+            settings = MarketDataSettings.from_env(None)
+        self.assertEqual(settings.provider, "alpaca")
+
+    def test_market_data_provider_accepts_databento(self):
+        with patch.dict(os.environ, {"MARKET_DATA_PROVIDER": "Databento"}, clear=True):
+            settings = MarketDataSettings.from_env(None)
+        self.assertEqual(settings.provider, "databento")
+
+    def test_databento_settings_require_key(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "DATABENTO_API_KEY"):
+                DatabentoSettings.from_env(None)
+
+    def test_databento_settings_read_provider_options(self):
+        env = {
+            "DATABENTO_API_KEY": "db-key",
+            "DATABENTO_OPTIONS_DATASET": "OPTIONS.TEST",
+            "DATABENTO_EQUITIES_DATASET": "EQUITIES.TEST",
+            "DATABENTO_EQUITIES_FALLBACK": "none",
+            "DATABENTO_LIVE_REPLAY_SECONDS": "30",
+            "DATABENTO_LIVE_TIMEOUT_SECONDS": "3.5",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = DatabentoSettings.from_env(None)
+        self.assertEqual(settings.api_key, "db-key")
+        self.assertEqual(settings.options_dataset, "OPTIONS.TEST")
+        self.assertEqual(settings.equities_dataset, "EQUITIES.TEST")
+        self.assertEqual(settings.equities_fallback, "none")
+        self.assertEqual(settings.live_replay_seconds, 30)
+        self.assertEqual(settings.live_timeout_seconds, 3.5)
+
+    def test_databento_settings_accept_legacy_replay_minutes(self):
+        env = {
+            "DATABENTO_API_KEY": "db-key",
+            "DATABENTO_LIVE_REPLAY_MINUTES": "3",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = DatabentoSettings.from_env(None)
+        self.assertEqual(settings.live_replay_seconds, 180)
 
 if __name__ == "__main__":
     unittest.main()

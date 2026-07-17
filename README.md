@@ -40,6 +40,50 @@ ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets
 ALPACA_DATA_BASE_URL=https://data.alpaca.markets
 ```
 
+Alpaca remains the paper broker even when another market-data provider is selected.
+
+### Databento market data
+
+The app can use Databento for option chains, OPRA quotes, stock and option bars,
+historical replay, technical indicators, and trade-outcome tracking. Alpaca is
+still used for paper account and order endpoints.
+
+After activating Databento OPRA and U.S. equities access, add:
+
+```env
+MARKET_DATA_PROVIDER=databento
+DATABENTO_API_KEY=your-databento-api-key
+DATABENTO_OPTIONS_DATASET=OPRA.PILLAR
+DATABENTO_EQUITIES_DATASET=EQUS.MINI
+DATABENTO_EQUITIES_FALLBACK=alpaca
+DATABENTO_LIVE_REPLAY_SECONDS=30
+DATABENTO_LIVE_TIMEOUT_SECONDS=2
+```
+
+Restart the web application after changing providers. To return to Alpaca data,
+change only:
+
+```env
+MARKET_DATA_PROVIDER=alpaca
+```
+
+Databento timestamps are normalized to the same UTC bar format the app already
+uses. OCC option symbols are translated automatically. Greeks are estimated
+locally from the Databento NBBO mid when the feed does not provide them.
+`DATABENTO_LIVE_REPLAY_MINUTES` remains supported for older configurations, but
+`DATABENTO_LIVE_REPLAY_SECONDS` takes precedence when both are present.
+
+Live `EQUS.MINI` access requires a Databento U.S. Equities subscription. With
+`DATABENTO_EQUITIES_FALLBACK=alpaca`, missing Databento equity entitlement falls
+back to Alpaca IEX bars for underlying technicals while option quotes and option
+bars continue to use Databento OPRA. Set the fallback to `none` to require
+Databento for both asset classes.
+
+The current underlying or index spot used for GEX distances, native SPX/NDX
+strike filtering, and locally estimated option Greeks always comes from the GEX
+response. Alpaca proxy bars are used only for indicators that require price
+history, such as VWAP and the 50-day/200-day moving averages.
+
 Environment variables from your shell override values in `.env`.
 
 ## Usage
@@ -232,4 +276,7 @@ PYTHONPATH=src python -m unittest discover -s tests
 
 ## Notes
 
-This project reads GEX levels for analysis. Options contract data, trading execution, brokerage integration, position sizing, and stricter risk checks should be added deliberately before any live trading is enabled.
+This project reads GEX levels and market data for analysis. Databento supplies
+data only; it does not execute orders. Keep paper and live execution controls
+separate, and validate subscriptions and feed behavior before relying on a live
+session.

@@ -119,7 +119,7 @@ class WebAppTests(unittest.TestCase):
         recommendation.as_dict.return_value = {"ticker": "AAPL", "candidates": []}
 
         with patch("trading_bot.web_app._analyze_ticker", return_value=analysis) as analyze_mock:
-            with patch("trading_bot.web_app._alpaca_client", return_value=MagicMock()) as alpaca_mock:
+            with patch("trading_bot.web_app._market_data_client", return_value=MagicMock()) as market_data_mock:
                 with patch("trading_bot.web_app.recommend_option_contracts", return_value=recommendation) as recommend_mock:
                     handler._handle_option_recommendation(
                         "ticker=aapl&period=zero&limit=3&max_contract_cost=500"
@@ -130,7 +130,7 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(payload["ticker"], "AAPL")
         self.assertEqual(payload["analysis"]["bias"], "bullish")
         analyze_mock.assert_called_once_with("AAPL", "zero")
-        alpaca_mock.assert_called_once_with()
+        market_data_mock.assert_called_once_with()
         self.assertEqual(recommend_mock.call_args.kwargs["max_candidates"], 3)
         self.assertEqual(recommend_mock.call_args.kwargs["max_contract_cost"], 500)
 
@@ -144,7 +144,7 @@ class WebAppTests(unittest.TestCase):
             }
         }
 
-        with patch("trading_bot.web_app._alpaca_client", return_value=alpaca):
+        with patch("trading_bot.web_app._market_data_client", return_value=alpaca):
             handler._handle_option_prices("symbols=AAPL260710C00310000")
 
         self.assertEqual(handler.status, HTTPStatus.OK)
@@ -162,7 +162,7 @@ class WebAppTests(unittest.TestCase):
         replay.as_dict.return_value = {"date": "2026-07-02", "candidates": []}
 
         with patch("trading_bot.web_app._analyze_ticker", return_value=analysis) as analyze_mock:
-            with patch("trading_bot.web_app._alpaca_client", return_value=alpaca):
+            with patch("trading_bot.web_app._market_data_client", return_value=alpaca):
                 with patch("trading_bot.web_app.recommend_option_contracts", return_value=recommendation):
                     with patch("trading_bot.web_app.replay_option_recommendation", return_value=replay) as replay_mock:
                         handler._handle_option_replay("ticker=aapl&period=zero&date=2026-07-02&time=10:45:30")
@@ -183,7 +183,7 @@ class WebAppTests(unittest.TestCase):
         alpaca = MagicMock()
         alpaca.get_stock_bars.return_value = []
 
-        with patch("trading_bot.web_app._alpaca_client", return_value=alpaca):
+        with patch("trading_bot.web_app._market_data_client", return_value=alpaca):
             _stock_technicals("AAPL", replay_date="2026-07-02", replay_time="10:45:30")
 
         self.assertEqual(alpaca.get_stock_bars.call_count, 2)

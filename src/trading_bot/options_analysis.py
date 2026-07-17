@@ -1,4 +1,4 @@
-"""Combine GEX reads with Alpaca option data to rank candidate contracts."""
+"""Combine GEX reads with provider-neutral option data to rank contracts."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from math import erf, exp, log, pi, sqrt
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from trading_bot.alpaca_client import AlpacaClient
 from trading_bot.analysis import GexAnalysis
+from trading_bot.market_data import MarketDataClient
 
 OPTIONABLE_GEX_TICKER_OVERRIDES = {
     "NDX": "QQQ",
@@ -98,13 +98,18 @@ class OptionRecommendation:
 def recommend_option_contracts(
     *,
     gex_analysis: GexAnalysis,
-    alpaca_client: AlpacaClient,
+    alpaca_client: MarketDataClient,
     max_expiration_days: int = 14,
     max_candidates: int = 5,
     max_contract_cost: float | None = None,
 ) -> OptionRecommendation:
     ticker = gex_analysis.ticker.upper()
-    underlying_symbol = OPTIONABLE_GEX_TICKER_OVERRIDES.get(ticker, ticker)
+    provider_name = getattr(alpaca_client, "provider_name", "alpaca")
+    underlying_symbol = (
+        ticker
+        if provider_name == "databento"
+        else OPTIONABLE_GEX_TICKER_OVERRIDES.get(ticker, ticker)
+    )
     warnings: list[str] = []
 
     contract_type = _contract_type_from_bias(gex_analysis.bias)
@@ -124,8 +129,8 @@ def recommend_option_contracts(
             warnings=("GEX bias is neutral; wait for directional alignment before selecting calls or puts.",),
         )
 
-    if ticker in OPTIONABLE_GEX_TICKER_OVERRIDES:
-        warnings.append(f"{ticker} is not an equity option underlying at Alpaca; using {underlying_symbol} as proxy.")
+    if underlying_symbol != ticker:
+        warnings.append(f"{ticker} uses {underlying_symbol} as its option-data proxy.")
 
     if gex_analysis.trade_permission == "no trade":
         warnings.append("GEX trade permission is no trade; candidates are watchlist ideas, not entry instructions.")
@@ -172,7 +177,7 @@ def recommend_option_contracts(
             contract_type=contract_type,
             target_level=target_level,
             trade_permission=gex_analysis.trade_permission,
-            recommendation="No liquid option contract candidate was found in the near-dated Alpaca chain.",
+            recommendation="No liquid option contract candidate was found in the near-dated option chain.",
             candidates=(),
             warnings=tuple(warnings + [
                 "No candidate had usable bid/ask quote data within the selected contract-price limit."
@@ -254,7 +259,7 @@ def _filter_contracts(
     return sorted(filtered, key=lambda contract: abs((_to_float(contract.get("strike_price")) or spot) - target_level))
 
 
-def _load_snapshots(alpaca_client: AlpacaClient, symbols: list[str]) -> dict[str, Any]:
+def _load_snapshots(alpaca_client: MarketDataClient, symbols: list[str]) -> dict[str, Any]:
     snapshots: dict[str, Any] = {}
     for index in range(0, len(symbols), 100):
         snapshots.update(alpaca_client.get_option_snapshots(symbols[index : index + 100]))
@@ -262,7 +267,7 @@ def _load_snapshots(alpaca_client: AlpacaClient, symbols: list[str]) -> dict[str
 
 
 def _attach_intraday_price_paths(
-    alpaca_client: AlpacaClient,
+    alpaca_client: MarketDataClient,
     candidates: tuple[OptionCandidate, ...],
 ) -> tuple[OptionCandidate, ...]:
     if not candidates:
@@ -342,7 +347,7 @@ def _candidate_from_contract(
             greeks_estimated = True
 
     score = 100.0
-    reasons: list[str] = []
+    reasons: list[str] = [f"Underlying spot {analysis.spot:g} is sourced from GEX."]
 
     target_distance = abs(strike - target_level)
     score -= min(target_distance / max(analysis.spot * 0.01, 1), 20)
@@ -365,7 +370,7 @@ def _candidate_from_contract(
         score -= min(abs(delta - desired_delta) * 25, 15)
         reasons.append(f"Delta is {delta:g}.")
         if greeks_estimated:
-            reasons.append("Greeks were estimated from option mid because Alpaca did not return snapshot Greeks.")
+            reasons.append("Greeks were estimated from the option mid because the data feed did not supply them.")
 
     if analysis.trade_permission == "no trade":
         score -= 20

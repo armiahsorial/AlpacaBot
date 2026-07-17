@@ -140,11 +140,13 @@ def recommend_option_contracts(
         underlying_symbol,
         expiration_date_gte=today.isoformat(),
         expiration_date_lte=(today + timedelta(days=max_expiration_days)).isoformat(),
-        limit=1000,
+        limit=10000,
     )
     target_level = _target_level(gex_analysis, contract_type)
     side_contracts = _filter_contracts(contracts, contract_type, gex_analysis.spot, target_level)
-    snapshots = _load_snapshots(alpaca_client, [contract["symbol"] for contract in side_contracts[:100]])
+    snapshot_limit = 20 if provider_name == "databento" else 100
+    priced_contracts = side_contracts[:snapshot_limit]
+    snapshots = _load_snapshots(alpaca_client, [contract["symbol"] for contract in priced_contracts])
 
     candidates = tuple(
         sorted(
@@ -152,7 +154,7 @@ def recommend_option_contracts(
                 candidate
                 for candidate in (
                     _candidate_from_contract(contract, snapshots.get(contract["symbol"], {}), gex_analysis, target_level)
-                    for contract in side_contracts
+                    for contract in priced_contracts
                 )
                 if candidate is not None
                 and (
@@ -256,7 +258,13 @@ def _filter_contracts(
         if min_strike <= strike <= max_strike:
             filtered.append(contract)
 
-    return sorted(filtered, key=lambda contract: abs((_to_float(contract.get("strike_price")) or spot) - target_level))
+    return sorted(
+        filtered,
+        key=lambda contract: (
+            str(contract.get("expiration_date", "")),
+            abs((_to_float(contract.get("strike_price")) or spot) - target_level),
+        ),
+    )
 
 
 def _load_snapshots(alpaca_client: MarketDataClient, symbols: list[str]) -> dict[str, Any]:

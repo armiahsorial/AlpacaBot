@@ -19,6 +19,12 @@ TIMEFRAME_SCHEMAS = {
     "1day": "ohlcv-1d",
     "1d": "ohlcv-1d",
 }
+OPTION_PARENT_ROOTS = {
+    "SPX": ("SPX", "SPXW"),
+    "NDX": ("NDX", "NDXP"),
+    "RUT": ("RUT", "RUTW"),
+}
+AM_SETTLED_INDEX_ROOTS = {"SPX", "NDX", "RUT"}
 
 
 class DatabentoApiError(MarketDataError):
@@ -98,20 +104,30 @@ class DatabentoClient:
     ) -> list[dict[str, Any]]:
         underlying = _clean_symbol(underlying_symbol)
         query_day = date.today()
-        request = {
-            "dataset": self._settings.options_dataset,
-            "schema": "definition",
-            "symbols": [f"{underlying}.OPT"],
-            "stype_in": "parent",
-            "start": query_day.isoformat(),
-        }
-        try:
-            rows = self._historical_rows(
-                **request,
-                end=(query_day + timedelta(days=1)).isoformat(),
-            )
-        except DatabentoApiError:
-            rows = self._live_rows(**request)
+        rows: list[dict[str, Any]] = []
+        parent_errors: list[DatabentoApiError] = []
+        for root in OPTION_PARENT_ROOTS.get(underlying, (underlying,)):
+            request = {
+                "dataset": self._settings.options_dataset,
+                "schema": "definition",
+                "symbols": [f"{root}.OPT"],
+                "stype_in": "parent",
+                "start": query_day.isoformat(),
+            }
+            try:
+                rows.extend(
+                    self._historical_rows(
+                        **request,
+                        end=(query_day + timedelta(days=1)).isoformat(),
+                    )
+                )
+            except DatabentoApiError:
+                try:
+                    rows.extend(self._live_rows(**request))
+                except DatabentoApiError as exc:
+                    parent_errors.append(exc)
+        if not rows and parent_errors:
+            raise parent_errors[-1]
         contracts: list[dict[str, Any]] = []
         for row in rows:
             contract = _normalize_contract(row, underlying)
@@ -125,8 +141,12 @@ class DatabentoClient:
             if status and contract["status"] != status.lower():
                 continue
             contracts.append(contract)
-        contracts.sort(key=lambda item: (item["expiration_date"], float(item["strike_price"])))
-        return contracts[:limit]
+        unique_contracts = {contract["symbol"]: contract for contract in contracts}
+        ordered = sorted(
+            unique_contracts.values(),
+            key=lambda item: (item["expiration_date"], float(item["strike_price"])),
+        )
+        return ordered[:limit]
 
     def get_option_snapshots(self, symbols: list[str], *, feed: str | None = None) -> dict[str, Any]:
         del feed
@@ -313,7 +333,9 @@ def _normalize_contract(row: dict[str, Any], underlying: str) -> dict[str, Any] 
     if not match:
         return None
     root, expiration_code, side, strike_code = match.groups()
-    expiration = _date_string(row.get("expiration")) or datetime.strptime(expiration_code, "%y%m%d").date().isoformat()
+    expiration_value = row.get("expiration")
+    expiration = _date_string(expiration_value) or datetime.strptime(expiration_code, "%y%m%d").date().isoformat()
+    expiration_dt = _datetime_value(expiration_value)
     strike = _price(row.get("strike_price"))
     if strike is None:
         strike = int(strike_code) / 1000
@@ -323,7 +345,7 @@ def _normalize_contract(row: dict[str, Any], underlying: str) -> dict[str, Any] 
         "type": "call" if side == "C" else "put",
         "expiration_date": expiration,
         "strike_price": strike,
-        "status": "active" if expiration >= date.today().isoformat() else "inactive",
+        "status": "active" if _contract_is_active(expiration, expiration_dt, root) else "inactive",
         "tradable": True,
         "open_interest": _integer(row.get("open_interest")),
     }
@@ -454,6 +476,26 @@ def _date_string(value: Any) -> str | None:
         return datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
     except ValueError:
         return text[:10] if len(text) >= 10 else None
+
+
+def _datetime_value(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, int) and value > 10_000_000_000:
+        return datetime.fromtimestamp(value / PRICE_SCALE, tz=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(_iso_value(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _contract_is_active(expiration: str, expiration_dt: datetime | None, root: str) -> bool:
+    if root in AM_SETTLED_INDEX_ROOTS and expiration_dt is not None:
+        return expiration_dt > datetime.now(timezone.utc)
+    return expiration >= date.today().isoformat()
 
 
 def _parse_datetime(value: str) -> datetime:

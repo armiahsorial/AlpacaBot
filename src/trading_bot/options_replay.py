@@ -7,7 +7,7 @@ from datetime import datetime, time
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from trading_bot.alpaca_client import AlpacaClient
+from trading_bot.market_data import MarketDataClient
 from trading_bot.options_analysis import OptionRecommendation
 
 MARKET_TZ = ZoneInfo("America/New_York")
@@ -75,7 +75,7 @@ class OptionReplay:
 def replay_option_recommendation(
     *,
     recommendation: OptionRecommendation,
-    alpaca_client: AlpacaClient,
+    alpaca_client: MarketDataClient,
     replay_date: str,
     replay_time: str,
 ) -> OptionReplay:

@@ -22,6 +22,24 @@ class OptionRecommendationTests(unittest.TestCase):
         self.assertEqual(recommendation.underlying_symbol, "SPX")
         self.assertFalse(any("using SPY as proxy" in warning for warning in recommendation.warnings))
 
+    def test_databento_uses_native_ndx_contracts_with_gex_spot(self):
+        client = _FakeAlpacaClient()
+        client.provider_name = "databento"
+
+        recommendation = recommend_option_contracts(
+            gex_analysis=_analysis(
+                ticker="NDX",
+                bias="bullish",
+                score=4,
+                permission="possible trade after confirmation",
+            ),
+            alpaca_client=client,
+        )
+
+        self.assertEqual(client.requested_underlying, "NDX")
+        self.assertEqual(recommendation.underlying_symbol, "NDX")
+        self.assertIn("sourced from GEX", recommendation.candidates[0].reasons[0])
+
     def test_recommends_call_for_bullish_gex(self):
         recommendation = recommend_option_contracts(
             gex_analysis=_analysis(bias="bullish", score=4, permission="possible trade after confirmation"),
@@ -66,6 +84,8 @@ class OptionRecommendationTests(unittest.TestCase):
 
 
 class _FakeAlpacaClient:
+    provider_name = "alpaca"
+
     def __init__(self, *, include_greeks: bool = True):
         self._include_greeks = include_greeks
         self.requested_underlying = None

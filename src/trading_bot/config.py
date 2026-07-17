@@ -13,6 +13,10 @@ DEFAULT_TIMEOUT_SECONDS = 20.0
 DEFAULT_ENV_FILE = Path.cwd() / ".env"
 DEFAULT_ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 DEFAULT_ALPACA_DATA_BASE_URL = "https://data.alpaca.markets"
+DEFAULT_MARKET_DATA_PROVIDER = "alpaca"
+DEFAULT_DATABENTO_OPTIONS_DATASET = "OPRA.PILLAR"
+DEFAULT_DATABENTO_EQUITIES_DATASET = "EQUS.MINI"
+MARKET_DATA_PROVIDERS = ("alpaca", "databento")
 
 
 @dataclass(frozen=True)
@@ -92,6 +96,69 @@ class AlpacaSettings:
             data_base_url=data_base_url,
             user_agent=user_agent,
             timeout_seconds=timeout_seconds,
+        )
+
+
+@dataclass(frozen=True)
+class MarketDataSettings:
+    provider: str = DEFAULT_MARKET_DATA_PROVIDER
+
+    @classmethod
+    def from_env(cls, env_file: Path | str | None = DEFAULT_ENV_FILE) -> "MarketDataSettings":
+        values = _load_env_file(env_file)
+        values.update(os.environ)
+        provider = values.get("MARKET_DATA_PROVIDER", DEFAULT_MARKET_DATA_PROVIDER).strip().lower()
+        if provider not in MARKET_DATA_PROVIDERS:
+            raise ValueError(f"MARKET_DATA_PROVIDER must be one of: {', '.join(MARKET_DATA_PROVIDERS)}.")
+        return cls(provider=provider)
+
+
+@dataclass(frozen=True)
+class DatabentoSettings:
+    api_key: str
+    options_dataset: str = DEFAULT_DATABENTO_OPTIONS_DATASET
+    equities_dataset: str = DEFAULT_DATABENTO_EQUITIES_DATASET
+    equities_fallback: str = "alpaca"
+    live_replay_seconds: int = 30
+    live_timeout_seconds: float = 2.0
+
+    @classmethod
+    def from_env(cls, env_file: Path | str | None = DEFAULT_ENV_FILE) -> "DatabentoSettings":
+        values = _load_env_file(env_file)
+        values.update(os.environ)
+
+        api_key = values.get("DATABENTO_API_KEY", "").strip()
+        if not api_key:
+            raise ValueError("DATABENTO_API_KEY is required when MARKET_DATA_PROVIDER=databento.")
+
+        options_dataset = values.get(
+            "DATABENTO_OPTIONS_DATASET", DEFAULT_DATABENTO_OPTIONS_DATASET
+        ).strip()
+        equities_dataset = values.get(
+            "DATABENTO_EQUITIES_DATASET", DEFAULT_DATABENTO_EQUITIES_DATASET
+        ).strip()
+        equities_fallback = values.get("DATABENTO_EQUITIES_FALLBACK", "alpaca").strip().lower()
+        if equities_fallback not in {"alpaca", "none"}:
+            raise ValueError("DATABENTO_EQUITIES_FALLBACK must be alpaca or none.")
+        try:
+            replay_seconds_raw = values.get("DATABENTO_LIVE_REPLAY_SECONDS", "").strip()
+            if replay_seconds_raw:
+                live_replay_seconds = int(replay_seconds_raw)
+            else:
+                live_replay_seconds = int(values.get("DATABENTO_LIVE_REPLAY_MINUTES", "2")) * 60
+            live_timeout_seconds = float(values.get("DATABENTO_LIVE_TIMEOUT_SECONDS", "2"))
+        except ValueError as exc:
+            raise ValueError("Databento replay window and timeout must be numbers.") from exc
+        if live_replay_seconds <= 0 or live_timeout_seconds <= 0:
+            raise ValueError("Databento replay window and timeout must be greater than zero.")
+
+        return cls(
+            api_key=api_key,
+            options_dataset=options_dataset,
+            equities_dataset=equities_dataset,
+            equities_fallback=equities_fallback,
+            live_replay_seconds=live_replay_seconds,
+            live_timeout_seconds=live_timeout_seconds,
         )
 
 

@@ -50,6 +50,7 @@ class GexAnalysis:
             "period": self.period,
             "timestamp": self.timestamp,
             "spot": self.spot,
+            "spot_source": "GEX classic major levels",
             "zero_gamma": self.zero_gamma,
             "score": self.score,
             "market_regime": self.market_regime,

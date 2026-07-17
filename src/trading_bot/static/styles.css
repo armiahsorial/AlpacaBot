@@ -525,6 +525,101 @@ button:disabled {
 .contract-list {
   display: grid;
   gap: 8px;
+  min-height: 56px;
+}
+
+.contract-list.is-refreshing {
+  cursor: progress;
+}
+
+.contract-list.multi-ticker-columns {
+  grid-auto-columns: minmax(460px, 1fr);
+  grid-auto-flow: column;
+  overflow-x: auto;
+  padding-bottom: 5px;
+}
+
+.ticker-contract-column {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(6, 16, 24, 0.45);
+  padding: 10px;
+}
+
+.ticker-contract-column.permission-trade {
+  border-color: rgba(53, 231, 176, 0.38);
+}
+
+.ticker-contract-column.permission-no-trade,
+.ticker-contract-column.error {
+  border-color: rgba(255, 92, 122, 0.34);
+}
+
+.ticker-column-header {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 56px;
+  margin-bottom: 9px;
+  border-bottom: 1px solid rgba(119, 255, 218, 0.15);
+  padding: 2px 2px 9px;
+}
+
+.ticker-column-header > div {
+  display: grid;
+  gap: 3px;
+}
+
+.ticker-column-header strong {
+  color: var(--ink);
+  font-size: 22px;
+}
+
+.ticker-column-header span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.ticker-column-stats {
+  justify-items: end;
+  text-align: right;
+}
+
+.ticker-candidate-list {
+  display: grid;
+  gap: 8px;
+}
+
+.ticker-column-empty {
+  min-height: 72px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.45;
+  padding: 12px 4px;
+}
+
+.ticker-contract-column .contract-row {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.ticker-contract-column .candidate-rank,
+.ticker-contract-column .contract-title,
+.ticker-contract-column .option-sparkline,
+.ticker-contract-column .contract-row small {
+  grid-column: 1 / -1;
+}
+
+.candidate-rank {
+  color: var(--accent) !important;
+  font-size: 10px !important;
+  font-weight: 900 !important;
+  text-transform: uppercase;
 }
 
 .best-pick {
@@ -624,67 +719,6 @@ button:disabled {
 
 .history-filters input {
   height: 36px;
-}
-
-.day-performance {
-  display: grid;
-  grid-template-columns: repeat(5, minmax(120px, 1fr));
-  gap: 8px;
-  border: 1px solid rgba(119, 255, 218, 0.22);
-  border-radius: 7px;
-  background:
-    linear-gradient(135deg, rgba(53, 231, 176, 0.11), rgba(8, 15, 24, 0.88)),
-    var(--panel);
-  padding: 10px;
-}
-
-.day-performance div {
-  display: grid;
-  gap: 3px;
-  min-height: 56px;
-  border: 1px solid rgba(119, 255, 218, 0.13);
-  border-radius: 6px;
-  background: rgba(6, 16, 24, 0.55);
-  padding: 9px;
-}
-
-.day-performance span {
-  color: var(--muted);
-  font-size: 10px;
-  font-weight: 850;
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
-}
-
-.day-performance strong {
-  color: var(--ink);
-  font-size: 18px;
-  line-height: 1.1;
-}
-
-.day-performance p {
-  grid-column: 1 / -1;
-  margin: 0;
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1.35;
-}
-
-.day-performance .positive {
-  color: var(--accent);
-}
-
-.day-performance .negative {
-  color: var(--danger);
-}
-
-.day-performance.profitable {
-  border-color: rgba(53, 231, 176, 0.42);
-}
-
-.day-performance.losing {
-  border-color: rgba(255, 92, 122, 0.42);
 }
 
 .paper-ledger-panel {
@@ -1957,6 +1991,12 @@ td:nth-child(2) {
     grid-column: auto;
   }
 
+  .contract-list.multi-ticker-columns {
+    grid-auto-columns: auto;
+    grid-auto-flow: row;
+    overflow-x: visible;
+  }
+
   .contract-row {
     grid-template-columns: 1fr 1fr;
   }
@@ -1966,7 +2006,6 @@ td:nth-child(2) {
   }
 
   .history-filters,
-  .day-performance,
   .paper-ledger-summary {
     grid-template-columns: 1fr;
   }

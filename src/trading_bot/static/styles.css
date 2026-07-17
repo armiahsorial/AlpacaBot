@@ -1063,8 +1063,7 @@ button:disabled {
   font-weight: 700;
 }
 
-.history-high-greeks,
-.history-low-greeks {
+.history-high-greeks {
   max-width: 132px;
   color: var(--soft) !important;
   font-size: 10px !important;

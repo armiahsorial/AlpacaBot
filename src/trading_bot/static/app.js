@@ -74,6 +74,7 @@ const EXIT_CONFIRMATION_REFRESHES = 2;
 // to evict the previous day's history.
 const MAX_TRADE_HISTORY_ITEMS = 2000;
 const MAX_PAPER_LEDGER_ITEMS = 500;
+const COMPACT_TRADE_HISTORY_ITEMS = 600;
 const MAX_RECORDED_PERMISSION_CANDIDATES = 3;
 const PACIFIC_TO_EASTERN_SECONDS = 3 * 60 * 60;
 
@@ -2044,8 +2045,7 @@ function renderTradeHistory({ preserveScroll = true } = {}) {
       <span class="history-pill history-bias">${item.bias}</span>
       <span class="history-pill">Score ${formatOptionalNumber(item.score)}</span>
       <span class="history-stat"><i>Recorded</i><strong>${formatCurrency(item.entryPrice)}</strong></span>
-      <span class="history-stat"><i>High</i><strong class="history-high">Loading...</strong><em class="history-high-greeks">-</em></span>
-      <span class="history-stat"><i>Low</i><strong class="history-low">Loading...</strong><em class="history-low-greeks">-</em></span>
+      <span class="history-stat"><i>Highest after buy</i><strong class="history-high">Loading...</strong><em class="history-high-greeks">-</em></span>
       <span class="history-stat"><i>Current</i><strong class="history-current">Loading...</strong></span>
       <span class="history-stat"><i>Change</i><strong class="history-change">-</strong></span>
       <span class="history-stat"><i>Exit</i><strong class="history-exit">Checking...</strong></span>
@@ -2150,8 +2150,7 @@ function renderPaperLedger({ preserveScroll = true } = {}) {
       </span>
       <span class="history-pill">${trade.status === "closed" ? "Closed" : "Open"}</span>
       <span class="history-stat"><i>Entry</i><strong>${formatCurrency(trade.entryPrice)}</strong></span>
-      <span class="history-stat"><i>High since entry</i><strong class="positive">${formatCurrency(trade.highPrice ?? current)}</strong></span>
-      <span class="history-stat"><i>Low since entry</i><strong class="negative">${formatCurrency(trade.lowPrice ?? current)}</strong></span>
+      <span class="history-stat"><i>Highest since entry</i><strong class="positive">${formatCurrency(trade.highPrice ?? current)}</strong></span>
       <span class="history-stat"><i>Now</i><strong>${formatCurrency(current)}</strong></span>
       <span class="history-stat"><i>P/L</i><strong class="${pnl >= 0 ? "positive" : "negative"}">${formatCurrency(pnl)}</strong></span>
       <span class="history-stat"><i>Move</i><strong class="${pnlPct >= 0 ? "positive" : "negative"}">${formatPercent(pnlPct)}</strong></span>
@@ -2492,10 +2491,6 @@ function tradeHistoryCsv(history) {
     "highest_delta",
     "highest_gamma",
     "highest_iv",
-    "lowest_after_buy",
-    "lowest_delta",
-    "lowest_gamma",
-    "lowest_iv",
     "outcome_status",
     "bias",
     "permission",
@@ -2524,10 +2519,6 @@ function tradeHistoryCsv(history) {
     item.outcome?.high_greeks?.delta ?? "",
     item.outcome?.high_greeks?.gamma ?? "",
     item.outcome?.high_greeks?.implied_volatility ?? "",
-    item.outcome?.low ?? "",
-    item.outcome?.low_greeks?.delta ?? "",
-    item.outcome?.low_greeks?.gamma ?? "",
-    item.outcome?.low_greeks?.implied_volatility ?? "",
     outcomeStatus(item.outcome),
     item.bias || "",
     item.permission || "",
@@ -2755,23 +2746,17 @@ function saveTradeHistoryOutcomes(outcomes) {
 function renderHistoryOutcome(row, outcome) {
   const highEl = row.querySelector(".history-high");
   const highGreeksEl = row.querySelector(".history-high-greeks");
-  const lowEl = row.querySelector(".history-low");
-  const lowGreeksEl = row.querySelector(".history-low-greeks");
-  if (!highEl || !highGreeksEl || !lowEl || !lowGreeksEl) {
+  if (!highEl || !highGreeksEl) {
     return;
   }
   if (!outcome || outcome.error) {
     highEl.textContent = "n/a";
     highGreeksEl.textContent = outcome?.error || "No outcome data";
-    lowEl.textContent = "n/a";
-    lowGreeksEl.textContent = "-";
     return;
   }
 
   highEl.textContent = outcome.went_up ? formatCurrency(outcome.high) : `No rise ${formatCurrency(outcome.high)}`;
   highGreeksEl.textContent = greekOutcomeSummary(outcome.high_greeks);
-  lowEl.textContent = formatCurrency(outcome.low);
-  lowGreeksEl.textContent = greekOutcomeSummary(outcome.low_greeks);
 }
 
 function outcomeStatus(outcome) {
@@ -2959,11 +2944,97 @@ function loadTradeHistory() {
 }
 
 function saveTradeHistory(history) {
+  const attempts = [
+    history,
+    compactTradeHistoryForStorage(history, MAX_TRADE_HISTORY_ITEMS),
+    compactTradeHistoryForStorage(history, COMPACT_TRADE_HISTORY_ITEMS),
+    compactTradeHistoryForStorage(history, Math.floor(COMPACT_TRADE_HISTORY_ITEMS / 2)),
+  ];
   try {
-    localStorage.setItem(TRADE_HISTORY_STORAGE_KEY, JSON.stringify(history));
+    localStorage.setItem(TRADE_HISTORY_STORAGE_KEY, JSON.stringify(attempts[0]));
+    return true;
   } catch (_error) {
-    fields.tradeHistory.textContent = "Trade history could not be saved in this browser.";
+    for (const compacted of attempts.slice(1)) {
+      try {
+        localStorage.setItem(TRADE_HISTORY_STORAGE_KEY, JSON.stringify(compacted));
+        setStatus(
+          `Trade history storage was full, so the app compacted older saved picks to keep the latest ${compacted.length}.`,
+          true
+        );
+        return true;
+      } catch (_ignoredError) {
+        // Try a smaller save below.
+      }
+    }
+    setStatus("Trade history could not be saved in this browser. Download or clear older history to free space.", true);
+    return false;
   }
+}
+
+function compactTradeHistoryForStorage(history, limit) {
+  return (history || []).slice(0, limit).map((item) => {
+    const compact = {
+      id: item.id,
+      timestamp: item.timestamp,
+      replayDate: item.replayDate,
+      mode: item.mode,
+      rank: item.rank,
+      ticker: item.ticker,
+      underlying: item.underlying,
+      bias: item.bias,
+      permission: item.permission,
+      contract: item.contract,
+      symbol: item.symbol,
+      side: item.side,
+      expirationDate: item.expirationDate,
+      strikePrice: item.strikePrice,
+      contractType: item.contractType,
+      entryPrice: item.entryPrice,
+      entrySpot: item.entrySpot,
+      entryGreeks: item.entryGreeks,
+      priceLabel: item.priceLabel,
+      score: item.score,
+      sellPlan: item.sellPlan,
+      outcome: compactOutcome(item.outcome),
+      decisionSnapshot: compactDecisionSnapshot(item.decisionSnapshot),
+    };
+    return compact;
+  });
+}
+
+function compactOutcome(outcome) {
+  if (!outcome) {
+    return outcome;
+  }
+  return {
+    high: outcome.high,
+    high_time: outcome.high_time,
+    high_greeks: outcome.high_greeks,
+    went_up: outcome.went_up,
+    current: outcome.current,
+    source: outcome.source,
+    error: outcome.error,
+  };
+}
+
+function compactDecisionSnapshot(snapshot) {
+  if (!snapshot) {
+    return snapshot;
+  }
+  return {
+    timestamp: snapshot.timestamp,
+    gex: snapshot.gex,
+    technicals: snapshot.technicals
+      ? {
+          lastPrice: snapshot.technicals.lastPrice,
+          vwap: snapshot.technicals.vwap,
+          sma50: snapshot.technicals.sma50,
+          sma200: snapshot.technicals.sma200,
+          scoreAdjustment: snapshot.technicals.scoreAdjustment,
+        }
+      : null,
+    contract: snapshot.contract,
+  };
 }
 
 function loadPaperLedger() {

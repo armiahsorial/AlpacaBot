@@ -120,7 +120,7 @@ class DatabentoSettings:
     equities_dataset: str = DEFAULT_DATABENTO_EQUITIES_DATASET
     equities_fallback: str = "alpaca"
     live_replay_seconds: int = 30
-    live_timeout_seconds: float = 2.0
+    live_timeout_seconds: float = 4.0
 
     @classmethod
     def from_env(cls, env_file: Path | str | None = DEFAULT_ENV_FILE) -> "DatabentoSettings":
@@ -146,7 +146,7 @@ class DatabentoSettings:
                 live_replay_seconds = int(replay_seconds_raw)
             else:
                 live_replay_seconds = int(values.get("DATABENTO_LIVE_REPLAY_MINUTES", "2")) * 60
-            live_timeout_seconds = float(values.get("DATABENTO_LIVE_TIMEOUT_SECONDS", "2"))
+            live_timeout_seconds = float(values.get("DATABENTO_LIVE_TIMEOUT_SECONDS", "4"))
         except ValueError as exc:
             raise ValueError("Databento replay window and timeout must be numbers.") from exc
         if live_replay_seconds <= 0 or live_timeout_seconds <= 0:

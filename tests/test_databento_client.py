@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 
 from trading_bot.databento_client import (
     DatabentoClient,
+    OPTION_PARENT_ROOTS,
     _from_databento_option_symbol,
     _normalize_bar,
     _normalize_contract,
@@ -12,6 +13,10 @@ from trading_bot.config import DatabentoSettings
 
 
 class DatabentoClientTests(unittest.TestCase):
+    def test_index_option_roots_include_weekly_contract_families(self):
+        self.assertEqual(OPTION_PARENT_ROOTS["SPX"], ("SPX", "SPXW"))
+        self.assertEqual(OPTION_PARENT_ROOTS["NDX"], ("NDX", "NDXP"))
+
     def test_translates_occ_symbols_both_directions(self):
         compact = "AAPL260717C00310000"
         raw = _to_databento_option_symbol(compact)
@@ -32,6 +37,18 @@ class DatabentoClientTests(unittest.TestCase):
         self.assertEqual(contract["type"], "put")
         self.assertEqual(contract["expiration_date"], "2026-07-17")
         self.assertEqual(contract["strike_price"], 7610.0)
+
+    def test_definition_past_its_exact_expiration_is_inactive(self):
+        contract = _normalize_contract(
+            {
+                "raw_symbol": "SPX   200117C03300000",
+                "expiration": "2020-01-17T14:30:00+00:00",
+                "strike_price": 3300.0,
+            },
+            "SPX",
+        )
+        self.assertIsNotNone(contract)
+        self.assertEqual(contract["status"], "inactive")
 
     def test_normalizes_nanosecond_bar_prices(self):
         bar = _normalize_bar(

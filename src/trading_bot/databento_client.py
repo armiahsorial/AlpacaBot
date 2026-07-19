@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
@@ -10,6 +11,10 @@ from typing import Any, Iterable
 
 from trading_bot.config import DatabentoSettings
 from trading_bot.market_data import MarketDataClient, MarketDataError
+
+# The macOS PyArrow mimalloc backend has produced intermittent native crashes
+# during Databento frame conversion. This must be set before PyArrow is imported.
+os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
 
 OCC_SYMBOL = re.compile(r"^([A-Z0-9.]+)(\d{6})([CP])(\d{8})$")
 PRICE_SCALE = 1_000_000_000
@@ -25,6 +30,12 @@ OPTION_PARENT_ROOTS = {
     "RUT": ("RUT", "RUTW"),
 }
 AM_SETTLED_INDEX_ROOTS = {"SPX", "NDX", "RUT"}
+WEEKLY_INDEX_ROOTS = {"SPX": "SPXW", "NDX": "NDXP", "RUT": "RUTW"}
+
+# PyArrow's native allocator can crash when multiple threaded HTTP requests
+# fetch and materialize Databento frames concurrently. Serialize that historical
+# path process-wide; live feeds and non-Arrow requests stay parallel.
+_HISTORICAL_CONVERSION_LOCK = Lock()
 
 
 class DatabentoApiError(MarketDataError):
@@ -203,6 +214,39 @@ class DatabentoClient:
             symbol = _from_databento_option_symbol(str(row.get("symbol", "")))
             if symbol in clean_symbols and len(grouped[symbol]) < limit:
                 grouped[symbol].append(_normalize_bar(row))
+
+        # Older signals may have been recorded with the parent index root even
+        # though Databento stores that expiration under its weekly root.
+        aliases = {
+            alias: symbol
+            for symbol in clean_symbols
+            for alias in [_weekly_option_alias(symbol)]
+            if alias is not None
+        }
+        if aliases:
+            alias_rows = self._bar_rows(
+                dataset=self._settings.options_dataset,
+                symbols=[_to_databento_option_symbol(symbol) for symbol in aliases],
+                start=start,
+                end=end,
+                timeframe=timeframe,
+                stype_in="raw_symbol",
+            )
+            alias_grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for row in alias_rows:
+                alias = _from_databento_option_symbol(str(row.get("symbol", "")))
+                requested_symbol = aliases.get(alias)
+                if requested_symbol and len(alias_grouped[requested_symbol]) < limit:
+                    alias_grouped[requested_symbol].append(_normalize_bar(row))
+            for requested_symbol, candidate_bars in alias_grouped.items():
+                exact_bars = grouped.get(requested_symbol, [])
+                exact_latest = max((_row_time(bar) for bar in exact_bars), default=None)
+                alias_latest = max((_row_time(bar) for bar in candidate_bars), default=None)
+                if candidate_bars and (
+                    not exact_bars or
+                    (alias_latest is not None and (exact_latest is None or alias_latest > exact_latest))
+                ):
+                    grouped[requested_symbol] = candidate_bars
         return {symbol: grouped.get(symbol, []) for symbol in clean_symbols}
 
     def _bar_rows(
@@ -242,9 +286,11 @@ class DatabentoClient:
             # Databento does not support raw_symbol -> raw_symbol resolution.
             # Its DBN metadata maps the default instrument_id output back to the
             # requested OCC symbol when the frame is materialized.
-            data = self._historical().timeseries.get_range(**kwargs)
-            frame = data.to_df().reset_index()
-            return [_clean_row(row) for row in frame.to_dict(orient="records")]
+            with _HISTORICAL_CONVERSION_LOCK:
+                data = self._historical().timeseries.get_range(**kwargs)
+                frame = data.to_df().reset_index()
+                records = frame.to_dict(orient="records")
+            return [_clean_row(row) for row in records]
         except Exception as exc:
             raise DatabentoApiError(f"Databento historical request failed: {exc}") from exc
 
@@ -327,6 +373,17 @@ def _from_databento_option_symbol(symbol: str) -> str:
     if len(symbol) >= 15 and " " in symbol[:6]:
         value = f"{symbol[:6].strip()}{symbol[6:]}".upper()
     return value.replace(" ", "")
+
+
+def _weekly_option_alias(symbol: str) -> str | None:
+    match = OCC_SYMBOL.fullmatch(_clean_symbol(symbol))
+    if not match:
+        return None
+    root, expiration, side, strike = match.groups()
+    weekly_root = WEEKLY_INDEX_ROOTS.get(root)
+    if weekly_root is None:
+        return None
+    return f"{weekly_root}{expiration}{side}{strike}"
 
 
 def _normalize_contract(row: dict[str, Any], underlying: str) -> dict[str, Any] | None:

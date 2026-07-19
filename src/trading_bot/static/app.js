@@ -69,7 +69,10 @@ let daySimulationStopRequested = false;
 const replayOutcomeCache = new Map();
 const REPLAY_FETCH_STEP_SECONDS = 60;
 const DAY_SIMULATION_STEP_SECONDS = 15 * 60;
-const REPLAY_MIN_FETCH_INTERVAL_MS = 5000;
+// Price outcomes can advance from cached minute bars, but GEX and contract
+// replay calls still use external providers. Keep those calls rate-limited
+// independently of the selected playback speed.
+const REPLAY_MIN_FETCH_INTERVAL_MS = 15000;
 const TRADE_HISTORY_STORAGE_KEY = "tradingBot.tradePermissionHistory";
 const PAPER_LEDGER_STORAGE_KEY = "tradingBot.paperSimulationLedger";
 const TICKER_GROUPS_STORAGE_KEY = "tradingBot.tickerGroups";
@@ -317,6 +320,31 @@ replayTime.addEventListener("change", async () => {
   stopLiveMode();
   renderTradeHistory();
   await loadOptionReplay({ force: true });
+});
+
+replayClock.addEventListener("change", async () => {
+  const typedSeconds = parseClock(replayClock.value);
+  if (typedSeconds === null) {
+    updateReplayClock();
+    return;
+  }
+  stopLiveMode();
+  stopReplay();
+  clearReplayScrubTimer();
+  replayTime.value = String(Math.min(
+    Math.max(typedSeconds, Number(replayTime.min)),
+    Number(replayTime.max)
+  ));
+  lastReplayFetchSecond = null;
+  updateReplayClock();
+  renderTradeHistory();
+  await loadOptionReplay({ force: true });
+});
+
+replayClock.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    replayClock.blur();
+  }
 });
 
 replayPlay.addEventListener("click", () => {
@@ -1278,7 +1306,7 @@ function showReplayError(error) {
   }
 }
 
-async function loadOptionReplay({ force = false } = {}) {
+async function loadOptionReplay({ force = false, refreshHistory = true } = {}) {
   updateReplayClock();
   if (replayDate.value === currentHostDate()) {
     stopReplay();
@@ -1286,7 +1314,7 @@ async function loadOptionReplay({ force = false } = {}) {
     fields.contractSummary.classList.remove("error");
     fields.contractSummary.textContent = "Today uses live GEX and Alpaca data instead of historical replay files.";
     await runAnalysis();
-    setStatus(`Live data updated for today at ${replayClock.textContent} ${hostTimeZoneLabel()}.`, false);
+    setStatus(`Live data updated for today at ${replayClock.value} ${hostTimeZoneLabel()}.`, false);
     return;
   }
 
@@ -1299,7 +1327,7 @@ async function loadOptionReplay({ force = false } = {}) {
     lastReplayFetchSecond !== null &&
     Math.abs(replaySecond - lastReplayFetchSecond) < REPLAY_FETCH_STEP_SECONDS
   ) {
-    fields.contractSummary.textContent = `Clock updated to ${replayClock.textContent} ${hostTimeZoneLabel()}. Values refresh on the next available one-minute bar.`;
+    fields.contractSummary.textContent = `Clock updated to ${replayClock.value} ${hostTimeZoneLabel()}. Values refresh on the next available one-minute bar.`;
     return;
   }
   if (!force && now - lastReplayFetchStartedAt < REPLAY_MIN_FETCH_INTERVAL_MS) {
@@ -1335,8 +1363,8 @@ async function loadOptionReplay({ force = false } = {}) {
       throw new Error(replayErrorMessage(errors));
     }
     lastReplayFetchSecond = replaySecond;
-    const renderedHistory = renderOptionReplays(payloads, errors);
-    if (!renderedHistory) {
+    const renderedHistory = renderOptionReplays(payloads, errors, { refreshHistory });
+    if (!renderedHistory && refreshHistory) {
       renderTradeHistory();
     }
   } catch (error) {
@@ -1366,7 +1394,7 @@ function scheduleReplayScrubRefresh() {
     return;
   }
   fields.contractSummary.classList.remove("error");
-  fields.contractSummary.textContent = `Loading ${replayDate.value} at ${replayClock.textContent} ${hostTimeZoneLabel()}...`;
+  fields.contractSummary.textContent = `Loading ${replayDate.value} at ${replayClock.value} ${hostTimeZoneLabel()}...`;
   replayScrubTimer = setTimeout(async () => {
     replayScrubTimer = null;
     stopLiveMode();
@@ -1436,7 +1464,7 @@ async function runDaySimulation() {
       replayTime.value = String(second);
       updateReplayClock();
       setDaySimulationStatus(
-        `Replaying ${simulationTickers.join(", ")} at ${replayClock.textContent} ${hostTimeZoneLabel()} (${index + 1} of ${checkpoints.length})...`,
+        `Replaying ${simulationTickers.join(", ")} at ${replayClock.value} ${hostTimeZoneLabel()} (${index + 1} of ${checkpoints.length})...`,
         false
       );
       const { payloads, errors } = await loadOptionReplaysForTickers(simulationTickers, period);
@@ -1503,7 +1531,7 @@ function renderOptionReplay(payload) {
   renderOptionReplays([payload], []);
 }
 
-function renderOptionReplays(payloads, errors = []) {
+function renderOptionReplays(payloads, errors = [], { refreshHistory = true } = {}) {
   return withViewportAnchor(() => {
     const primary = payloads[0];
     if (primary?.analysis) {
@@ -1518,7 +1546,7 @@ function renderOptionReplays(payloads, errors = []) {
       ticker: payload.analysis?.ticker || payload.recommendation?.ticker || "Unknown",
       payload: payload.analysis,
     })).concat(errors.map((error) => ({ ticker: error.ticker, error: error.message }))));
-    setStatus(`Replay maps updated for ${payloads.length} ticker${payloads.length === 1 ? "" : "s"} at ${replayClock.textContent} ${hostTimeZoneLabel()}.`, false);
+    setStatus(`Replay maps updated for ${payloads.length} ticker${payloads.length === 1 ? "" : "s"} at ${replayClock.value} ${hostTimeZoneLabel()}.`, false);
 
     const summaries = payloads.map((payload) => {
       const recommendation = payload.recommendation || {};
@@ -1529,13 +1557,13 @@ function renderOptionReplays(payloads, errors = []) {
       summaries.push(...errors.map((error) => `${error.ticker}: unavailable`));
     }
     fields.contractSummary.classList.toggle("error", payloads.length === 0);
-    fields.contractSummary.textContent = `${primary?.date || replayDate.value} ${replayClock.textContent} ${hostTimeZoneLabel()} | ${summaries.join(" | ")}`;
+    fields.contractSummary.textContent = `${primary?.date || replayDate.value} ${replayClock.value} ${hostTimeZoneLabel()} | ${summaries.join(" | ")}`;
 
     let recorded = false;
     for (const payload of payloads) {
       recorded = recordPayloadTradePermission(payload, "replay", { render: false }) || recorded;
     }
-    if (recorded) {
+    if (recorded && refreshHistory) {
       renderTradeHistory({ preserveScroll: false });
     }
     const bestPayload = selectBestPayload(payloads, "replay");
@@ -1597,7 +1625,7 @@ function initializeMarketMode() {
   if (market.isOpen) {
     isInspectingContract = false;
     startLiveMode();
-    setStatus(`Market is open. Auto Live started at ${replayClock.textContent} ${hostTimeZoneLabel()}.`, false);
+    setStatus(`Market is open. Auto Live started at ${replayClock.value} ${hostTimeZoneLabel()}.`, false);
     return;
   }
 
@@ -1639,7 +1667,7 @@ function formatDateInput(date) {
 
 function updateReplayClock() {
   const seconds = Number(replayTime.value || 46740);
-  replayClock.textContent = formatClock(seconds);
+  replayClock.value = formatClock(seconds);
   if (replayTimezone) {
     replayTimezone.textContent = hostTimeZoneLabel();
   }
@@ -1682,11 +1710,11 @@ async function jumpToTodayNow() {
   if (market.isOpen) {
     isInspectingContract = false;
     await runAnalysis();
-    setStatus(`Live view updated to today at ${replayClock.textContent} ${hostTimeZoneLabel()}.`, false);
+    setStatus(`Live view updated to today at ${replayClock.value} ${hostTimeZoneLabel()}.`, false);
     return;
   }
 
-  setStatus(`Market is outside regular hours. Showing the nearest session point for ${marketDate} at ${replayClock.textContent} ${hostTimeZoneLabel()}.`, false);
+  setStatus(`Market is outside regular hours. Showing the nearest session point for ${marketDate} at ${replayClock.value} ${hostTimeZoneLabel()}.`, false);
   await loadOptionReplay({ force: true });
 }
 
@@ -1763,25 +1791,27 @@ function toggleReplay() {
 
   stopLiveMode();
   isInspectingContract = true;
-  updatePlaybackButton();
   replayTimer = setInterval(() => {
-    if (isReplayLoading) {
-      const nextValue = Math.min(Number(replayTime.value) + replaySpeed, Number(replayTime.max));
-      replayTime.value = String(nextValue);
-      updateReplayClock();
-      return;
-    }
     const previousValue = Number(replayTime.value);
     const nextValue = Math.min(previousValue + replaySpeed, Number(replayTime.max));
     replayTime.value = String(nextValue);
     updateReplayClock();
-    if (Math.floor(previousValue / REPLAY_FETCH_STEP_SECONDS) !== Math.floor(nextValue / REPLAY_FETCH_STEP_SECONDS)) {
-      loadOptionReplay();
+    const crossedMinute = Math.floor(previousValue / REPLAY_FETCH_STEP_SECONDS) !==
+      Math.floor(nextValue / REPLAY_FETCH_STEP_SECONDS);
+    if (crossedMinute) {
+      // Historical outcome rows are SQLite-backed after their first contract
+      // load, so update them at every simulated minute independently of the
+      // slower GEX/contract replay request.
+      renderTradeHistory();
+      if (!isReplayLoading) {
+        loadOptionReplay({ refreshHistory: false });
+      }
     }
     if (nextValue >= Number(replayTime.max)) {
       toggleReplay();
     }
   }, 1000);
+  updatePlaybackButton();
 }
 
 function stopReplay() {
@@ -1802,6 +1832,20 @@ function formatClock(totalSeconds) {
   const minute = Math.floor((totalSeconds % 3600) / 60);
   const second = totalSeconds % 60;
   return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:${String(second).padStart(2, "0")}`;
+}
+
+function parseClock(value) {
+  const match = String(value || "").match(/^(\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!match) {
+    return null;
+  }
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  const second = Number(match[3] || 0);
+  if (hour > 23 || minute > 59 || second > 59) {
+    return null;
+  }
+  return hour * 3600 + minute * 60 + second;
 }
 
 function renderOptionRecommendation(payload) {
@@ -1951,7 +1995,7 @@ function createTickerCandidateRow(candidate, mode, rank) {
       candidate,
       price,
       replay
-        ? `Staged ${candidate.symbol} from replay at ${replayClock.textContent} ${hostTimeZoneLabel()}.`
+        ? `Staged ${candidate.symbol} from replay at ${replayClock.value} ${hostTimeZoneLabel()}.`
         : `Staged ${candidate.symbol} as a paper limit order.`
     );
   });
@@ -2247,7 +2291,7 @@ function renderTradeHistory({ preserveScroll = true, refreshData = true } = {}) 
       return;
     }
     fields.tradeHistory.textContent = selectedDate
-      ? `No trade-permission picks recorded by ${replayClock.textContent} ${hostTimeZoneLabel()} on ${formatContractDate(selectedDate)}.`
+      ? `No trade-permission picks recorded by ${replayClock.value} ${hostTimeZoneLabel()} on ${formatContractDate(selectedDate)}.`
       : "No trade-permission picks yet.";
     return;
   }
@@ -2399,7 +2443,7 @@ function createTradeHistoryRow(item) {
     <span class="history-pill">Score ${formatOptionalNumber(item.score)}</span>
     <span class="history-stat"><i>Recorded</i><strong>${formatCurrency(item.entryPrice)}</strong></span>
     <span class="history-stat history-high-stat"><i class="history-high-label">Highest after buy</i><strong class="history-high">Loading...</strong><em class="history-high-time">-</em><em class="history-high-greeks">-</em></span>
-    <span class="history-stat"><i>Current</i><strong class="history-current">Loading...</strong><em class="history-current-time">-</em></span>
+    <span class="history-stat history-current-stat"><i>Last traded</i><strong class="history-current">Loading...</strong><em class="history-current-time">-</em></span>
     <span class="history-stat"><i>Change</i><strong class="history-change">-</strong></span>
     <span class="history-stat"><i>Exit</i><strong class="history-exit">Checking...</strong></span>
   `;
@@ -3166,8 +3210,12 @@ async function fetchTradeHistoryOutcomes(history, replayPoint = null) {
       pendingEntries.push(entry);
     }
   }
-  for (let index = 0; index < pendingEntries.length; index += 100) {
-    const batch = pendingEntries.slice(index, index + 100);
+  // One historical ticker can contain hundreds of repeated confirmations but
+  // usually only a few dozen contracts. Keep them together so the backend can
+  // deduplicate symbols and load each completed-day series once.
+  const outcomeBatchSize = replayPoint ? 1000 : 100;
+  for (let index = 0; index < pendingEntries.length; index += outcomeBatchSize) {
+    const batch = pendingEntries.slice(index, index + outcomeBatchSize);
     const payload = await postJsonWithRetry("/api/options/outcomes", { entries: batch }, 3);
     Object.assign(outcomes, payload.outcomes || {});
     if (cacheMinute) {
@@ -3252,9 +3300,12 @@ function renderHistoryOutcome(row, outcome, item = null) {
   if (currentEl && changeEl && current !== null) {
     currentEl.textContent = formatCurrency(current);
     if (currentTimeEl) {
+      const ageLabel = formatBarAge(outcome.current_age_seconds);
+      const staleLabel = outcome.current_is_stale ? "stale · " : "";
       currentTimeEl.textContent = outcome.current_time
-        ? `Bar ${formatOutcomeTimestamp(outcome.current_time)}`
-        : "Latest available bar";
+        ? `${formatOutcomeTimestamp(outcome.current_time)}${ageLabel ? ` · ${staleLabel}${ageLabel}` : ""}`
+        : "Latest available trade";
+      currentTimeEl.classList.toggle("stale", Boolean(outcome.current_is_stale));
     }
     if (entryPrice) {
       const change = (current - entryPrice) / entryPrice;
@@ -3273,6 +3324,19 @@ function renderHistoryOutcome(row, outcome, item = null) {
     exitEl.classList.toggle("positive", exitPlan.className === "positive");
     exitEl.classList.toggle("negative", exitPlan.className === "negative");
   }
+}
+
+function formatBarAge(value) {
+  const seconds = optionalNumber(value);
+  if (seconds === null || seconds < 0) {
+    return "";
+  }
+  if (seconds < 60) {
+    return `${Math.round(seconds)}s old`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainder = Math.round(seconds % 60);
+  return remainder ? `${minutes}m ${remainder}s old` : `${minutes}m old`;
 }
 
 function formatOutcomeTimestamp(value) {
@@ -3555,6 +3619,9 @@ function compactOutcome(outcome) {
     high_greeks: outcome.high_greeks,
     went_up: outcome.went_up,
     current: outcome.current,
+    current_time: outcome.current_time,
+    current_age_seconds: outcome.current_age_seconds,
+    current_is_stale: outcome.current_is_stale,
     source: outcome.source,
     error: outcome.error,
   };

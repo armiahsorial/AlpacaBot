@@ -1,4 +1,6 @@
 import unittest
+from threading import Barrier, Lock, Thread
+from time import sleep
 from unittest.mock import MagicMock
 
 from trading_bot.databento_client import (
@@ -8,6 +10,7 @@ from trading_bot.databento_client import (
     _normalize_bar,
     _normalize_contract,
     _to_databento_option_symbol,
+    _weekly_option_alias,
 )
 from trading_bot.config import DatabentoSettings
 
@@ -22,6 +25,67 @@ class DatabentoClientTests(unittest.TestCase):
         raw = _to_databento_option_symbol(compact)
         self.assertEqual(raw, "AAPL  260717C00310000")
         self.assertEqual(_from_databento_option_symbol(raw), compact)
+
+    def test_maps_legacy_index_contracts_to_weekly_roots(self):
+        self.assertEqual(
+            _weekly_option_alias("SPX260717P07320000"),
+            "SPXW260717P07320000",
+        )
+        self.assertEqual(
+            _weekly_option_alias("NDX260717C29140000"),
+            "NDXP260717C29140000",
+        )
+        self.assertIsNone(_weekly_option_alias("QQQ260717P00707000"))
+
+    def test_option_bars_fall_back_to_weekly_index_root(self):
+        client = DatabentoClient(DatabentoSettings(api_key="key"))
+        client._bar_rows = MagicMock(side_effect=[
+            [],
+            [{
+                "symbol": "SPXW260717P07320000",
+                "t": "2026-07-16T19:49:00Z",
+                "open": 670_000_000,
+                "high": 690_000_000,
+                "low": 650_000_000,
+                "close": 670_000_000,
+                "volume": 173,
+            }],
+        ])
+
+        bars = client.get_option_bars(
+            ["SPX260717P07320000"],
+            start="2026-07-16T19:48:10Z",
+            end="2026-07-16T20:00:00Z",
+        )
+
+        self.assertEqual(bars["SPX260717P07320000"][0]["c"], 0.67)
+        self.assertEqual(client._bar_rows.call_count, 2)
+        alias_request = client._bar_rows.call_args_list[1].kwargs["symbols"]
+        self.assertEqual(alias_request, ["SPXW  260717P07320000"])
+
+    def test_option_bars_prefer_weekly_series_when_exact_series_is_stale(self):
+        client = DatabentoClient(DatabentoSettings(api_key="key"))
+        client._bar_rows = MagicMock(side_effect=[
+            [{
+                "symbol": "SPX260717P07320000",
+                "t": "2026-07-16T18:25:00Z",
+                "close": 400_000_000,
+            }],
+            [{
+                "symbol": "SPXW260717P07320000",
+                "t": "2026-07-16T19:59:00Z",
+                "close": 250_000_000,
+            }],
+        ])
+
+        bars = client.get_option_bars(
+            ["SPX260717P07320000"],
+            start="2026-07-16T13:30:00Z",
+            end="2026-07-16T20:00:00Z",
+        )
+
+        self.assertEqual(bars["SPX260717P07320000"][0]["t"], "2026-07-16T19:59:00Z")
+        self.assertEqual(bars["SPX260717P07320000"][0]["c"], 0.25)
 
     def test_normalizes_definition_to_existing_contract_shape(self):
         contract = _normalize_contract(
@@ -109,6 +173,50 @@ class DatabentoClientTests(unittest.TestCase):
         kwargs = historical.timeseries.get_range.call_args.kwargs
         self.assertEqual(kwargs["stype_in"], "raw_symbol")
         self.assertNotIn("stype_out", kwargs)
+
+    def test_historical_frame_materialization_is_serialized(self):
+        client = DatabentoClient(DatabentoSettings(api_key="key"))
+        historical = MagicMock()
+        client._historical_client = historical
+        barrier = Barrier(3)
+        state_lock = Lock()
+        active = 0
+        max_active = 0
+
+        def get_range(**kwargs):
+            del kwargs
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            sleep(0.02)
+            with state_lock:
+                active -= 1
+            data = MagicMock()
+            data.to_df.return_value.reset_index.return_value.to_dict.return_value = []
+            return data
+
+        historical.timeseries.get_range.side_effect = get_range
+
+        def request_rows():
+            barrier.wait()
+            client._historical_rows(
+                dataset="OPRA.PILLAR",
+                schema="ohlcv-1m",
+                symbols=["NDXP 260717C29140000"],
+                stype_in="raw_symbol",
+                start="2026-07-17T16:00:00Z",
+                end="2026-07-17T17:00:00Z",
+            )
+
+        threads = [Thread(target=request_rows) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(max_active, 1)
 
 
 if __name__ == "__main__":

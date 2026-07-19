@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class TradingBotStorage:
@@ -32,6 +32,7 @@ class TradingBotStorage:
 
     def initialize(self) -> None:
         with self._connect() as connection:
+            previous_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(
                 """
@@ -91,6 +92,21 @@ class TradingBotStorage:
                     ON historical_option_bars(session_date, symbol);
                 """
             )
+            if previous_version < 3:
+                # Version 3 resolves legacy parent-root index symbols to their
+                # Databento weekly series. Remove older ambiguous cached bars
+                # once so they can be fetched again with the corrected mapping.
+                connection.execute(
+                    """
+                    DELETE FROM historical_option_bars
+                    WHERE provider = 'DATABENTO'
+                      AND (
+                        symbol GLOB 'SPX[0-9]*' OR
+                        symbol GLOB 'NDX[0-9]*' OR
+                        symbol GLOB 'RUT[0-9]*'
+                      )
+                    """
+                )
             connection.execute(
                 "INSERT INTO metadata(key, value) VALUES('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",

@@ -370,8 +370,8 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             entries = payload.get("entries")
             if not isinstance(entries, list) or not entries:
                 raise ValueError("entries are required.")
-            if len(entries) > 100:
-                raise ValueError("At most 100 option entries can be evaluated at once.")
+            if len(entries) > 1000:
+                raise ValueError("At most 1,000 option entries can be evaluated at once.")
             outcomes = _option_outcomes(_market_data_client(), entries, option_bar_cache=_storage())
             self._send_json({"outcomes": outcomes})
         except (MarketDataError, ValueError) as exc:
@@ -728,6 +728,11 @@ def _outcome_for_entry(
     high_time = _bar_datetime(high_bar)
     low_time = _bar_datetime(low_bar)
     current_time = _bar_datetime(latest_bar)
+    current_age_seconds = (
+        max(0, int((entry["end_dt"] - current_time).total_seconds()))
+        if current_time is not None
+        else None
+    )
     return {
         "high": high_price,
         "high_time": high_time.isoformat() if high_time else None,
@@ -737,6 +742,8 @@ def _outcome_for_entry(
         "low_greeks": _estimate_outcome_greeks(entry, low_price, low_time, stock_bars),
         "current": current_price,
         "current_time": current_time.isoformat() if current_time else None,
+        "current_age_seconds": current_age_seconds,
+        "current_is_stale": current_age_seconds is not None and current_age_seconds > 120,
         "went_up": went_up,
         "source": "market-data option bars",
     }

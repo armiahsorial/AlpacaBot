@@ -1277,6 +1277,10 @@ button:disabled {
   line-height: 1.15;
 }
 
+.history-current-time.stale {
+  color: #f2bd54 !important;
+}
+
 .live-controls {
   display: grid;
   grid-template-columns: auto minmax(110px, 150px) minmax(180px, 1fr);
@@ -1317,13 +1321,17 @@ button:disabled {
   min-width: 180px;
 }
 
-.replay-controls strong {
+.replay-controls #replay-clock {
   display: block;
+  width: 100%;
   height: 40px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: #061018;
+  color: var(--text);
   padding: 10px 8px;
+  font: inherit;
+  font-weight: 850;
   text-align: center;
   font-variant-numeric: tabular-nums;
   line-height: 18px;

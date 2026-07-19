@@ -38,6 +38,19 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("const REPLAY_FETCH_STEP_SECONDS = 60", javascript)
         self.assertIn("function scheduleReplayScrubRefresh()", javascript)
         self.assertIn("function historyItemVisibleAtReplayPoint(item, selectedDate, replayPoint = null)", javascript)
+        self.assertIn('id="replay-clock" type="time" step="1"', html)
+        self.assertIn("function parseClock(value)", javascript)
+        self.assertIn("replayTime.value = String(Math.min(", javascript)
+
+    def test_replay_updates_historical_rows_at_selected_speed(self):
+        javascript = (STATIC_DIR / "app.js").read_text()
+
+        self.assertIn("const nextValue = Math.min(previousValue + replaySpeed", javascript)
+        self.assertIn("if (crossedMinute) {", javascript)
+        self.assertIn("renderTradeHistory();", javascript)
+        self.assertIn("loadOptionReplay({ refreshHistory: false })", javascript)
+        self.assertIn("renderOptionReplays(payloads, errors, { refreshHistory })", javascript)
+        self.assertIn("const REPLAY_MIN_FETCH_INTERVAL_MS = 15000", javascript)
         self.assertIn("function getReplayPoint()", javascript)
 
     def test_frontend_uses_sticky_watchlist_and_fast_replay_updates(self):
@@ -123,9 +136,18 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("if (selectedDate && selectedDate !== currentHostDate())", javascript)
         self.assertIn("const mergedOutcomes = replayPoint ? outcomes", javascript)
         self.assertIn("as_of_iso: replayPoint?.iso || null", javascript)
+        self.assertIn("const outcomeBatchSize = replayPoint ? 1000 : 100", javascript)
         self.assertIn('class="history-current-time"', javascript)
+        self.assertIn('<i>Last traded</i>', javascript)
+        self.assertIn('const staleLabel = outcome.current_is_stale ? "stale · " : "";', javascript)
         self.assertIn("function postJsonWithRetry", javascript)
         self.assertIn("Historical replay unavailable after retry", javascript)
+
+    def test_option_outcome_endpoint_supports_large_historical_ticker_groups(self):
+        source = (STATIC_DIR.parent / "web_app.py").read_text()
+
+        self.assertIn("if len(entries) > 1000:", source)
+        self.assertIn("At most 1,000 option entries can be evaluated at once.", source)
 
     def test_handle_analyze_returns_analysis_json(self):
         handler = _handler()
@@ -433,6 +455,8 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(outcomes["ndx-signal"]["high"], 4.99)
         self.assertEqual(outcomes["ndx-signal"]["current"], 4.50)
         self.assertEqual(outcomes["ndx-signal"]["current_time"], "2026-07-17T12:52:00-04:00")
+        self.assertEqual(outcomes["ndx-signal"]["current_age_seconds"], 6)
+        self.assertFalse(outcomes["ndx-signal"]["current_is_stale"])
         self.assertEqual(outcomes["spx-signal"]["high"], 5.25)
         self.assertEqual(outcomes["spx-signal"]["current"], 5.00)
 

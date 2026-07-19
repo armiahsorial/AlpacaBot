@@ -25,6 +25,34 @@ class WebAppTests(unittest.TestCase):
         self.assertIn('Math.max(15, Number(liveInterval.value || 15))', javascript)
         self.assertIn('return selected.length > 0 ? [...new Set(selected)] : ["SPX"]', javascript)
 
+    def test_frontend_uses_compact_local_time_replay_controls(self):
+        html = (STATIC_DIR / "index.html").read_text()
+        javascript = (STATIC_DIR / "app.js").read_text()
+
+        self.assertIn("<h1>Trading Bot</h1>", html)
+        self.assertIn('<option value="1000" selected>$1,000</option>', html)
+        self.assertNotIn('id="live-update"', html)
+        self.assertIn('id="tracking-overview-rows"', html)
+        self.assertIn('const TRACKING_HISTORY_STORAGE_KEY = "tradingBot.trackedTickersByDate"', javascript)
+        self.assertIn("function hostMarketWindow(dateValue)", javascript)
+        self.assertIn("const REPLAY_FETCH_STEP_SECONDS = 60", javascript)
+        self.assertIn("function scheduleReplayScrubRefresh()", javascript)
+        self.assertIn("function historyItemVisibleAtReplayPoint(item, selectedDate, replayPoint = null)", javascript)
+        self.assertIn("function getReplayPoint()", javascript)
+
+    def test_frontend_uses_sticky_watchlist_and_fast_replay_updates(self):
+        html = (STATIC_DIR / "index.html").read_text()
+        javascript = (STATIC_DIR / "app.js").read_text()
+        stylesheet = (STATIC_DIR / "styles.css").read_text()
+
+        self.assertIn('class="watchlist-sidebar"', html)
+        self.assertIn('class="watchlist-main"', html)
+        self.assertIn("position: sticky", stylesheet)
+        self.assertIn(".history-high-label", stylesheet)
+        self.assertIn("const replayOutcomeCache = new Map()", javascript)
+        self.assertIn("Promise.allSettled([outcomeUpdate, updateTradeHistoryPrices(history)])", javascript)
+        self.assertIn("}, 300);", javascript)
+
     def test_frontend_uses_confirmed_market_exit_rules_without_fixed_cash_simulation(self):
         html = (STATIC_DIR / "index.html").read_text()
         javascript = (STATIC_DIR / "app.js").read_text()
@@ -64,6 +92,40 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("function compactTradeHistoryForStorage(history, limit)", javascript)
         self.assertIn("function compactDecisionSnapshot(snapshot)", javascript)
         self.assertNotIn('fields.tradeHistory.textContent = "Trade history could not be saved in this browser."', javascript)
+
+    def test_frontend_hydrates_and_syncs_sqlite_storage(self):
+        javascript = (STATIC_DIR / "app.js").read_text()
+
+        self.assertIn('getJson("/api/storage/snapshot")', javascript)
+        self.assertIn('postJson("/api/storage/sync"', javascript)
+        self.assertIn('postJson("/api/storage/delete-day"', javascript)
+        self.assertIn("function mergePersistentRecords", javascript)
+        self.assertIn("initializePersistentStorage();", javascript)
+
+    def test_historical_trade_history_is_grouped_by_recorded_ticker(self):
+        javascript = (STATIC_DIR / "app.js").read_text()
+        stylesheet = (STATIC_DIR / "styles.css").read_text()
+
+        self.assertIn("(isHistoricalDay || matchesTickerFilter(item, selectedTickers))", javascript)
+        self.assertIn("function renderHistoricalTickerGroups", javascript)
+        self.assertIn("function historicalTickerSummaryMarkup", javascript)
+        self.assertIn("function createTradeHistoryRow", javascript)
+        self.assertIn('group.className = "history-ticker-group"', javascript)
+        self.assertIn(".history-ticker-group > summary", stylesheet)
+        self.assertIn('getJson(`/api/storage/history?date=${encodeURIComponent(day)}`)', javascript)
+        self.assertIn("function historicalTradeHistoryForDate", javascript)
+        self.assertIn("function historicalPaperLedgerForDate", javascript)
+        self.assertIn('class="history-high-time"', javascript)
+        self.assertIn("function formatOutcomeTimestamp", javascript)
+        self.assertIn("historyOutcomeRequestVersions", javascript)
+        self.assertGreaterEqual(javascript.count("if (!item) {\n        continue;"), 2)
+        self.assertIn("A live snapshot here would overwrite that", javascript)
+        self.assertIn("if (selectedDate && selectedDate !== currentHostDate())", javascript)
+        self.assertIn("const mergedOutcomes = replayPoint ? outcomes", javascript)
+        self.assertIn("as_of_iso: replayPoint?.iso || null", javascript)
+        self.assertIn('class="history-current-time"', javascript)
+        self.assertIn("function postJsonWithRetry", javascript)
+        self.assertIn("Historical replay unavailable after retry", javascript)
 
     def test_handle_analyze_returns_analysis_json(self):
         handler = _handler()
@@ -304,6 +366,75 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(outcome["current"], 9.5)
         self.assertEqual(outcome["source"], "saved intraday path fallback")
         self.assertEqual(outcome["high_greeks"]["delta"], 0.4)
+
+    def test_option_outcomes_stops_at_selected_replay_time(self):
+        alpaca = MagicMock()
+        alpaca.get_option_bars.return_value = {
+            "AAPL260710C00100000": [
+                {"t": "2026-07-10T14:30:00Z", "h": 2.6, "l": 2.1, "c": 2.4},
+                {"t": "2026-07-10T15:00:00Z", "h": 4.2, "l": 3.8, "c": 4.0},
+                {"t": "2026-07-10T16:00:00Z", "h": 8.0, "l": 7.5, "c": 7.8},
+            ]
+        }
+        alpaca.get_stock_bars.return_value = []
+
+        outcomes = _option_outcomes(
+            alpaca,
+            [{
+                "id": "signal-as-of",
+                "symbol": "AAPL260710C00100000",
+                "date": "2026-07-10",
+                "timestamp_iso": "2026-07-10T14:30:00Z",
+                "as_of_time": "11:00:00",
+                "entry_price": 2.4,
+            }],
+        )
+
+        self.assertEqual(outcomes["signal-as-of"]["high"], 4.2)
+        self.assertEqual(outcomes["signal-as-of"]["current"], 4.0)
+
+    def test_option_outcomes_uses_exact_replay_instant_for_every_symbol(self):
+        alpaca = MagicMock()
+        alpaca.get_option_bars.return_value = {
+            "NDXP260717C29140000": [
+                {"t": "2026-07-17T16:21:00Z", "h": 2.50, "l": 2.10, "c": 2.32},
+                {"t": "2026-07-17T16:52:00Z", "h": 4.99, "l": 4.20, "c": 4.50},
+                {"t": "2026-07-17T17:10:00Z", "h": 6.00, "l": 5.20, "c": 5.80},
+            ],
+            "SPXW260717C07500000": [
+                {"t": "2026-07-17T16:31:00Z", "h": 3.20, "l": 2.80, "c": 3.00},
+                {"t": "2026-07-17T16:52:00Z", "h": 5.25, "l": 4.70, "c": 5.00},
+            ],
+        }
+        alpaca.get_stock_bars.return_value = []
+
+        entries = [
+            {
+                "id": "ndx-signal",
+                "symbol": "NDXP260717C29140000",
+                "date": "2026-07-17",
+                "timestamp_iso": "2026-07-17T16:00:00Z",
+                "as_of_time": "09:31:00",
+                "as_of_iso": "2026-07-17T16:52:06Z",
+                "entry_price": 3.18,
+            },
+            {
+                "id": "spx-signal",
+                "symbol": "SPXW260717C07500000",
+                "date": "2026-07-17",
+                "timestamp_iso": "2026-07-17T16:00:00Z",
+                "as_of_iso": "2026-07-17T16:52:06Z",
+                "entry_price": 3.00,
+            },
+        ]
+
+        outcomes = _option_outcomes(alpaca, entries)
+
+        self.assertEqual(outcomes["ndx-signal"]["high"], 4.99)
+        self.assertEqual(outcomes["ndx-signal"]["current"], 4.50)
+        self.assertEqual(outcomes["ndx-signal"]["current_time"], "2026-07-17T12:52:00-04:00")
+        self.assertEqual(outcomes["spx-signal"]["high"], 5.25)
+        self.assertEqual(outcomes["spx-signal"]["current"], 5.00)
 
     def test_option_outcomes_returns_row_error_without_bars_or_fallback(self):
         alpaca = MagicMock()

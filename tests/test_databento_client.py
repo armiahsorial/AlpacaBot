@@ -91,6 +91,25 @@ class DatabentoClientTests(unittest.TestCase):
             limit=10000,
         )
 
+    def test_historical_requests_do_not_force_unsupported_raw_to_raw_mapping(self):
+        client = DatabentoClient(DatabentoSettings(api_key="key"))
+        historical = MagicMock()
+        historical.timeseries.get_range.return_value.to_df.return_value.reset_index.return_value.to_dict.return_value = []
+        client._historical_client = historical
+
+        client._historical_rows(
+            dataset="OPRA.PILLAR",
+            schema="ohlcv-1m",
+            symbols=["AMD   260717C00487500"],
+            stype_in="raw_symbol",
+            start="2026-07-17T15:23:37Z",
+            end="2026-07-17T20:00:00Z",
+        )
+
+        kwargs = historical.timeseries.get_range.call_args.kwargs
+        self.assertEqual(kwargs["stype_in"], "raw_symbol")
+        self.assertNotIn("stype_out", kwargs)
+
 
 if __name__ == "__main__":
     unittest.main()

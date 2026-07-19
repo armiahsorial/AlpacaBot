@@ -86,6 +86,24 @@ history, such as VWAP and the 50-day/200-day moving averages.
 
 Environment variables from your shell override values in `.env`.
 
+### Local history database
+
+The web app automatically creates `data/trading_bot.sqlite3` and stores trade
+permissions, paper-ledger positions, and tracked tickers there. Existing browser
+history is imported on first load and remains in the browser as a fallback.
+
+To use another location, set:
+
+```env
+TRADING_BOT_DB_PATH=/absolute/path/to/trading_bot.sqlite3
+```
+
+The database can be inspected with a SQLite desktop viewer or from the terminal:
+
+```bash
+sqlite3 data/trading_bot.sqlite3
+```
+
 ## Usage
 
 Print all supported ticker groups:

@@ -239,7 +239,10 @@ class DatabentoClient:
 
     def _historical_rows(self, **kwargs: Any) -> list[dict[str, Any]]:
         try:
-            data = self._historical().timeseries.get_range(stype_out="raw_symbol", **kwargs)
+            # Databento does not support raw_symbol -> raw_symbol resolution.
+            # Its DBN metadata maps the default instrument_id output back to the
+            # requested OCC symbol when the frame is materialized.
+            data = self._historical().timeseries.get_range(**kwargs)
             frame = data.to_df().reset_index()
             return [_clean_row(row) for row in frame.to_dict(orient="records")]
         except Exception as exc:

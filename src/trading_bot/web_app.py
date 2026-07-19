@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import date, datetime, time, timedelta
 from functools import lru_cache
 from http import HTTPStatus
@@ -18,6 +19,7 @@ from trading_bot.gex_client import AGGREGATION_PERIODS, GexApiError, GexClient
 from trading_bot.market_data import MarketDataClient, MarketDataError, create_market_data_client
 from trading_bot.options_analysis import _black_scholes_delta, _black_scholes_gamma, _solve_implied_volatility, recommend_option_contracts
 from trading_bot.options_replay import replay_option_recommendation
+from trading_bot.storage import TradingBotStorage
 from trading_bot.technicals import StockTechnicals, calculate_stock_technicals
 
 
@@ -92,6 +94,14 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             self._handle_option_replay_prefetch(parsed_url.query)
             return
 
+        if parsed_url.path == "/api/storage/snapshot":
+            self._handle_storage_snapshot()
+            return
+
+        if parsed_url.path == "/api/storage/history":
+            self._handle_storage_history(parsed_url.query)
+            return
+
         self._send_json({"error": "Not found."}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
@@ -103,6 +113,14 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
 
         if parsed_url.path == "/api/options/outcomes":
             self._handle_option_outcomes()
+            return
+
+        if parsed_url.path == "/api/storage/sync":
+            self._handle_storage_sync()
+            return
+
+        if parsed_url.path == "/api/storage/delete-day":
+            self._handle_storage_delete_day()
             return
 
         self._send_json({"error": "Not found."}, status=HTTPStatus.NOT_FOUND)
@@ -354,10 +372,53 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
                 raise ValueError("entries are required.")
             if len(entries) > 100:
                 raise ValueError("At most 100 option entries can be evaluated at once.")
-            outcomes = _option_outcomes(_market_data_client(), entries)
+            outcomes = _option_outcomes(_market_data_client(), entries, option_bar_cache=_storage())
             self._send_json({"outcomes": outcomes})
         except (MarketDataError, ValueError) as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+    def _handle_storage_snapshot(self) -> None:
+        try:
+            self._send_json(_storage().snapshot())
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            self._send_json({"error": f"Database read failed: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def _handle_storage_history(self, query: str) -> None:
+        try:
+            params = parse_qs(query)
+            day = params.get("date", [""])[0].strip()
+            self._send_json(_storage().history_for_day(day))
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            self._send_json({"error": f"Database history read failed: {exc}"}, status=HTTPStatus.BAD_REQUEST)
+
+    def _handle_storage_sync(self) -> None:
+        try:
+            payload = self._read_json_body()
+            trade_history = payload.get("trade_history", [])
+            paper_ledger = payload.get("paper_ledger", [])
+            tracked_tickers = payload.get("tracked_tickers", {})
+            if not isinstance(trade_history, list) or not isinstance(paper_ledger, list):
+                raise ValueError("trade_history and paper_ledger must be arrays.")
+            if not isinstance(tracked_tickers, dict):
+                raise ValueError("tracked_tickers must be an object.")
+            counts = _storage().sync(
+                trade_history=trade_history,
+                paper_ledger=paper_ledger,
+                tracked_tickers=tracked_tickers,
+            )
+            self._send_json({"saved": counts, "database_path": str(_storage().path)})
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            self._send_json({"error": f"Database write failed: {exc}"}, status=HTTPStatus.BAD_REQUEST)
+
+    def _handle_storage_delete_day(self) -> None:
+        try:
+            payload = self._read_json_body()
+            record_type = str(payload.get("record_type") or "")
+            day = str(payload.get("day") or "")
+            deleted = _storage().delete_day(record_type, day)
+            self._send_json({"deleted": deleted, "record_type": record_type, "day": day})
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            self._send_json({"error": f"Database delete failed: {exc}"}, status=HTTPStatus.BAD_REQUEST)
 
     def _send_file(self, path: Path, content_type: str) -> None:
         try:
@@ -405,6 +466,11 @@ def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
 
 def _alpaca_client() -> AlpacaClient:
     return AlpacaClient(AlpacaSettings.from_env())
+
+
+@lru_cache(maxsize=1)
+def _storage() -> TradingBotStorage:
+    return TradingBotStorage()
 
 
 @lru_cache(maxsize=1)
@@ -476,7 +542,12 @@ def _stock_technicals(ticker: str, replay_date: str | None = None, replay_time: 
     )
 
 
-def _option_outcomes(alpaca_client: MarketDataClient, raw_entries: list[object]) -> dict[str, dict[str, object]]:
+def _option_outcomes(
+    alpaca_client: MarketDataClient,
+    raw_entries: list[object],
+    *,
+    option_bar_cache: TradingBotStorage | None = None,
+) -> dict[str, dict[str, object]]:
     entries = [_normalize_option_outcome_entry(entry) for entry in raw_entries]
     entries = [entry for entry in entries if entry is not None]
     if not entries:
@@ -487,28 +558,48 @@ def _option_outcomes(alpaca_client: MarketDataClient, raw_entries: list[object])
         date_entries = [entry for entry in entries if entry["date"] == outcome_date]
         symbols = sorted({entry["symbol"] for entry in date_entries})
         start_dt = min(entry["start_dt"] for entry in date_entries)
-        end_dt = _option_outcome_end_dt(outcome_date)
+        end_dt = max(entry["end_dt"] for entry in date_entries)
         if end_dt <= start_dt:
             end_dt = start_dt + timedelta(minutes=1)
 
-        try:
-            option_bars = alpaca_client.get_option_bars(
-                symbols,
-                start=_to_utc_iso(start_dt),
-                end=_to_utc_iso(end_dt),
-                timeframe="1Min",
-            )
-            option_bars_error = None
-        except MarketDataError as exc:
-            option_bars = {}
-            option_bars_error = str(exc)
+        provider = str(getattr(alpaca_client, "provider_name", "market-data"))
+        is_completed_session = date.fromisoformat(outcome_date) < datetime.now(EASTERN).date()
+        option_bars = (
+            option_bar_cache.option_bars(provider, outcome_date, symbols)
+            if option_bar_cache is not None and is_completed_session
+            else {}
+        )
+        missing_symbols = [symbol for symbol in symbols if symbol not in option_bars]
+        option_bars_error = None
+        if missing_symbols:
+            fetch_start = start_dt
+            fetch_end = end_dt
+            if is_completed_session:
+                session_day = date.fromisoformat(outcome_date)
+                fetch_start = datetime.combine(session_day, time(9, 30), tzinfo=EASTERN)
+                fetch_end = datetime.combine(session_day, time(16, 0), tzinfo=EASTERN)
+            try:
+                fetched_bars = alpaca_client.get_option_bars(
+                    missing_symbols,
+                    start=_to_utc_iso(fetch_start),
+                    end=_to_utc_iso(fetch_end),
+                    timeframe="1Min",
+                )
+                option_bars.update(fetched_bars)
+                if option_bar_cache is not None and is_completed_session:
+                    option_bar_cache.save_option_bars(provider, outcome_date, fetched_bars)
+            except MarketDataError as exc:
+                option_bars_error = str(exc)
         stock_bars_by_underlying = _load_outcome_stock_bars(alpaca_client, date_entries, start_dt, end_dt)
 
         for entry in date_entries:
             bars = [
                 bar
                 for bar in option_bars.get(entry["symbol"], [])
-                if isinstance(bar, dict) and (_bar_datetime(bar) is None or _bar_datetime(bar) >= entry["start_dt"])
+                if isinstance(bar, dict) and (
+                    _bar_datetime(bar) is None or
+                    entry["start_dt"] <= _bar_datetime(bar) <= entry["end_dt"]
+                )
             ]
             if bars:
                 outcomes[entry["id"]] = _outcome_for_entry(entry, bars, stock_bars_by_underlying.get(entry["underlying"], []))
@@ -527,12 +618,29 @@ def _normalize_option_outcome_entry(entry: object) -> dict[str, object] | None:
     outcome_date = str(entry.get("date", "")).strip()
     timestamp_iso = str(entry.get("timestamp_iso", "")).strip()
     start_dt = _entry_start_datetime(outcome_date, timestamp_iso)
+    as_of_time = str(entry.get("as_of_time", "")).strip()
+    as_of_iso = str(entry.get("as_of_iso", "")).strip()
+    replay_end_dt = None
+    if as_of_iso:
+        try:
+            replay_end_dt = datetime.fromisoformat(as_of_iso.replace("Z", "+00:00"))
+            if replay_end_dt.tzinfo is None:
+                replay_end_dt = replay_end_dt.replace(tzinfo=EASTERN)
+            else:
+                replay_end_dt = replay_end_dt.astimezone(EASTERN)
+        except ValueError:
+            replay_end_dt = None
+    end_dt = min(
+        replay_end_dt or (_technical_as_of(outcome_date or start_dt.date().isoformat(), as_of_time) if as_of_time else _option_outcome_end_dt(outcome_date or start_dt.date().isoformat())),
+        _option_outcome_end_dt(outcome_date or start_dt.date().isoformat()),
+    )
     underlying = str(entry.get("underlying", "")).strip().upper() or _underlying_from_option_symbol(symbol)
     return {
         "id": str(entry.get("id") or symbol),
         "symbol": symbol,
         "date": outcome_date or start_dt.date().isoformat(),
         "start_dt": start_dt,
+        "end_dt": end_dt,
         "underlying": underlying,
         "expiration_date": str(entry.get("expiration_date", "")).strip(),
         "strike_price": _optional_snapshot_float(entry.get("strike_price")),
@@ -619,6 +727,7 @@ def _outcome_for_entry(
 
     high_time = _bar_datetime(high_bar)
     low_time = _bar_datetime(low_bar)
+    current_time = _bar_datetime(latest_bar)
     return {
         "high": high_price,
         "high_time": high_time.isoformat() if high_time else None,
@@ -627,6 +736,7 @@ def _outcome_for_entry(
         "low_time": low_time.isoformat() if low_time else None,
         "low_greeks": _estimate_outcome_greeks(entry, low_price, low_time, stock_bars),
         "current": current_price,
+        "current_time": current_time.isoformat() if current_time else None,
         "went_up": went_up,
         "source": "market-data option bars",
     }

@@ -37,6 +37,9 @@ const historyStartDate = document.querySelector("#history-start-date");
 const historyEndDate = document.querySelector("#history-end-date");
 const historyTickers = document.querySelector("#history-tickers");
 const historyExportStatus = document.querySelector("#history-export-status");
+const tickerSelectionCount = document.querySelector("#ticker-selection-count");
+const replayTimezone = document.querySelector("#replay-timezone");
+const trackingOverviewRows = document.querySelector("#tracking-overview-rows");
 const speedButtons = document.querySelectorAll("[data-speed]");
 const barSymbol = document.querySelector("#bar-symbol");
 const latestBar = document.querySelector("#latest-bar");
@@ -48,6 +51,8 @@ let refreshTimer = null;
 let liveTimer = null;
 let liveClockTimer = null;
 let replayTimer = null;
+let replayScrubTimer = null;
+let replayRequestId = 0;
 let replaySpeed = 1;
 let lastAnalysis = null;
 const latestAnalysisByTicker = new Map();
@@ -61,13 +66,17 @@ let lastReplayFetchStartedAt = 0;
 let currentBestPick = null;
 let daySimulationRunning = false;
 let daySimulationStopRequested = false;
-const REPLAY_FETCH_STEP_SECONDS = 300;
+const replayOutcomeCache = new Map();
+const REPLAY_FETCH_STEP_SECONDS = 60;
 const DAY_SIMULATION_STEP_SECONDS = 15 * 60;
 const REPLAY_MIN_FETCH_INTERVAL_MS = 5000;
 const TRADE_HISTORY_STORAGE_KEY = "tradingBot.tradePermissionHistory";
 const PAPER_LEDGER_STORAGE_KEY = "tradingBot.paperSimulationLedger";
 const TICKER_GROUPS_STORAGE_KEY = "tradingBot.tickerGroups";
 const MAX_CONTRACT_COST_STORAGE_KEY = "tradingBot.maxContractCost";
+const MAX_CONTRACT_DEFAULT_VERSION_KEY = "tradingBot.maxContractDefaultVersion";
+const TRACKING_HISTORY_STORAGE_KEY = "tradingBot.trackedTickersByDate";
+const DATABASE_MIGRATION_STORAGE_KEY = "tradingBot.sqliteMigrationVersion";
 const OPTION_CONTRACT_MULTIPLIER = 100;
 const EXIT_CONFIRMATION_REFRESHES = 2;
 // Keep enough signals for multi-day exports instead of allowing one busy session
@@ -76,7 +85,16 @@ const MAX_TRADE_HISTORY_ITEMS = 2000;
 const MAX_PAPER_LEDGER_ITEMS = 500;
 const COMPACT_TRADE_HISTORY_ITEMS = 600;
 const MAX_RECORDED_PERMISSION_CANDIDATES = 3;
-const PACIFIC_TO_EASTERN_SECONDS = 3 * 60 * 60;
+const MARKET_TIME_ZONE = "America/New_York";
+let persistentStorageSyncTimer = null;
+let persistentStorageSyncInFlight = false;
+let persistentStorageSyncQueued = false;
+let persistentStorageHydrating = false;
+let historyGroupDate = "";
+const openHistoryTickerGroups = new Set();
+const persistentHistoryByDate = new Map();
+const persistentHistoryRequests = new Map();
+const historyOutcomeRequestVersions = new Map();
 
 const fields = {
   tradePermission: document.querySelector("#trade-permission"),
@@ -264,7 +282,7 @@ loadContractsButton?.addEventListener("click", () => {
   loadOptionReplay();
 });
 
-liveUpdateButton.addEventListener("click", () => {
+liveUpdateButton?.addEventListener("click", () => {
   runLiveUpdate({ manual: true });
 });
 
@@ -280,18 +298,25 @@ liveInterval.addEventListener("change", () => {
 
 replayDate.addEventListener("change", () => {
   stopLiveMode();
+  applyHostMarketWindow(replayDate.value);
   syncHistoryExportDatesToReplayDate();
+  renderTrackingOverview();
   renderTradeHistory();
+  ensureHistoricalDateLoaded(replayDate.value);
   loadOptionReplay();
 });
 
 replayTime.addEventListener("input", () => {
   updateReplayClock();
+  renderTradeHistory({ refreshData: false });
+  scheduleReplayScrubRefresh();
 });
 
-replayTime.addEventListener("change", () => {
+replayTime.addEventListener("change", async () => {
+  clearReplayScrubTimer();
   stopLiveMode();
-  loadOptionReplay();
+  renderTradeHistory();
+  await loadOptionReplay({ force: true });
 });
 
 replayPlay.addEventListener("click", () => {
@@ -409,6 +434,10 @@ async function runAnalysis({ isRefresh = false } = {}) {
   const { period } = getFormValues();
   const tickers = getSelectedTickers();
   const primaryTicker = tickers[0] || "SPX";
+  updateTickerSelectionCount();
+  if (!replayDate.value || replayDate.value === currentHostDate()) {
+    recordTrackedTickers(currentHostDate(), tickers);
+  }
 
   setStatus(isRefresh ? `Refreshing ${tickers.join(", ")} GEX data...` : `Pulling ${tickers.join(", ")} GEX data...`, false);
   if (button) {
@@ -554,7 +583,7 @@ function stopLiveMode() {
   liveToggleButton.textContent = "Start Auto Live";
   updatePlaybackButton();
   if (!isLiveLoading) {
-    liveStatus.textContent = "Auto Live is off. Use Refresh Once for one manual live pull.";
+    liveStatus.textContent = "Auto Live is off. Historical replay remains available.";
   }
 }
 
@@ -567,8 +596,9 @@ function toggleLiveMode() {
 }
 
 function syncLiveClock() {
-  const market = currentPacificMarketSnapshot();
+  const market = currentHostMarketSnapshot();
   replayDate.value = market.date;
+  applyHostMarketWindow(market.date);
   replayTime.value = String(market.clampedSeconds);
   updateReplayClock();
 }
@@ -694,7 +724,11 @@ function initializeMaxContractCost() {
   if (!maxContractCostSelect) {
     return;
   }
-  const saved = localStorage.getItem(MAX_CONTRACT_COST_STORAGE_KEY) || "";
+  if (localStorage.getItem(MAX_CONTRACT_DEFAULT_VERSION_KEY) !== "1000-v1") {
+    localStorage.setItem(MAX_CONTRACT_COST_STORAGE_KEY, "1000");
+    localStorage.setItem(MAX_CONTRACT_DEFAULT_VERSION_KEY, "1000-v1");
+  }
+  const saved = localStorage.getItem(MAX_CONTRACT_COST_STORAGE_KEY) || "1000";
   if ([...maxContractCostSelect.options].some((option) => option.value === saved)) {
     maxContractCostSelect.value = saved;
   }
@@ -705,13 +739,99 @@ function setSelectedTickers(tickers) {
   for (const checkbox of document.querySelectorAll("[data-ticker-checkbox]")) {
     checkbox.checked = selected.has(checkbox.value.toUpperCase());
   }
+  updateTickerSelectionCount();
+}
+
+function updateTickerSelectionCount() {
+  if (!tickerSelectionCount) {
+    return;
+  }
+  const count = getSelectedTickers().length;
+  tickerSelectionCount.textContent = `${count} selected`;
+}
+
+function loadTrackedTickerHistory() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(TRACKING_HISTORY_STORAGE_KEY) || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch (error) {
+    return {};
+  }
+}
+
+function recordTrackedTickers(dateValue, tickers) {
+  if (!dateValue || !Array.isArray(tickers) || tickers.length === 0) {
+    return;
+  }
+  const history = loadTrackedTickerHistory();
+  const merged = new Set([...(history[dateValue] || []), ...tickers].map((ticker) => String(ticker).toUpperCase()));
+  history[dateValue] = [...merged].sort();
+  try {
+    localStorage.setItem(TRACKING_HISTORY_STORAGE_KEY, JSON.stringify(history));
+  } catch (error) {
+    // Trade history remains untouched if the browser cannot store this optional index.
+  }
+  schedulePersistentStorageSync();
+  renderTrackingOverview();
+}
+
+function trackedTickerOverview() {
+  const byDate = new Map();
+  const add = (dateValue, ticker) => {
+    const normalized = String(ticker || "").trim().toUpperCase();
+    if (!dateValue || !normalized) {
+      return;
+    }
+    if (!byDate.has(dateValue)) {
+      byDate.set(dateValue, new Set());
+    }
+    byDate.get(dateValue).add(normalized);
+  };
+
+  for (const [dateValue, tickers] of Object.entries(loadTrackedTickerHistory())) {
+    for (const ticker of Array.isArray(tickers) ? tickers : []) {
+      add(dateValue, ticker);
+    }
+  }
+  for (const item of loadTradeHistory()) {
+    add(historyItemDate(item), item.ticker || item.underlying || contractUnderlying(item));
+  }
+  for (const trade of loadPaperLedger()) {
+    add(paperLedgerDay(trade), trade.ticker || trade.underlying || contractUnderlying(trade));
+  }
+  return [...byDate.entries()]
+    .map(([dateValue, tickers]) => ({ date: dateValue, tickers: [...tickers].sort() }))
+    .sort((a, b) => b.date.localeCompare(a.date));
+}
+
+function renderTrackingOverview() {
+  if (!trackingOverviewRows) {
+    return;
+  }
+  const rows = trackedTickerOverview();
+  if (rows.length === 0) {
+    trackingOverviewRows.innerHTML = `
+      <div class="tracking-overview-row"><span>${escapeHtml(replayDate.value || currentHostDate())}</span><span>No saved tracking activity yet</span></div>
+    `;
+    return;
+  }
+  trackingOverviewRows.innerHTML = rows.slice(0, 10).map((row) => `
+    <div class="tracking-overview-row${row.date === replayDate.value ? " active" : ""}" role="row">
+      <span role="cell">${escapeHtml(formatContractDate(row.date))}</span>
+      <span role="cell">${escapeHtml(row.tickers.join(", "))}</span>
+    </div>
+  `).join("");
 }
 
 async function refreshForTickerSelection() {
   isInspectingContract = false;
   lastReplayFetchSecond = null;
+  updateTickerSelectionCount();
+  if (!replayDate.value || replayDate.value === currentHostDate()) {
+    recordTrackedTickers(currentHostDate(), getSelectedTickers());
+  }
   renderTradeHistory();
-  if (replayDate.value && replayDate.value !== currentPacificDate()) {
+  if (replayDate.value && replayDate.value !== currentHostDate()) {
     stopLiveMode();
     await loadOptionReplay({ force: true });
   } else {
@@ -834,10 +954,12 @@ initializeReplayControls();
 initializeTradeHistoryExportControls();
 renderTickerGroups();
 initializeMaxContractCost();
+updateTickerSelectionCount();
 autoRefresh.checked = true;
 initializeMarketMode();
 scheduleRefresh();
 renderTradeHistory();
+initializePersistentStorage();
 
 function renderStrikeChart(analysis) {
   const points = [
@@ -1157,27 +1279,17 @@ function showReplayError(error) {
 }
 
 async function loadOptionReplay({ force = false } = {}) {
-  if (isReplayLoading) {
-    if (replayAbortController) {
-      replayAbortController.abort();
-    }
-    fields.contractSummary.textContent = "Canceling previous replay request...";
-  }
-
   updateReplayClock();
-  if (replayDate.value === currentPacificDate()) {
+  if (replayDate.value === currentHostDate()) {
     stopReplay();
     isInspectingContract = false;
     fields.contractSummary.classList.remove("error");
     fields.contractSummary.textContent = "Today uses live GEX and Alpaca data instead of historical replay files.";
     await runAnalysis();
-    setStatus(`Live data updated for today at ${replayClock.textContent} Pacific time.`, false);
+    setStatus(`Live data updated for today at ${replayClock.textContent} ${hostTimeZoneLabel()}.`, false);
     return;
   }
 
-  isReplayLoading = true;
-  replayAbortController = new AbortController();
-  isInspectingContract = true;
   const { period } = getFormValues();
   const tickers = getSelectedTickers();
   const replaySecond = Number(replayTime.value || 57540);
@@ -1187,16 +1299,21 @@ async function loadOptionReplay({ force = false } = {}) {
     lastReplayFetchSecond !== null &&
     Math.abs(replaySecond - lastReplayFetchSecond) < REPLAY_FETCH_STEP_SECONDS
   ) {
-    isReplayLoading = false;
-    replayAbortController = null;
-    fields.contractSummary.textContent = `Clock updated to ${replayClock.textContent} PT. Press Update Data to rescore this exact second.`;
+    fields.contractSummary.textContent = `Clock updated to ${replayClock.textContent} ${hostTimeZoneLabel()}. Values refresh on the next available one-minute bar.`;
     return;
   }
   if (!force && now - lastReplayFetchStartedAt < REPLAY_MIN_FETCH_INTERVAL_MS) {
-    isReplayLoading = false;
-    replayAbortController = null;
     return;
   }
+
+  if (isReplayLoading && replayAbortController) {
+    replayAbortController.abort();
+  }
+  const requestId = ++replayRequestId;
+  const controller = new AbortController();
+  isReplayLoading = true;
+  replayAbortController = controller;
+  isInspectingContract = true;
   lastReplayFetchStartedAt = now;
 
   fields.contractSummary.textContent =
@@ -1209,25 +1326,58 @@ async function loadOptionReplay({ force = false } = {}) {
 
   try {
     const { payloads, errors } = await loadOptionReplaysForTickers(tickers, period, {
-      signal: replayAbortController.signal,
+      signal: controller.signal,
     });
+    if (requestId !== replayRequestId) {
+      return;
+    }
     if (payloads.length === 0) {
       throw new Error(replayErrorMessage(errors));
     }
     lastReplayFetchSecond = replaySecond;
-    renderOptionReplays(payloads, errors);
+    const renderedHistory = renderOptionReplays(payloads, errors);
+    if (!renderedHistory) {
+      renderTradeHistory();
+    }
   } catch (error) {
-    showReplayError(error);
+    if (requestId === replayRequestId) {
+      showReplayError(error);
+      renderTradeHistory();
+    }
   } finally {
-    isReplayLoading = false;
-    replayAbortController = null;
-    fields.contractList.classList.remove("is-refreshing");
+    if (requestId === replayRequestId) {
+      isReplayLoading = false;
+      replayAbortController = null;
+      fields.contractList.classList.remove("is-refreshing");
+    }
   }
+}
+
+function clearReplayScrubTimer() {
+  if (replayScrubTimer !== null) {
+    clearTimeout(replayScrubTimer);
+    replayScrubTimer = null;
+  }
+}
+
+function scheduleReplayScrubRefresh() {
+  clearReplayScrubTimer();
+  if (replayDate.value === currentHostDate()) {
+    return;
+  }
+  fields.contractSummary.classList.remove("error");
+  fields.contractSummary.textContent = `Loading ${replayDate.value} at ${replayClock.textContent} ${hostTimeZoneLabel()}...`;
+  replayScrubTimer = setTimeout(async () => {
+    replayScrubTimer = null;
+    stopLiveMode();
+    renderTradeHistory();
+    await loadOptionReplay({ force: true });
+  }, 300);
 }
 
 async function runDaySimulation() {
   const simulationDate = replayDate.value;
-  if (!simulationDate || simulationDate >= currentPacificDate() || isWeekendDate(simulationDate)) {
+  if (!simulationDate || simulationDate >= currentHostDate() || isWeekendDate(simulationDate)) {
     setDaySimulationStatus("Choose a completed weekday before today.", true);
     return;
   }
@@ -1286,7 +1436,7 @@ async function runDaySimulation() {
       replayTime.value = String(second);
       updateReplayClock();
       setDaySimulationStatus(
-        `Replaying ${simulationTickers.join(", ")} at ${replayClock.textContent} PT (${index + 1} of ${checkpoints.length})...`,
+        `Replaying ${simulationTickers.join(", ")} at ${replayClock.textContent} ${hostTimeZoneLabel()} (${index + 1} of ${checkpoints.length})...`,
         false
       );
       const { payloads, errors } = await loadOptionReplaysForTickers(simulationTickers, period);
@@ -1317,7 +1467,7 @@ async function runDaySimulation() {
   }
 }
 
-async function refreshReplayLedgerPrices(simulationDate, easternClock, pacificSecond) {
+async function refreshReplayLedgerPrices(simulationDate, easternClock, localSecond) {
   const openSymbols = [...new Set(
     loadPaperLedger()
       .filter((trade) => trade.status !== "closed" && paperLedgerDay(trade) === simulationDate)
@@ -1333,7 +1483,7 @@ async function refreshReplayLedgerPrices(simulationDate, easternClock, pacificSe
     time: easternClock,
   });
   const payload = await getJson(`/api/options/prices?${query.toString()}`);
-  updatePaperLedgerPrices(payload.prices || {}, `${simulationDate}T${formatClock(pacificSecond)}`);
+  updatePaperLedgerPrices(payload.prices || {}, `${simulationDate}T${formatClock(localSecond)}`);
 }
 
 function simulationDelay(milliseconds) {
@@ -1368,7 +1518,7 @@ function renderOptionReplays(payloads, errors = []) {
       ticker: payload.analysis?.ticker || payload.recommendation?.ticker || "Unknown",
       payload: payload.analysis,
     })).concat(errors.map((error) => ({ ticker: error.ticker, error: error.message }))));
-    setStatus(`Replay maps updated for ${payloads.length} ticker${payloads.length === 1 ? "" : "s"} at ${replayClock.textContent} Pacific time.`, false);
+    setStatus(`Replay maps updated for ${payloads.length} ticker${payloads.length === 1 ? "" : "s"} at ${replayClock.textContent} ${hostTimeZoneLabel()}.`, false);
 
     const summaries = payloads.map((payload) => {
       const recommendation = payload.recommendation || {};
@@ -1379,7 +1529,7 @@ function renderOptionReplays(payloads, errors = []) {
       summaries.push(...errors.map((error) => `${error.ticker}: unavailable`));
     }
     fields.contractSummary.classList.toggle("error", payloads.length === 0);
-    fields.contractSummary.textContent = `${primary?.date || replayDate.value} ${replayClock.textContent} PT | ${summaries.join(" | ")}`;
+    fields.contractSummary.textContent = `${primary?.date || replayDate.value} ${replayClock.textContent} ${hostTimeZoneLabel()} | ${summaries.join(" | ")}`;
 
     let recorded = false;
     for (const payload of payloads) {
@@ -1396,17 +1546,19 @@ function renderOptionReplays(payloads, errors = []) {
     }
 
     renderTickerContractColumns(payloads, errors, "replay");
+    return recorded;
   });
 }
 
 function initializeReplayControls() {
-  const today = new Date(`${currentPacificDate()}T12:00:00`);
+  const today = new Date(`${currentHostDate()}T12:00:00`);
   const priorDay = new Date(today);
   priorDay.setDate(today.getDate() - 1);
   while (priorDay.getDay() === 0 || priorDay.getDay() === 6) {
     priorDay.setDate(priorDay.getDate() - 1);
   }
   replayDate.value = formatDateInput(priorDay);
+  applyHostMarketWindow(replayDate.value);
   updateReplayClock();
   for (const button of speedButtons) {
     button.classList.toggle("active", Number(button.dataset.speed) === replaySpeed);
@@ -1414,7 +1566,7 @@ function initializeReplayControls() {
 }
 
 function initializeTradeHistoryExportControls() {
-  const selectedDate = replayDate.value || currentPacificDate();
+  const selectedDate = replayDate.value || currentHostDate();
   if (historyStartDate && !historyStartDate.value) {
     historyStartDate.value = selectedDate;
   }
@@ -1425,7 +1577,7 @@ function initializeTradeHistoryExportControls() {
 }
 
 function syncHistoryExportDatesToReplayDate() {
-  const selectedDate = replayDate.value || currentPacificDate();
+  const selectedDate = replayDate.value || currentHostDate();
   if (historyStartDate && historyEndDate && historyStartDate.value === historyEndDate.value) {
     historyStartDate.value = selectedDate;
     historyEndDate.value = selectedDate;
@@ -1433,22 +1585,23 @@ function syncHistoryExportDatesToReplayDate() {
 }
 
 function initializeMarketMode() {
-  const market = currentPacificMarketSnapshot();
+  const market = currentHostMarketSnapshot();
   replayDate.value = market.date;
+  applyHostMarketWindow(market.date);
   replayTime.value = String(market.clampedSeconds);
   updateReplayClock();
+  updateTickerSelectionCount();
+  recordTrackedTickers(market.date, getSelectedTickers());
+  renderTrackingOverview();
 
   if (market.isOpen) {
     isInspectingContract = false;
     startLiveMode();
-    setStatus(`Market is open. Live Mode started at ${replayClock.textContent} Pacific time.`, false);
+    setStatus(`Market is open. Auto Live started at ${replayClock.textContent} ${hostTimeZoneLabel()}.`, false);
     return;
   }
 
   stopLiveMode();
-  if (isWeekendDate(market.date)) {
-    initializeReplayControls();
-  }
   syncHistoryExportDatesToReplayDate();
   fields.contractSummary.textContent = "Market is closed. Historical replay mode is ready.";
   setStatus("Market is closed. Today's trade history is still selected; use historical replay controls to analyze another session.", false);
@@ -1460,38 +1613,21 @@ function isWeekendDate(value) {
   return date.getDay() === 0 || date.getDay() === 6;
 }
 
-function currentPacificMarketSnapshot() {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Los_Angeles",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).formatToParts(new Date());
-  const part = (type) => parts.find((item) => item.type === type)?.value || "00";
-  const seconds = Number(part("hour")) * 3600 + Number(part("minute")) * 60 + Number(part("second"));
-  const min = Number(replayTime.min);
-  const max = Number(replayTime.max);
+function currentHostMarketSnapshot() {
+  const now = new Date();
+  const date = formatDateInput(now);
+  const window = hostMarketWindow(date);
+  const seconds = localSeconds(now);
   return {
-    date: `${part("year")}-${part("month")}-${part("day")}`,
+    date,
     seconds,
-    clampedSeconds: Math.min(Math.max(seconds, min), max),
-    isOpen: seconds >= min && seconds <= max,
+    clampedSeconds: Math.min(Math.max(seconds, window.min), window.max),
+    isOpen: now >= window.open && now <= window.close,
   };
 }
 
-function currentPacificDate() {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Los_Angeles",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(new Date());
-  const part = (type) => parts.find((item) => item.type === type)?.value || "01";
-  return `${part("year")}-${part("month")}-${part("day")}`;
+function currentHostDate() {
+  return formatDateInput(new Date());
 }
 
 function formatDateInput(date) {
@@ -1504,47 +1640,119 @@ function formatDateInput(date) {
 function updateReplayClock() {
   const seconds = Number(replayTime.value || 46740);
   replayClock.textContent = formatClock(seconds);
+  if (replayTimezone) {
+    replayTimezone.textContent = hostTimeZoneLabel();
+  }
 }
 
 function getReplayMarketClock() {
-  return formatClock(Number(replayTime.value || 46740) + PACIFIC_TO_EASTERN_SECONDS);
+  return getReplayPoint().marketClock;
+}
+
+function getReplayPoint() {
+  const [year, month, day] = replayDate.value.split("-").map(Number);
+  const seconds = Number(replayTime.value || 46740);
+  const localDateTime = new Date(
+    year,
+    month - 1,
+    day,
+    Math.floor(seconds / 3600),
+    Math.floor((seconds % 3600) / 60),
+    seconds % 60
+  );
+  const parts = timeZoneParts(localDateTime, MARKET_TIME_ZONE);
+  return {
+    iso: localDateTime.toISOString(),
+    marketClock: `${parts.hour}:${parts.minute}:${parts.second}`,
+  };
 }
 
 async function jumpToTodayNow() {
-  const now = new Date();
-  const pacificParts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Los_Angeles",
+  const market = currentHostMarketSnapshot();
+  const marketDate = market.date;
+
+  replayDate.value = marketDate;
+  applyHostMarketWindow(marketDate);
+  replayTime.value = String(market.clampedSeconds);
+  lastReplayFetchSecond = null;
+  updateReplayClock();
+  renderTrackingOverview();
+  renderTradeHistory();
+
+  if (market.isOpen) {
+    isInspectingContract = false;
+    await runAnalysis();
+    setStatus(`Live view updated to today at ${replayClock.textContent} ${hostTimeZoneLabel()}.`, false);
+    return;
+  }
+
+  setStatus(`Market is outside regular hours. Showing the nearest session point for ${marketDate} at ${replayClock.textContent} ${hostTimeZoneLabel()}.`, false);
+  await loadOptionReplay({ force: true });
+}
+
+function timeZoneParts(date, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
-    hour12: false,
-  }).formatToParts(now);
-  const part = (type) => pacificParts.find((item) => item.type === type)?.value || "00";
-  const marketDate = `${part("year")}-${part("month")}-${part("day")}`;
-  const pacificSeconds = Number(part("hour")) * 3600 + Number(part("minute")) * 60 + Number(part("second"));
-  const min = Number(replayTime.min);
-  const max = Number(replayTime.max);
-  const clampedSeconds = Math.min(Math.max(pacificSeconds, min), max);
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const part = (type) => parts.find((item) => item.type === type)?.value || "00";
+  return {
+    year: part("year"),
+    month: part("month"),
+    day: part("day"),
+    hour: part("hour"),
+    minute: part("minute"),
+    second: part("second"),
+  };
+}
 
-  replayDate.value = marketDate;
-  replayTime.value = String(clampedSeconds);
-  lastReplayFetchSecond = null;
-  updateReplayClock();
-  renderTradeHistory();
+function zonedDateTimeToInstant(dateValue, clock, timeZone) {
+  const [year, month, day] = dateValue.split("-").map(Number);
+  const [hour, minute, second] = clock.split(":").map(Number);
+  const nominal = Date.UTC(year, month - 1, day, hour, minute, second || 0);
+  let instant = nominal;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const parts = timeZoneParts(new Date(instant), timeZone);
+    const represented = Date.UTC(
+      Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+      Number(parts.hour), Number(parts.minute), Number(parts.second)
+    );
+    instant += nominal - represented;
+  }
+  return new Date(instant);
+}
 
-  const isMarketHours = pacificSeconds >= min && pacificSeconds <= max;
-  if (isMarketHours) {
-    isInspectingContract = false;
-    await runAnalysis();
-    setStatus(`Live view updated to today at ${replayClock.textContent} Pacific time.`, false);
+function localSeconds(date) {
+  return date.getHours() * 3600 + date.getMinutes() * 60 + date.getSeconds();
+}
+
+function hostMarketWindow(dateValue) {
+  const open = zonedDateTimeToInstant(dateValue, "09:30:00", MARKET_TIME_ZONE);
+  const close = zonedDateTimeToInstant(dateValue, "16:00:00", MARKET_TIME_ZONE);
+  return { open, close, min: localSeconds(open), max: localSeconds(close) };
+}
+
+function applyHostMarketWindow(dateValue) {
+  if (!dateValue) {
     return;
   }
+  const window = hostMarketWindow(dateValue);
+  replayTime.min = String(window.min);
+  replayTime.max = String(window.max);
+  const value = Number(replayTime.value);
+  replayTime.value = String(Math.min(Math.max(value, window.min), window.max));
+}
 
-  setStatus(`Market is outside regular hours. Showing nearest replay point for ${marketDate} ${replayClock.textContent} Pacific time.`, false);
-  await loadOptionReplay({ force: true });
+function hostTimeZoneLabel() {
+  return new Intl.DateTimeFormat(undefined, { timeZoneName: "short" })
+    .formatToParts(new Date())
+    .find((part) => part.type === "timeZoneName")?.value || "Local";
 }
 
 function toggleReplay() {
@@ -1743,7 +1951,7 @@ function createTickerCandidateRow(candidate, mode, rank) {
       candidate,
       price,
       replay
-        ? `Staged ${candidate.symbol} from replay at ${replayClock.textContent} PT.`
+        ? `Staged ${candidate.symbol} from replay at ${replayClock.textContent} ${hostTimeZoneLabel()}.`
         : `Staged ${candidate.symbol} as a paper limit order.`
     );
   });
@@ -1905,6 +2113,7 @@ function recordTradePermissionPicks({ candidates, recommendation, payload, mode,
   const withoutDuplicates = history.filter((existing) => !incomingIds.has(existing.id));
   saveTradeHistory([...items, ...withoutDuplicates].slice(0, MAX_TRADE_HISTORY_ITEMS));
   recordPaperLedgerTrade(items[0]);
+  renderTrackingOverview();
   if (render) {
     renderTradeHistory();
   }
@@ -2012,56 +2221,232 @@ function pickTimestamp({ recommendation, payload, mode }) {
   };
 }
 
-function renderTradeHistory({ preserveScroll = true } = {}) {
+function renderTradeHistory({ preserveScroll = true, refreshData = true } = {}) {
   if (preserveScroll) {
-    return withViewportAnchor(() => renderTradeHistory({ preserveScroll: false }));
+    return withViewportAnchor(() => renderTradeHistory({ preserveScroll: false, refreshData }));
   }
   const selectedDate = replayDate.value;
   const selectedTickers = getSelectedTickers();
-  const history = loadTradeHistory().filter((item) =>
-    historyItemDate(item) === selectedDate && matchesTickerFilter(item, selectedTickers)
+  const isHistoricalDay = Boolean(selectedDate && selectedDate !== currentHostDate());
+  const replayPoint = isHistoricalDay ? getReplayPoint() : null;
+  if (isHistoricalDay) {
+    ensureHistoricalDateLoaded(selectedDate);
+  }
+  const sourceHistory = isHistoricalDay
+    ? historicalTradeHistoryForDate(selectedDate)
+    : loadTradeHistory();
+  const history = sourceHistory.filter((item) =>
+    historyItemDate(item) === selectedDate &&
+    (isHistoricalDay || matchesTickerFilter(item, selectedTickers)) &&
+    historyItemVisibleAtReplayPoint(item, selectedDate, replayPoint)
   );
   renderPaperLedger({ preserveScroll: false });
   if (history.length === 0) {
+    if (isHistoricalDay && persistentHistoryRequests.has(selectedDate) && !persistentHistoryByDate.has(selectedDate)) {
+      fields.tradeHistory.textContent = `Loading saved history for ${formatContractDate(selectedDate)}...`;
+      return;
+    }
     fields.tradeHistory.textContent = selectedDate
-      ? `No trade-permission picks recorded for ${selectedTickers.join(", ")} on ${formatContractDate(selectedDate)}.`
+      ? `No trade-permission picks recorded by ${replayClock.textContent} ${hostTimeZoneLabel()} on ${formatContractDate(selectedDate)}.`
       : "No trade-permission picks yet.";
     return;
   }
   fields.tradeHistory.innerHTML = "";
-  for (const item of history) {
-    const row = document.createElement("button");
-    row.type = "button";
-    row.className = `trade-history-row contract-${item.side || "call"}`;
-    row.dataset.historyId = item.id || "";
-    row.dataset.symbol = item.symbol || "";
-    row.dataset.entryPrice = item.entryPrice || "";
-    row.dataset.scrollKey = `history:${item.id || item.symbol || item.timestamp?.iso || ""}`;
-    row.innerHTML = `
-      <span class="history-contract">
-        <strong>${item.timestamp.label}</strong>
-        <em>${historyRankLabel(item)}${item.contract}</em>
-      </span>
-      <span class="history-pill history-bias">${item.bias}</span>
-      <span class="history-pill">Score ${formatOptionalNumber(item.score)}</span>
-      <span class="history-stat"><i>Recorded</i><strong>${formatCurrency(item.entryPrice)}</strong></span>
-      <span class="history-stat"><i>Highest after buy</i><strong class="history-high">Loading...</strong><em class="history-high-greeks">-</em></span>
-      <span class="history-stat"><i>Current</i><strong class="history-current">Loading...</strong></span>
-      <span class="history-stat"><i>Change</i><strong class="history-change">-</strong></span>
-      <span class="history-stat"><i>Exit</i><strong class="history-exit">Checking...</strong></span>
-    `;
-    row.addEventListener("click", () => {
-      stageCandidate(
-        { symbol: item.symbol },
-        item.entryPrice,
-        `${item.symbol} selected from trade permission history.`
-      );
+  if (isHistoricalDay) {
+    renderHistoricalTickerGroups(history, selectedDate, refreshData, replayPoint);
+  } else {
+    for (const item of history) {
+      fields.tradeHistory.appendChild(createTradeHistoryRow(item));
+    }
+    refreshRenderedTradeHistory(history, { refreshData });
+  }
+}
+
+function historicalTradeHistoryForDate(day) {
+  const browserRows = loadTradeHistory().filter((item) => historyItemDate(item) === day);
+  const databaseRows = persistentHistoryByDate.get(day)?.tradeHistory || [];
+  return mergePersistentRecords(databaseRows, browserRows, tradeHistoryMergeKey)
+    .sort((a, b) => String(b.timestamp?.iso || "").localeCompare(String(a.timestamp?.iso || "")));
+}
+
+function historicalPaperLedgerForDate(day) {
+  const browserRows = loadPaperLedger().filter((trade) => paperLedgerDay(trade) === day);
+  const databaseRows = persistentHistoryByDate.get(day)?.paperLedger || [];
+  return uniquePaperLedgerTrades(mergePersistentRecords(databaseRows, browserRows, paperLedgerMergeKey));
+}
+
+function ensureHistoricalDateLoaded(day) {
+  if (!day || day === currentHostDate() || persistentHistoryByDate.has(day)) {
+    return Promise.resolve(persistentHistoryByDate.get(day) || null);
+  }
+  if (persistentHistoryRequests.has(day)) {
+    return persistentHistoryRequests.get(day);
+  }
+  const request = getJson(`/api/storage/history?date=${encodeURIComponent(day)}`)
+    .then((payload) => {
+      persistentHistoryByDate.set(day, {
+        tradeHistory: Array.isArray(payload.trade_history) ? payload.trade_history : [],
+        paperLedger: Array.isArray(payload.paper_ledger) ? payload.paper_ledger : [],
+        trackedTickers: Array.isArray(payload.tracked_tickers) ? payload.tracked_tickers : [],
+      });
+      renderTradeHistory();
+      renderPaperLedger();
+      return payload;
+    })
+    .catch((error) => {
+      console.warn(`Could not load SQLite history for ${day}.`, error);
+      persistentHistoryByDate.set(day, {
+        tradeHistory: [],
+        paperLedger: [],
+        trackedTickers: [],
+        loadError: String(error?.message || error),
+      });
+      renderTradeHistory();
+      return null;
+    })
+    .finally(() => {
+      persistentHistoryRequests.delete(day);
     });
-    fields.tradeHistory.appendChild(row);
+  persistentHistoryRequests.set(day, request);
+  return request;
+}
+
+function renderHistoricalTickerGroups(history, selectedDate, refreshData, replayPoint) {
+  const grouped = new Map();
+  for (const item of history) {
+    const ticker = historyItemTicker(item);
+    if (!grouped.has(ticker)) {
+      grouped.set(ticker, []);
+    }
+    grouped.get(ticker).push(item);
   }
-  if (!daySimulationRunning) {
-    updateTradeHistoryOutcomes(history).finally(() => updateTradeHistoryPrices(history));
+  if (historyGroupDate !== selectedDate) {
+    historyGroupDate = selectedDate;
+    openHistoryTickerGroups.clear();
+    const firstTicker = [...grouped.keys()].sort()[0];
+    if (firstTicker) {
+      openHistoryTickerGroups.add(firstTicker);
+    }
   }
+
+  for (const ticker of [...grouped.keys()].sort()) {
+    const items = grouped.get(ticker);
+    const group = document.createElement("details");
+    group.className = "history-ticker-group";
+    group.dataset.ticker = ticker;
+    group.open = openHistoryTickerGroups.has(ticker);
+
+    const summary = document.createElement("summary");
+    summary.innerHTML = historicalTickerSummaryMarkup(ticker, items);
+    group.appendChild(summary);
+
+    const rows = document.createElement("div");
+    rows.className = "history-ticker-rows";
+    for (const item of items) {
+      rows.appendChild(createTradeHistoryRow(item));
+    }
+    group.appendChild(rows);
+    group.addEventListener("toggle", () => {
+      if (group.open) {
+        openHistoryTickerGroups.add(ticker);
+        refreshRenderedTradeHistory(items, { refreshData: true, replayPoint });
+      } else {
+        openHistoryTickerGroups.delete(ticker);
+      }
+    });
+    fields.tradeHistory.appendChild(group);
+    if (group.open) {
+      refreshRenderedTradeHistory(items, { refreshData, replayPoint });
+    }
+  }
+}
+
+function historicalTickerSummaryMarkup(ticker, items) {
+  const uniqueContracts = new Set(items.map((item) => String(item.symbol || "")).filter(Boolean)).size;
+  const scores = items.map((item) => optionalNumber(item.score)).filter((value) => value !== null);
+  const averageScore = scores.length
+    ? scores.reduce((total, value) => total + value, 0) / scores.length
+    : null;
+  const first = items[items.length - 1]?.timestamp?.label || "-";
+  const latest = items[0]?.timestamp?.label || "-";
+  return `
+    <span class="history-ticker-name">${escapeHtml(ticker)}</span>
+    <span class="history-ticker-metric"><strong>${items.length}</strong> signals</span>
+    <span class="history-ticker-metric"><strong>${uniqueContracts}</strong> contracts</span>
+    <span class="history-ticker-metric">Avg score <strong>${formatOptionalNumber(averageScore)}</strong></span>
+    <span class="history-ticker-window">${escapeHtml(first)} to ${escapeHtml(latest)}</span>
+  `;
+}
+
+function historyItemTicker(item) {
+  return String(item.ticker || item.underlying || contractUnderlying(item || {}) || "Unknown").toUpperCase();
+}
+
+function createTradeHistoryRow(item) {
+  const row = document.createElement("button");
+  row.type = "button";
+  row.className = `trade-history-row contract-${item.side || "call"}`;
+  row.dataset.historyId = item.id || "";
+  row.dataset.symbol = item.symbol || "";
+  row.dataset.entryPrice = item.entryPrice || "";
+  row.dataset.scrollKey = `history:${item.id || item.symbol || item.timestamp?.iso || ""}`;
+  row.innerHTML = `
+    <span class="history-contract">
+      <strong>${item.timestamp?.label || "-"}</strong>
+      <em>${historyRankLabel(item)}${item.contract || item.symbol || "Unknown contract"}</em>
+    </span>
+    <span class="history-pill history-bias">${item.bias || "-"}</span>
+    <span class="history-pill">Score ${formatOptionalNumber(item.score)}</span>
+    <span class="history-stat"><i>Recorded</i><strong>${formatCurrency(item.entryPrice)}</strong></span>
+    <span class="history-stat history-high-stat"><i class="history-high-label">Highest after buy</i><strong class="history-high">Loading...</strong><em class="history-high-time">-</em><em class="history-high-greeks">-</em></span>
+    <span class="history-stat"><i>Current</i><strong class="history-current">Loading...</strong><em class="history-current-time">-</em></span>
+    <span class="history-stat"><i>Change</i><strong class="history-change">-</strong></span>
+    <span class="history-stat"><i>Exit</i><strong class="history-exit">Checking...</strong></span>
+  `;
+  row.addEventListener("click", () => {
+    stageCandidate(
+      { symbol: item.symbol },
+      item.entryPrice,
+      `${item.symbol} selected from trade permission history.`
+    );
+  });
+  return row;
+}
+
+function refreshRenderedTradeHistory(history, { refreshData = true, replayPoint = null } = {}) {
+  if (daySimulationRunning || !refreshData || history.length === 0) {
+    return;
+  }
+  const historicalReplayPoint = replayDate.value !== currentHostDate()
+    ? (replayPoint || getReplayPoint())
+    : null;
+  const outcomeUpdate = updateTradeHistoryOutcomes(history, {
+    replayPoint: historicalReplayPoint,
+    persist: !historicalReplayPoint,
+  });
+  if (!historicalReplayPoint) {
+    Promise.allSettled([outcomeUpdate, updateTradeHistoryPrices(history)]);
+  }
+}
+
+function historyItemVisibleAtReplayPoint(item, selectedDate, replayPoint = null) {
+  if (!selectedDate || selectedDate === currentHostDate()) {
+    return true;
+  }
+  const timestampIso = String(item.timestamp?.iso || "");
+  if (item.mode === "replay") {
+    const recordedMarketClock = timestampIso.match(/T(\d{2}:\d{2}:\d{2})/)?.[1];
+    return !recordedMarketClock || recordedMarketClock <= (replayPoint || getReplayPoint()).marketClock;
+  }
+  const recordedAt = new Date(timestampIso);
+  if (!Number.isFinite(recordedAt.getTime())) {
+    return true;
+  }
+  const recordedLocalDate = formatDateInput(recordedAt);
+  if (recordedLocalDate !== selectedDate) {
+    return recordedLocalDate < selectedDate;
+  }
+  return localSeconds(recordedAt) <= Number(replayTime.value);
 }
 
 function historyRankLabel(item) {
@@ -2119,17 +2504,21 @@ function renderPaperLedger({ preserveScroll = true } = {}) {
   if (!fields.paperLedger) {
     return;
   }
-  const selectedDate = replayDate.value || currentPacificDate();
+  const selectedDate = replayDate.value || currentHostDate();
   const selectedTickers = getSelectedTickers();
-  const ledger = loadPaperLedger().filter((trade) =>
-    paperLedgerDay(trade) === selectedDate && matchesTickerFilter(trade, selectedTickers)
+  const isHistoricalDay = selectedDate !== currentHostDate();
+  const sourceLedger = isHistoricalDay
+    ? historicalPaperLedgerForDate(selectedDate)
+    : loadPaperLedger();
+  const ledger = sourceLedger.filter((trade) =>
+    paperLedgerDay(trade) === selectedDate && (isHistoricalDay || matchesTickerFilter(trade, selectedTickers))
   );
   renderPaperLedgerSummary(ledger);
   renderDailyReportCard(ledger);
 
   if (ledger.length === 0) {
     fields.paperLedger.textContent = selectedDate
-      ? `No simulated paper trades recorded for ${selectedTickers.join(", ")} on ${formatContractDate(selectedDate)}.`
+      ? `No simulated paper trades recorded on ${formatContractDate(selectedDate)}.`
       : "No simulated paper trades yet.";
     return;
   }
@@ -2344,9 +2733,13 @@ function paperTradePnlPct(entryPrice, currentPrice) {
 }
 
 function clearPaperLedgerForSelectedDay() {
-  const selectedDate = replayDate.value || currentPacificDate();
+  const selectedDate = replayDate.value || currentHostDate();
   const remaining = loadPaperLedger().filter((trade) => paperLedgerDay(trade) !== selectedDate);
   savePaperLedger(remaining);
+  if (persistentHistoryByDate.has(selectedDate)) {
+    persistentHistoryByDate.get(selectedDate).paperLedger = [];
+  }
+  deletePersistentStorageDay("paper_ledger", selectedDate);
   setStatus(`Cleared simulated paper ledger for ${formatContractDate(selectedDate)}.`, false);
 }
 
@@ -2355,15 +2748,24 @@ function paperLedgerDay(trade) {
 }
 
 function clearTradeHistoryForSelectedDay() {
-  const selectedDate = replayDate.value || currentPacificDate();
+  const selectedDate = replayDate.value || currentHostDate();
   const remaining = loadTradeHistory().filter((item) => historyItemDate(item) !== selectedDate);
   saveTradeHistory(remaining);
+  if (persistentHistoryByDate.has(selectedDate)) {
+    persistentHistoryByDate.get(selectedDate).tradeHistory = [];
+  }
+  deletePersistentStorageDay("trade_history", selectedDate);
   setStatus(`Cleared trade-permission picks for ${formatContractDate(selectedDate)}.`, false);
 }
 
 async function downloadTradeHistoryForSelectedDay() {
-  const selectedDate = replayDate.value || currentPacificDate();
-  const history = loadTradeHistory().filter((item) => historyItemDate(item) === selectedDate);
+  const selectedDate = replayDate.value || currentHostDate();
+  if (selectedDate !== currentHostDate()) {
+    await ensureHistoricalDateLoaded(selectedDate);
+  }
+  const history = selectedDate === currentHostDate()
+    ? loadTradeHistory().filter((item) => historyItemDate(item) === selectedDate)
+    : historicalTradeHistoryForDate(selectedDate);
   await downloadTradeHistoryItems({
     history,
     emptyMessage: `No trade-permission picks to download for ${formatContractDate(selectedDate)}.`,
@@ -2373,7 +2775,7 @@ async function downloadTradeHistoryForSelectedDay() {
 }
 
 async function downloadTradeHistoryForRange() {
-  const startDate = historyStartDate?.value || replayDate.value || currentPacificDate();
+  const startDate = historyStartDate?.value || replayDate.value || currentHostDate();
   const endDate = historyEndDate?.value || startDate;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
     setStatus("Choose a valid From and To date before downloading the range.", true);
@@ -2562,22 +2964,54 @@ function csvCell(value) {
   return `"${text.replaceAll('"', '""')}"`;
 }
 
-async function updateTradeHistoryOutcomes(history) {
+async function updateTradeHistoryOutcomes(history, { replayPoint = null, persist = true } = {}) {
+  const historyById = new Map(history.map((item) => [item.id, item]));
+  const requestKey = `${historyItemDate(history[0] || {})}:${historyItemTicker(history[0] || {})}`;
+  const requestVersion = (historyOutcomeRequestVersions.get(requestKey) || 0) + 1;
+  historyOutcomeRequestVersions.set(requestKey, requestVersion);
   try {
-    const outcomes = await fetchTradeHistoryOutcomes(history);
-    const mergedOutcomes = mergeOutcomeFallbacks(history, outcomes);
-    saveTradeHistoryOutcomes(mergedOutcomes);
-    updatePaperLedgerExtremesFromOutcomes(mergedOutcomes);
+    const outcomes = await fetchTradeHistoryOutcomes(history, replayPoint);
+    if (historyOutcomeRequestVersions.get(requestKey) !== requestVersion) {
+      return;
+    }
+    // Historical replay must never replace a failed as-of query with entry
+    // prices; doing so makes a previously reached high appear to disappear.
+    const mergedOutcomes = replayPoint ? outcomes : mergeOutcomeFallbacks(history, outcomes);
+    if (persist) {
+      saveTradeHistoryOutcomes(mergedOutcomes);
+      updatePaperLedgerExtremesFromOutcomes(mergedOutcomes);
+    }
     for (const row of fields.tradeHistory.querySelectorAll(".trade-history-row")) {
       const id = row.dataset.historyId;
-      renderHistoryOutcome(row, mergedOutcomes[id]);
+      const item = historyById.get(id);
+      if (!item) {
+        continue;
+      }
+      renderHistoryOutcome(row, mergedOutcomes[id], item);
     }
-  } catch (_error) {
-    const fallbackOutcomes = mergeOutcomeFallbacks(history, {});
-    saveTradeHistoryOutcomes(fallbackOutcomes);
-    updatePaperLedgerExtremesFromOutcomes(fallbackOutcomes);
+  } catch (error) {
+    if (historyOutcomeRequestVersions.get(requestKey) !== requestVersion) {
+      return;
+    }
+    const fallbackOutcomes = replayPoint
+      ? Object.fromEntries(history.map((item) => [item.id, {
+          error: `Historical replay unavailable after retry: ${error?.message || error}`,
+        }]))
+      : mergeOutcomeFallbacks(history, {});
+    if (persist) {
+      saveTradeHistoryOutcomes(fallbackOutcomes);
+      updatePaperLedgerExtremesFromOutcomes(fallbackOutcomes);
+    }
     for (const row of fields.tradeHistory.querySelectorAll(".trade-history-row")) {
-      renderHistoryOutcome(row, fallbackOutcomes[row.dataset.historyId] || null);
+      const item = historyById.get(row.dataset.historyId);
+      if (!item) {
+        continue;
+      }
+      renderHistoryOutcome(
+        row,
+        fallbackOutcomes[row.dataset.historyId] || null,
+        item
+      );
     }
   }
 }
@@ -2696,7 +3130,7 @@ function greeksFromHistoryItem(item) {
   };
 }
 
-async function fetchTradeHistoryOutcomes(history) {
+async function fetchTradeHistoryOutcomes(history, replayPoint = null) {
   const entries = history
     .filter((item) => item.symbol && item.timestamp?.iso)
     .map((item) => ({
@@ -2714,17 +3148,56 @@ async function fetchTradeHistoryOutcomes(history) {
       fallback_path: item.pricePath || [],
       fallback_delta: item.entryGreeks?.delta,
       fallback_gamma: item.entryGreeks?.gamma,
+      as_of_time: replayPoint?.marketClock || null,
+      as_of_iso: replayPoint?.iso || null,
     }));
   if (entries.length === 0) {
     return {};
   }
 
   const outcomes = {};
-  for (let index = 0; index < entries.length; index += 100) {
-    const payload = await postJson("/api/options/outcomes", { entries: entries.slice(index, index + 100) });
+  const cacheMinute = replayPoint?.iso ? replayPoint.iso.slice(0, 16) : null;
+  const pendingEntries = [];
+  for (const entry of entries) {
+    const cacheKey = cacheMinute ? `${entry.id}|${cacheMinute}` : null;
+    if (cacheKey && replayOutcomeCache.has(cacheKey)) {
+      outcomes[entry.id] = replayOutcomeCache.get(cacheKey);
+    } else {
+      pendingEntries.push(entry);
+    }
+  }
+  for (let index = 0; index < pendingEntries.length; index += 100) {
+    const batch = pendingEntries.slice(index, index + 100);
+    const payload = await postJsonWithRetry("/api/options/outcomes", { entries: batch }, 3);
     Object.assign(outcomes, payload.outcomes || {});
+    if (cacheMinute) {
+      for (const entry of batch) {
+        const outcome = payload.outcomes?.[entry.id];
+        if (outcome && !outcome.error && optionalNumber(outcome.current) !== null) {
+          replayOutcomeCache.set(`${entry.id}|${cacheMinute}`, outcome);
+        }
+      }
+    }
+  }
+  while (replayOutcomeCache.size > 4000) {
+    replayOutcomeCache.delete(replayOutcomeCache.keys().next().value);
   }
   return outcomes;
+}
+
+async function postJsonWithRetry(url, body, attempts = 2) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await postJson(url, body);
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+      }
+    }
+  }
+  throw lastError || new Error("Request failed after retry.");
 }
 
 function saveTradeHistoryOutcomes(outcomes) {
@@ -2743,20 +3216,75 @@ function saveTradeHistoryOutcomes(outcomes) {
   }
 }
 
-function renderHistoryOutcome(row, outcome) {
+function renderHistoryOutcome(row, outcome, item = null) {
   const highEl = row.querySelector(".history-high");
+  const highTimeEl = row.querySelector(".history-high-time");
   const highGreeksEl = row.querySelector(".history-high-greeks");
   if (!highEl || !highGreeksEl) {
     return;
   }
   if (!outcome || outcome.error) {
     highEl.textContent = "n/a";
+    if (highTimeEl) {
+      highTimeEl.textContent = "Time unavailable";
+    }
     highGreeksEl.textContent = outcome?.error || "No outcome data";
+    const currentEl = row.querySelector(".history-current");
+    const currentTimeEl = row.querySelector(".history-current-time");
+    const changeEl = row.querySelector(".history-change");
+    if (currentEl) currentEl.textContent = "n/a";
+    if (currentTimeEl) currentTimeEl.textContent = "Time unavailable";
+    if (changeEl) changeEl.textContent = "n/a";
     return;
   }
 
   highEl.textContent = outcome.went_up ? formatCurrency(outcome.high) : `No rise ${formatCurrency(outcome.high)}`;
+  if (highTimeEl) {
+    highTimeEl.textContent = outcome.high_time ? `Hit ${formatOutcomeTimestamp(outcome.high_time)}` : "Time unavailable";
+  }
   highGreeksEl.textContent = greekOutcomeSummary(outcome.high_greeks);
+  const current = optionalNumber(outcome.current);
+  const entryPrice = optionalNumber(row.dataset.entryPrice);
+  const currentEl = row.querySelector(".history-current");
+  const currentTimeEl = row.querySelector(".history-current-time");
+  const changeEl = row.querySelector(".history-change");
+  const exitEl = row.querySelector(".history-exit");
+  if (currentEl && changeEl && current !== null) {
+    currentEl.textContent = formatCurrency(current);
+    if (currentTimeEl) {
+      currentTimeEl.textContent = outcome.current_time
+        ? `Bar ${formatOutcomeTimestamp(outcome.current_time)}`
+        : "Latest available bar";
+    }
+    if (entryPrice) {
+      const change = (current - entryPrice) / entryPrice;
+      changeEl.textContent = formatPercent(change);
+      changeEl.classList.toggle("positive", change >= 0);
+      changeEl.classList.toggle("negative", change < 0);
+    }
+  } else if (currentEl && changeEl) {
+    currentEl.textContent = "n/a";
+    if (currentTimeEl) currentTimeEl.textContent = "Time unavailable";
+    changeEl.textContent = "n/a";
+  }
+  if (exitEl && item) {
+    const exitPlan = gexSellAdvisory(item);
+    exitEl.textContent = exitPlan.label;
+    exitEl.classList.toggle("positive", exitPlan.className === "positive");
+    exitEl.classList.toggle("negative", exitPlan.className === "negative");
+  }
+}
+
+function formatOutcomeTimestamp(value) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return String(value || "-");
+  }
+  return parsed.toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  });
 }
 
 function outcomeStatus(outcome) {
@@ -2780,7 +3308,7 @@ function greekOutcomeSummary(greeks) {
   return `${formatGreek("delta", greeks.delta)} ${formatGreek("gamma", greeks.gamma)} ${formatGreek("iv", greeks.implied_volatility)}${suffix}`;
 }
 
-async function updateTradeHistoryPrices(history) {
+async function updateTradeHistoryPrices(history, { historicalAsOf = null } = {}) {
   const symbols = [...new Set(history.map((item) => item.symbol).filter(Boolean))];
   if (symbols.length === 0) {
     return;
@@ -2788,12 +3316,19 @@ async function updateTradeHistoryPrices(history) {
 
   try {
     const query = new URLSearchParams({ symbols: symbols.join(",") });
+    if (historicalAsOf && replayDate.value) {
+      query.set("date", replayDate.value);
+      query.set("time", historicalAsOf);
+    }
     const payload = await getJson(`/api/options/prices?${query.toString()}`);
     updatePaperLedgerPrices(payload.prices || {});
     const savedHistoryById = new Map(loadTradeHistory().map((item) => [item.id, item]));
     const historyById = new Map(history.map((item) => [item.id, item]));
     for (const row of fields.tradeHistory.querySelectorAll(".trade-history-row")) {
       const item = historyById.get(row.dataset.historyId);
+      if (!item) {
+        continue;
+      }
       const symbol = row.dataset.symbol;
       const entryPrice = optionalNumber(row.dataset.entryPrice);
       const savedItem = savedHistoryById.get(row.dataset.historyId);
@@ -2839,6 +3374,12 @@ function refreshVisibleTradeHistoryPrices() {
     return;
   }
   const selectedDate = replayDate.value;
+  // Historical rows get their as-of price and high from the same cached
+  // one-minute outcome series. A live snapshot here would overwrite that
+  // replay point with a later or end-of-day price.
+  if (selectedDate && selectedDate !== currentHostDate()) {
+    return;
+  }
   const selectedTickers = getSelectedTickers();
   const history = loadTradeHistory().filter((item) =>
     historyItemDate(item) === selectedDate && matchesTickerFilter(item, selectedTickers)
@@ -2952,11 +3493,13 @@ function saveTradeHistory(history) {
   ];
   try {
     localStorage.setItem(TRADE_HISTORY_STORAGE_KEY, JSON.stringify(attempts[0]));
+    schedulePersistentStorageSync();
     return true;
   } catch (_error) {
     for (const compacted of attempts.slice(1)) {
       try {
         localStorage.setItem(TRADE_HISTORY_STORAGE_KEY, JSON.stringify(compacted));
+        schedulePersistentStorageSync();
         setStatus(
           `Trade history storage was full, so the app compacted older saved picks to keep the latest ${compacted.length}.`,
           true
@@ -3086,10 +3629,156 @@ function normalizePaperLedgerTrade(trade) {
 function savePaperLedger(ledger) {
   try {
     localStorage.setItem(PAPER_LEDGER_STORAGE_KEY, JSON.stringify(uniquePaperLedgerTrades(ledger)));
+    schedulePersistentStorageSync();
   } catch (_error) {
     if (fields.paperLedger) {
       fields.paperLedger.textContent = "Paper simulation ledger could not be saved in this browser.";
     }
+  }
+}
+
+async function initializePersistentStorage() {
+  persistentStorageHydrating = true;
+  try {
+    const snapshot = await getJson("/api/storage/snapshot");
+    const browserHistory = loadTradeHistory();
+    const databaseHistory = Array.isArray(snapshot.trade_history) ? snapshot.trade_history : [];
+    const mergedHistory = mergePersistentRecords(databaseHistory, browserHistory, tradeHistoryMergeKey)
+      .sort((a, b) => String(b.timestamp?.iso || "").localeCompare(String(a.timestamp?.iso || "")));
+    persistTradeHistoryLocally(mergedHistory);
+
+    const browserLedger = loadPaperLedger();
+    const databaseLedger = Array.isArray(snapshot.paper_ledger) ? snapshot.paper_ledger : [];
+    const mergedLedger = uniquePaperLedgerTrades(
+      mergePersistentRecords(databaseLedger, browserLedger, paperLedgerMergeKey)
+    );
+    persistPaperLedgerLocally(mergedLedger);
+
+    const mergedTracking = mergeTrackedTickerHistory(
+      snapshot.tracked_tickers,
+      loadTrackedTickerHistory()
+    );
+    localStorage.setItem(TRACKING_HISTORY_STORAGE_KEY, JSON.stringify(mergedTracking));
+    localStorage.setItem(DATABASE_MIGRATION_STORAGE_KEY, "1");
+    renderTradeHistory();
+    renderPaperLedger();
+    renderTrackingOverview();
+  } catch (error) {
+    console.warn("SQLite storage is unavailable; browser storage remains active.", error);
+  } finally {
+    persistentStorageHydrating = false;
+    schedulePersistentStorageSync({ immediate: true });
+  }
+}
+
+function mergePersistentRecords(databaseRows, browserRows, keyFor) {
+  const merged = new Map();
+  for (const row of [...(databaseRows || []), ...(browserRows || [])]) {
+    if (!row || typeof row !== "object") {
+      continue;
+    }
+    merged.set(keyFor(row), row);
+  }
+  return [...merged.values()];
+}
+
+function tradeHistoryMergeKey(item) {
+  return String(item.id || [
+    historyItemDate(item),
+    item.timestamp?.iso,
+    item.symbol,
+    item.rank,
+  ].join(":"));
+}
+
+function paperLedgerMergeKey(trade) {
+  return String(trade.id || [paperLedgerDay(trade), trade.symbol].join(":"));
+}
+
+function mergeTrackedTickerHistory(databaseTracking, browserTracking) {
+  const merged = {};
+  for (const source of [databaseTracking, browserTracking]) {
+    if (!source || typeof source !== "object" || Array.isArray(source)) {
+      continue;
+    }
+    for (const [day, tickers] of Object.entries(source)) {
+      const values = Array.isArray(tickers) ? tickers : [];
+      merged[day] = [...new Set([...(merged[day] || []), ...values]
+        .map((ticker) => String(ticker).trim().toUpperCase())
+        .filter(Boolean))].sort();
+    }
+  }
+  return merged;
+}
+
+function persistTradeHistoryLocally(history) {
+  const attempts = [
+    history,
+    compactTradeHistoryForStorage(history, MAX_TRADE_HISTORY_ITEMS),
+    compactTradeHistoryForStorage(history, COMPACT_TRADE_HISTORY_ITEMS),
+  ];
+  for (const rows of attempts) {
+    try {
+      localStorage.setItem(TRADE_HISTORY_STORAGE_KEY, JSON.stringify(rows));
+      return true;
+    } catch (_error) {
+      // SQLite still retains all rows if the browser cache is full.
+    }
+  }
+  return false;
+}
+
+function persistPaperLedgerLocally(ledger) {
+  try {
+    localStorage.setItem(PAPER_LEDGER_STORAGE_KEY, JSON.stringify(uniquePaperLedgerTrades(ledger)));
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function schedulePersistentStorageSync({ immediate = false } = {}) {
+  if (persistentStorageHydrating) {
+    return;
+  }
+  if (persistentStorageSyncTimer !== null) {
+    clearTimeout(persistentStorageSyncTimer);
+  }
+  persistentStorageSyncTimer = setTimeout(syncPersistentStorage, immediate ? 0 : 350);
+}
+
+async function syncPersistentStorage() {
+  persistentStorageSyncTimer = null;
+  if (persistentStorageSyncInFlight) {
+    persistentStorageSyncQueued = true;
+    return;
+  }
+  persistentStorageSyncInFlight = true;
+  try {
+    await postJson("/api/storage/sync", {
+      trade_history: loadTradeHistory(),
+      paper_ledger: loadPaperLedger(),
+      tracked_tickers: loadTrackedTickerHistory(),
+    });
+  } catch (error) {
+    console.warn("SQLite sync failed; records remain cached in this browser.", error);
+  } finally {
+    persistentStorageSyncInFlight = false;
+    if (persistentStorageSyncQueued) {
+      persistentStorageSyncQueued = false;
+      schedulePersistentStorageSync({ immediate: true });
+    }
+  }
+}
+
+async function deletePersistentStorageDay(recordType, day) {
+  try {
+    await postJson("/api/storage/delete-day", {
+      record_type: recordType,
+      day,
+    });
+  } catch (error) {
+    console.warn(`Could not clear ${recordType} from SQLite.`, error);
   }
 }
 

@@ -3,38 +3,23 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>trading_bot</title>
+    <title>Trading Bot</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <main class="shell">
       <section class="toolbar" aria-label="Analysis controls">
         <div class="brand">
-          <h1>trading_bot</h1>
-          <p>GEX market read</p>
+          <span class="brand-kicker">Market intelligence</span>
+          <h1>Trading Bot</h1>
+          <p>GEX + options market read</p>
         </div>
 
         <form id="analysis-form" class="controls">
           <div class="ticker-control" aria-describedby="ticker-help">
             <div class="ticker-control-heading">
-              <span>Ticker</span>
-              <div class="ticker-heading-actions">
-                <label class="max-contract-control">
-                  <span>Max contract</span>
-                  <select id="max-contract-cost" aria-label="Maximum total price for one option contract">
-                    <option value="">Any price</option>
-                    <option value="100">$100</option>
-                    <option value="250">$250</option>
-                    <option value="500">$500</option>
-                    <option value="750">$750</option>
-                    <option value="1000">$1,000</option>
-                    <option value="1500">$1,500</option>
-                    <option value="2500">$2,500</option>
-                    <option value="5000">$5,000</option>
-                  </select>
-                </label>
-                <button id="save-ticker-group" type="button">Save Group</button>
-              </div>
+              <span>Tracked tickers</span>
+              <span id="ticker-selection-count" class="selection-count">1 selected</span>
             </div>
             <div class="ticker-presets" aria-label="Ticker groups">
               <button type="button" data-ticker-group="NDX">NDX</button>
@@ -44,7 +29,6 @@
               <button type="button" data-ticker-group="">Clear</button>
             </div>
             <div id="saved-ticker-groups" class="saved-ticker-groups" aria-label="Saved ticker groups"></div>
-            <input id="ticker-group-name" type="text" placeholder="Group name, e.g. Morning watch" />
             <div id="ticker-checklist" class="ticker-checklist" aria-label="Ticker checklist">
               <label><input type="checkbox" value="NDX" data-ticker-checkbox />NDX</label>
               <label><input type="checkbox" value="SPX" data-ticker-checkbox checked />SPX</label>
@@ -73,35 +57,56 @@
               <label><input type="checkbox" value="WDC" data-ticker-checkbox />WDC</label>
               <label><input type="checkbox" value="WDCX" data-ticker-checkbox />WDCX</label>
             </div>
-            <small id="ticker-help">Check one or more tickers. Max contract is the most the bot may spend for one 100-share option contract.</small>
+            <div class="ticker-save-row">
+              <input id="ticker-group-name" type="text" placeholder="Group name" />
+              <button id="save-ticker-group" type="button">Save</button>
+            </div>
+            <small id="ticker-help">Select one or more markets to analyze together.</small>
           </div>
 
-          <label>
-            <span>Period</span>
-            <select id="period" name="period">
-              <option value="zero">0DTE</option>
-              <option value="one">1DTE</option>
-              <option value="full">Full</option>
-            </select>
-          </label>
+          <div class="analysis-actions">
+            <label class="max-contract-control">
+              <span>Max contract</span>
+              <select id="max-contract-cost" aria-label="Maximum total price for one option contract">
+                <option value="">Any price</option>
+                <option value="100">$100</option>
+                <option value="250">$250</option>
+                <option value="500">$500</option>
+                <option value="750">$750</option>
+                <option value="1000" selected>$1,000</option>
+                <option value="1500">$1,500</option>
+                <option value="2500">$2,500</option>
+                <option value="5000">$5,000</option>
+              </select>
+            </label>
 
-          <button id="analyze-button" type="submit">Analyze</button>
+            <label>
+              <span>Period</span>
+              <select id="period" name="period">
+                <option value="zero">0DTE</option>
+                <option value="one">1DTE</option>
+                <option value="full">Full</option>
+              </select>
+            </label>
 
-          <label class="inline-toggle">
-            <input id="auto-refresh" type="checkbox" checked />
-            <span>Auto</span>
-          </label>
+            <label>
+              <span>Refresh</span>
+              <select id="refresh-seconds">
+                <option value="1">1 sec</option>
+                <option value="5">5 sec</option>
+                <option value="15" selected>15 sec</option>
+                <option value="30">30 sec</option>
+                <option value="60">60 sec</option>
+              </select>
+            </label>
 
-          <label>
-            <span>Refresh</span>
-            <select id="refresh-seconds">
-              <option value="1">1 sec</option>
-              <option value="5">5 sec</option>
-              <option value="15" selected>15 sec</option>
-              <option value="30">30 sec</option>
-              <option value="60">60 sec</option>
-            </select>
-          </label>
+            <button id="analyze-button" type="submit">Analyze</button>
+
+            <label class="inline-toggle">
+              <input id="auto-refresh" type="checkbox" checked />
+              <span>Auto analysis</span>
+            </label>
+          </div>
         </form>
       </section>
 
@@ -116,11 +121,12 @@
 
       <section class="contract-workspace" aria-label="Contract analysis">
         <section class="panel alpaca-panel contract-panel">
-          <div class="panel-heading">
-            <h2>Contract Watchlist</h2>
-          </div>
-          <div class="live-controls">
-            <button id="live-update" type="button">Refresh Once</button>
+          <div class="watchlist-layout">
+            <aside class="watchlist-sidebar" aria-label="Contract watchlist controls">
+              <div class="panel-heading">
+                <h2>Contract Watchlist</h2>
+              </div>
+              <div class="live-controls">
             <button id="live-toggle" type="button">Start Auto Live</button>
             <label>
               <span>Refresh</span>
@@ -132,9 +138,9 @@
                 <option value="300">5 min</option>
               </select>
             </label>
-            <div id="live-status" class="mini-status">Auto Live is off. Use Refresh Once for one manual live pull.</div>
-          </div>
-          <div class="replay-controls">
+            <div id="live-status" class="mini-status">Auto Live is off.</div>
+              </div>
+              <div class="replay-controls">
             <label>
               <span>Date</span>
               <input id="replay-date" type="date" />
@@ -143,7 +149,10 @@
               <span>Time</span>
               <input id="replay-time" type="range" min="23400" max="46800" step="1" value="46740" />
             </label>
-            <strong id="replay-clock">12:59:00</strong>
+            <div class="replay-clock-wrap">
+              <span id="replay-timezone">Local time</span>
+              <strong id="replay-clock">12:59:00</strong>
+            </div>
             <button id="replay-today" type="button">Today Now</button>
             <button id="replay-play" type="button">Play</button>
             <button id="replay-refresh" type="button">Update Data</button>
@@ -156,10 +165,26 @@
               <button type="button" data-speed="25">25x</button>
               <button type="button" data-speed="50">50x</button>
             </div>
-          </div>
-          <div id="day-simulation-status" class="mini-status hidden" aria-live="polite"></div>
-          <div id="contract-summary" class="mini-status">Run GEX analysis to scan contracts.</div>
-          <div id="best-pick" class="best-pick hidden">
+              </div>
+              <p id="replay-resolution-note" class="replay-resolution-note">The clock moves second by second. Historical statistics update at each available one-minute bar.</p>
+              <section class="tracking-overview" aria-labelledby="tracking-overview-title">
+            <div class="tracking-overview-heading">
+              <h3 id="tracking-overview-title">Tracking Overview</h3>
+              <span>Saved locally in this browser</span>
+            </div>
+            <div class="tracking-overview-table" role="table" aria-label="Tickers tracked by date">
+              <div class="tracking-overview-row tracking-overview-header" role="row">
+                <span role="columnheader">Date</span>
+                <span role="columnheader">Tickers tracked</span>
+              </div>
+              <div id="tracking-overview-rows"></div>
+            </div>
+              </section>
+            </aside>
+            <div class="watchlist-main">
+              <div id="day-simulation-status" class="mini-status hidden" aria-live="polite"></div>
+              <div id="contract-summary" class="mini-status">Run GEX analysis to scan contracts.</div>
+              <div id="best-pick" class="best-pick hidden">
             <div>
               <span class="label">Best Pick</span>
               <strong id="best-pick-action">-</strong>
@@ -167,8 +192,8 @@
               <p id="best-pick-reason">-</p>
               <p id="best-pick-exit">-</p>
             </div>
-          </div>
-          <div class="trade-history-panel">
+              </div>
+              <div class="trade-history-panel">
             <div class="panel-heading compact-heading">
               <h3>Trade Permission History</h3>
               <div class="history-actions">
@@ -223,8 +248,10 @@
               <div id="paper-ledger" class="paper-ledger-list">No simulated paper trades yet.</div>
             </div>
             <div id="trade-history" class="trade-history-list">No trade-permission picks yet.</div>
+              </div>
+              <div id="contract-list" class="contract-list">-</div>
+            </div>
           </div>
-          <div id="contract-list" class="contract-list">-</div>
         </section>
       </section>
 

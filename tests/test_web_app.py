@@ -9,21 +9,51 @@ from trading_bot.web_app import (
     STATIC_DIR,
     TradingBotWebHandler,
     _historical_option_prices,
+    _option_price_from_snapshot,
     _option_outcomes,
     _stock_technicals,
 )
 
 
 class WebAppTests(unittest.TestCase):
+    def test_option_snapshot_rejects_extremely_wide_quote_midpoint(self):
+        price = _option_price_from_snapshot({
+            "latestQuote": {"bp": 4.0, "ap": 146.0},
+            "latestTrade": {"p": 4.25},
+        })
+
+        self.assertEqual(price["mid"], 4.25)
+        self.assertEqual(price["bid"], 4.0)
+        self.assertEqual(price["ask"], 146.0)
+
+    def test_option_snapshot_returns_no_mark_for_wide_quote_without_trade(self):
+        price = _option_price_from_snapshot({
+            "latestQuote": {"bp": 4.0, "ap": 146.0},
+        })
+
+        self.assertIsNone(price["mid"])
+
+    def test_frontend_replaces_corrupt_ledger_high_with_authoritative_bars(self):
+        javascript = (STATIC_DIR / "app.js").read_text()
+
+        self.assertIn('const authoritative = outcome.source === "market-data option bars"', javascript)
+        self.assertIn("const current = reliableOptionMark(priceMap?.[trade.symbol])", javascript)
+        self.assertIn("spreadRatio > 0.50", javascript)
+        self.assertIn("const displayedHistoryOutcomes = new Map()", javascript)
+        self.assertIn('replayOutcome?.source === "market-data option bars"', javascript)
+        self.assertIn("function refreshHistoricalPaperLedgerOutcomes(ledger, replayPoint)", javascript)
+
     def test_frontend_defaults_to_spx_and_fifteen_second_refreshes(self):
         html = (STATIC_DIR / "index.html").read_text()
         javascript = (STATIC_DIR / "app.js").read_text()
 
         self.assertIn('value="SPX" data-ticker-checkbox checked', html)
-        self.assertNotIn('value="NDX" data-ticker-checkbox checked', html)
+        self.assertIn('value="NDX" data-ticker-checkbox checked', html)
         self.assertEqual(html.count('<option value="15" selected>15 sec</option>'), 2)
         self.assertIn('Math.max(15, Number(liveInterval.value || 15))', javascript)
-        self.assertIn('return selected.length > 0 ? [...new Set(selected)] : ["SPX"]', javascript)
+        self.assertIn('return selected.length > 0 ? [...new Set(selected)] : ["NDX", "SPX"]', javascript)
+        self.assertIn("function selectedReplayUsesLiveData()", javascript)
+        self.assertIn("if (!day || day > currentHostDate() || isWeekendDate(day))", javascript)
 
     def test_frontend_uses_compact_local_time_replay_controls(self):
         html = (STATIC_DIR / "index.html").read_text()
@@ -45,7 +75,10 @@ class WebAppTests(unittest.TestCase):
     def test_replay_updates_historical_rows_at_selected_speed(self):
         javascript = (STATIC_DIR / "app.js").read_text()
 
-        self.assertIn("const nextValue = Math.min(previousValue + replaySpeed", javascript)
+        self.assertIn("const REPLAY_CLOCK_TICK_MS = 100", javascript)
+        self.assertIn("replayClockRemainder += replaySpeed * (REPLAY_CLOCK_TICK_MS / 1000)", javascript)
+        self.assertIn("const nextValue = Math.min(previousValue + wholeSeconds", javascript)
+        self.assertIn("replayTimer = setTimeout(runReplayClockTick, REPLAY_CLOCK_TICK_MS)", javascript)
         self.assertIn("if (crossedMinute) {", javascript)
         self.assertIn("renderTradeHistory();", javascript)
         self.assertIn("loadOptionReplay({ refreshHistory: false })", javascript)
@@ -65,6 +98,17 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("const replayOutcomeCache = new Map()", javascript)
         self.assertIn("Promise.allSettled([outcomeUpdate, updateTradeHistoryPrices(history)])", javascript)
         self.assertIn("}, 300);", javascript)
+
+    def test_trade_history_rows_wrap_status_age_and_greeks_without_clipping(self):
+        javascript = (STATIC_DIR / "app.js").read_text()
+        stylesheet = (STATIC_DIR / "styles.css").read_text()
+
+        self.assertIn('class="history-tags"', javascript)
+        self.assertIn('class="history-stat history-recorded-stat"', javascript)
+        self.assertIn('class="history-stat history-exit-stat"', javascript)
+        self.assertIn("@media (max-width: 1750px) and (min-width: 761px)", stylesheet)
+        self.assertIn(".trade-history-row .history-current-time", stylesheet)
+        self.assertIn("min-height: 168px", stylesheet)
 
     def test_frontend_uses_confirmed_market_exit_rules_without_fixed_cash_simulation(self):
         html = (STATIC_DIR / "index.html").read_text()
@@ -112,6 +156,17 @@ class WebAppTests(unittest.TestCase):
         self.assertIn('getJson("/api/storage/snapshot")', javascript)
         self.assertIn('postJson("/api/storage/sync"', javascript)
         self.assertIn('postJson("/api/storage/delete-day"', javascript)
+
+    def test_historical_slider_and_reload_are_sqlite_only(self):
+        html = (STATIC_DIR / "index.html").read_text()
+        javascript = (STATIC_DIR / "app.js").read_text()
+
+        self.assertIn('id="cache-day"', html)
+        self.assertIn('id="replay-refresh" type="button">Reload SQLite', html)
+        self.assertIn('local_only: "1"', javascript)
+        self.assertNotIn('allowRemote: true', javascript)
+        self.assertIn('local_only: Boolean(replayPoint)', javascript)
+        self.assertIn('postJson("/api/cache/day"', javascript)
         self.assertIn("function mergePersistentRecords", javascript)
         self.assertIn("initializePersistentStorage();", javascript)
 
@@ -278,29 +333,27 @@ class WebAppTests(unittest.TestCase):
 
     def test_handle_option_replay_returns_json(self):
         handler = _handler()
-        analysis = MagicMock()
-        analysis.as_dict.return_value = {"ticker": "AAPL", "bias": "bearish"}
-        alpaca = MagicMock()
-        recommendation = MagicMock()
-        replay = MagicMock()
-        replay.as_dict.return_value = {"date": "2026-07-02", "candidates": []}
+        cached_payload = {
+            "date": "2026-07-02",
+            "candidates": [],
+            "analysis": {"ticker": "AAPL", "bias": "bearish"},
+        }
 
-        with patch("trading_bot.web_app._analyze_ticker", return_value=analysis) as analyze_mock:
-            with patch("trading_bot.web_app._market_data_client", return_value=alpaca):
-                with patch("trading_bot.web_app.recommend_option_contracts", return_value=recommendation):
-                    with patch("trading_bot.web_app.replay_option_recommendation", return_value=replay) as replay_mock:
-                        handler._handle_option_replay("ticker=aapl&period=zero&date=2026-07-02&time=10:45:30")
+        with patch("trading_bot.web_app._cached_replay_payload", return_value=cached_payload) as cached_mock:
+            handler._handle_option_replay("ticker=aapl&period=zero&date=2026-07-02&time=10:45:30")
 
         self.assertEqual(handler.status, HTTPStatus.OK)
         payload = json.loads(handler.body.decode("utf-8"))
         self.assertEqual(payload["date"], "2026-07-02")
         self.assertEqual(payload["analysis"]["bias"], "bearish")
-        analyze_mock.assert_called_once_with("AAPL", "zero", replay_date="2026-07-02", replay_time="10:45:30")
-        replay_mock.assert_called_once_with(
-            recommendation=recommendation,
-            alpaca_client=alpaca,
+        cached_mock.assert_called_once_with(
+            storage=unittest.mock.ANY,
+            ticker="AAPL",
+            period="zero",
             replay_date="2026-07-02",
             replay_time="10:45:30",
+            limit=5,
+            max_contract_cost=None,
         )
 
     def test_stock_technicals_uses_iex_feed_for_alpaca_bars(self):
@@ -316,19 +369,23 @@ class WebAppTests(unittest.TestCase):
 
     def test_option_outcomes_returns_high_low_and_estimated_greeks(self):
         alpaca = MagicMock()
-        alpaca.get_option_bars.return_value = {
+        alpaca.provider_name = "databento"
+        cached_bars = {
             "AAPL260710C00100000": [
                 {"t": "2026-07-10T14:30:00Z", "h": 2.6, "l": 2.1, "c": 2.4},
                 {"t": "2026-07-10T15:00:00Z", "h": 4.2, "l": 3.8, "c": 4.0},
                 {"t": "2026-07-10T16:00:00Z", "h": 1.9, "l": 1.4, "c": 1.6},
             ]
         }
-        alpaca.get_stock_bars.return_value = [
+        cached_stock_bars = [
             {"t": "2026-07-10T14:30:00Z", "c": 100.0},
             {"t": "2026-07-10T15:00:00Z", "c": 102.0},
             {"t": "2026-07-10T16:00:00Z", "c": 98.0},
         ]
 
+        cache = MagicMock()
+        cache.option_bars.return_value = cached_bars
+        cache.stock_bars.return_value = cached_stock_bars
         outcomes = _option_outcomes(
             alpaca,
             [
@@ -345,7 +402,7 @@ class WebAppTests(unittest.TestCase):
                     "entry_iv": 0.3,
                     "entry_spot": 100,
                 }
-            ],
+            ], option_bar_cache=cache,
         )
 
         outcome = outcomes["signal-1"]
@@ -355,6 +412,123 @@ class WebAppTests(unittest.TestCase):
         self.assertTrue(outcome["went_up"])
         self.assertTrue(outcome["high_greeks"]["estimated"])
         self.assertTrue(outcome["low_greeks"]["estimated"])
+
+    def test_option_outcomes_local_only_never_calls_market_provider(self):
+        market = MagicMock()
+        market.provider_name = "databento"
+        cache = MagicMock()
+        cache.option_bars.return_value = {
+            "AAPL260710C00100000": [
+                {"t": "2026-07-10T14:30:00Z", "h": 2.6, "l": 2.1, "c": 2.4},
+            ]
+        }
+        cache.stock_bars.return_value = []
+
+        outcomes = _option_outcomes(
+            market,
+            [{
+                "id": "local-only",
+                "symbol": "AAPL260710C00100000",
+                "date": "2026-07-10",
+                "timestamp_iso": "2026-07-10T14:30:00Z",
+                "underlying": "AAPL",
+                "entry_price": 2.4,
+            }],
+            option_bar_cache=cache,
+            allow_remote=False,
+        )
+
+        self.assertEqual(outcomes["local-only"]["current"], 2.4)
+        market.get_option_bars.assert_not_called()
+        market.get_stock_bars.assert_not_called()
+
+    def test_completed_day_outcomes_never_call_provider_even_when_remote_is_allowed(self):
+        market = MagicMock()
+        market.provider_name = "databento"
+        cache = MagicMock()
+        cache.option_bars.return_value = {}
+        cache.stock_bars.return_value = None
+
+        outcomes = _option_outcomes(
+            market,
+            [{
+                "id": "missing-cache-row",
+                "symbol": "AAPL260710C00100000",
+                "date": "2026-07-10",
+                "timestamp_iso": "2026-07-10T14:30:00Z",
+                "underlying": "AAPL",
+                "entry_price": 2.4,
+            }],
+            option_bar_cache=cache,
+            allow_remote=True,
+        )
+
+        self.assertIn("not cached in SQLite", outcomes["missing-cache-row"]["error"])
+        market.get_option_bars.assert_not_called()
+        market.get_stock_bars.assert_not_called()
+
+    def test_historical_option_prices_never_call_provider(self):
+        market = MagicMock()
+        market.provider_name = "databento"
+        cache = MagicMock()
+        cache.option_bars.return_value = {}
+
+        prices = _historical_option_prices(
+            market,
+            ["AAPL260710C00100000"],
+            "2026-07-10",
+            "12:00:00",
+            option_bar_cache=cache,
+        )
+
+        self.assertIsNone(prices["AAPL260710C00100000"]["mid"])
+        self.assertEqual(prices["AAPL260710C00100000"]["source"], "not cached in SQLite")
+        market.get_option_bars.assert_not_called()
+
+    def test_option_outcomes_uses_cached_gex_spot_for_index_greeks(self):
+        market = MagicMock()
+        market.provider_name = "databento"
+        cache = MagicMock()
+        cache.option_bars.return_value = {
+            "SPXW260717P07450000": [
+                {"t": "2026-07-17T14:30:00Z", "h": 8.0, "l": 7.5, "c": 7.8},
+                {"t": "2026-07-17T15:00:00Z", "h": 12.0, "l": 10.0, "c": 11.5},
+            ]
+        }
+        cache.stock_bars.return_value = [
+            {"t": "2026-07-17T14:30:00Z", "c": 744.0},
+            {"t": "2026-07-17T15:00:00Z", "c": 745.0},
+        ]
+        cache.gex_spot_rows.return_value = [
+            {"timestamp": 1784298600, "spot": 7440.0},
+            {"timestamp": 1784300400, "spot": 7450.0},
+        ]
+
+        with patch("trading_bot.web_app._solve_implied_volatility", return_value=0.25):
+            with patch("trading_bot.web_app._black_scholes_delta", return_value=-0.4) as delta_mock:
+                with patch("trading_bot.web_app._black_scholes_gamma", return_value=0.01):
+                    outcomes = _option_outcomes(
+                        market,
+                        [{
+                            "id": "spx-index-spot",
+                            "symbol": "SPXW260717P07450000",
+                            "date": "2026-07-17",
+                            "timestamp_iso": "2026-07-17T14:30:00Z",
+                            "underlying": "SPX",
+                            "expiration_date": "2026-07-17",
+                            "strike_price": 7450,
+                            "contract_type": "put",
+                            "entry_price": 7.8,
+                            "entry_spot": 7440,
+                        }],
+                        option_bar_cache=cache,
+                        allow_remote=False,
+                    )
+
+        self.assertEqual(outcomes["spx-index-spot"]["high_greeks"]["delta"], -0.4)
+        self.assertIn(7450.0, {call.args[1] for call in delta_mock.call_args_list})
+        self.assertNotIn(745.0, {call.args[1] for call in delta_mock.call_args_list})
+        cache.gex_spot_rows.assert_called_once_with("2026-07-17", "SPX")
 
     def test_option_outcomes_uses_saved_path_when_option_bars_fail(self):
         alpaca = MagicMock()
@@ -391,14 +565,16 @@ class WebAppTests(unittest.TestCase):
 
     def test_option_outcomes_stops_at_selected_replay_time(self):
         alpaca = MagicMock()
-        alpaca.get_option_bars.return_value = {
+        alpaca.provider_name = "databento"
+        cache = MagicMock()
+        cache.option_bars.return_value = {
             "AAPL260710C00100000": [
                 {"t": "2026-07-10T14:30:00Z", "h": 2.6, "l": 2.1, "c": 2.4},
                 {"t": "2026-07-10T15:00:00Z", "h": 4.2, "l": 3.8, "c": 4.0},
                 {"t": "2026-07-10T16:00:00Z", "h": 8.0, "l": 7.5, "c": 7.8},
             ]
         }
-        alpaca.get_stock_bars.return_value = []
+        cache.stock_bars.return_value = []
 
         outcomes = _option_outcomes(
             alpaca,
@@ -409,7 +585,7 @@ class WebAppTests(unittest.TestCase):
                 "timestamp_iso": "2026-07-10T14:30:00Z",
                 "as_of_time": "11:00:00",
                 "entry_price": 2.4,
-            }],
+            }], option_bar_cache=cache,
         )
 
         self.assertEqual(outcomes["signal-as-of"]["high"], 4.2)
@@ -417,7 +593,9 @@ class WebAppTests(unittest.TestCase):
 
     def test_option_outcomes_uses_exact_replay_instant_for_every_symbol(self):
         alpaca = MagicMock()
-        alpaca.get_option_bars.return_value = {
+        alpaca.provider_name = "databento"
+        cache = MagicMock()
+        cache.option_bars.return_value = {
             "NDXP260717C29140000": [
                 {"t": "2026-07-17T16:21:00Z", "h": 2.50, "l": 2.10, "c": 2.32},
                 {"t": "2026-07-17T16:52:00Z", "h": 4.99, "l": 4.20, "c": 4.50},
@@ -428,7 +606,7 @@ class WebAppTests(unittest.TestCase):
                 {"t": "2026-07-17T16:52:00Z", "h": 5.25, "l": 4.70, "c": 5.00},
             ],
         }
-        alpaca.get_stock_bars.return_value = []
+        cache.stock_bars.return_value = []
 
         entries = [
             {
@@ -450,7 +628,7 @@ class WebAppTests(unittest.TestCase):
             },
         ]
 
-        outcomes = _option_outcomes(alpaca, entries)
+        outcomes = _option_outcomes(alpaca, entries, option_bar_cache=cache)
 
         self.assertEqual(outcomes["ndx-signal"]["high"], 4.99)
         self.assertEqual(outcomes["ndx-signal"]["current"], 4.50)
@@ -478,11 +656,14 @@ class WebAppTests(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(outcomes["signal-3"]["error"], "option bars unavailable")
+        self.assertIn("not cached in SQLite", outcomes["signal-3"]["error"])
+        alpaca.get_option_bars.assert_not_called()
 
     def test_historical_option_prices_uses_latest_bar_close(self):
         alpaca = MagicMock()
-        alpaca.get_option_bars.return_value = {
+        alpaca.provider_name = "databento"
+        cache = MagicMock()
+        cache.option_bars.return_value = {
             "QQQ260717C00720000": [
                 {"t": "2026-07-13T14:30:00Z", "c": 2.1},
                 {"t": "2026-07-13T15:00:00Z", "c": 2.85},
@@ -494,11 +675,12 @@ class WebAppTests(unittest.TestCase):
             ["QQQ260717C00720000"],
             "2026-07-13",
             "11:00:00",
+            option_bar_cache=cache,
         )
 
         self.assertEqual(prices["QQQ260717C00720000"]["mid"], 2.85)
-        self.assertEqual(prices["QQQ260717C00720000"]["source"], "historical option bar")
-        alpaca.get_option_bars.assert_called_once()
+        self.assertEqual(prices["QQQ260717C00720000"]["source"], "SQLite historical option bar")
+        alpaca.get_option_bars.assert_not_called()
 
 def _handler(body: bytes = b""):
     handler = object.__new__(TradingBotWebHandler)

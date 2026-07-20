@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class TradingBotStorage:
@@ -90,6 +90,41 @@ class TradingBotStorage:
                 );
                 CREATE INDEX IF NOT EXISTS historical_option_bars_date
                     ON historical_option_bars(session_date, symbol);
+
+                CREATE TABLE IF NOT EXISTS historical_stock_bars (
+                    provider TEXT NOT NULL,
+                    session_date TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (provider, session_date, symbol, timeframe)
+                );
+
+                CREATE TABLE IF NOT EXISTS historical_gex_rows (
+                    session_date TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (session_date, ticker, period, mode)
+                );
+
+                CREATE TABLE IF NOT EXISTS historical_cache_status (
+                    session_date TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    option_contract_count INTEGER NOT NULL DEFAULT 0,
+                    detail_json TEXT NOT NULL DEFAULT '{}',
+                    completed_at TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (session_date, ticker, period, provider)
+                );
+                CREATE INDEX IF NOT EXISTS historical_cache_status_date
+                    ON historical_cache_status(session_date, ticker);
                 """
             )
             if previous_version < 3:
@@ -261,6 +296,174 @@ class TradingBotStorage:
                 )
                 saved += 1
         return saved
+
+    def stock_bars(self, provider: str, day: str, symbol: str, timeframe: str) -> list[dict[str, Any]] | None:
+        if not _valid_day(day):
+            raise ValueError("day must use YYYY-MM-DD format.")
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload_json FROM historical_stock_bars
+                WHERE provider = ? AND session_date = ? AND symbol = ? AND timeframe = ?
+                """,
+                (_upper(provider), day, _upper(symbol), timeframe),
+            ).fetchone()
+        return json.loads(row["payload_json"]) if row is not None else None
+
+    def save_stock_bars(
+        self,
+        provider: str,
+        day: str,
+        symbol: str,
+        timeframe: str,
+        bars: list[dict[str, Any]],
+    ) -> None:
+        if not _valid_day(day):
+            raise ValueError("day must use YYYY-MM-DD format.")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO historical_stock_bars(provider, session_date, symbol, timeframe, payload_json)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(provider, session_date, symbol, timeframe) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    fetched_at = CURRENT_TIMESTAMP
+                """,
+                (_upper(provider), day, _upper(symbol), timeframe, json.dumps(bars, separators=(",", ":"))),
+            )
+
+    def gex_rows(self, day: str, ticker: str, period: str) -> dict[str, list[dict[str, Any]]]:
+        if not _valid_day(day):
+            raise ValueError("day must use YYYY-MM-DD format.")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT mode, payload_json FROM historical_gex_rows
+                WHERE session_date = ? AND ticker = ? AND period = ?
+                """,
+                (day, _upper(ticker), period.lower()),
+            )
+        return {row["mode"]: json.loads(row["payload_json"]) for row in rows}
+
+    def gex_spot_rows(self, day: str, ticker: str) -> list[dict[str, Any]]:
+        """Return one cached classic GEX stream for historical index spot lookup."""
+        if not _valid_day(day):
+            raise ValueError("day must use YYYY-MM-DD format.")
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload_json FROM historical_gex_rows
+                WHERE session_date = ? AND ticker = ? AND mode = 'classic'
+                ORDER BY CASE period WHEN 'zero' THEN 0 WHEN 'one' THEN 1 ELSE 2 END
+                LIMIT 1
+                """,
+                (day, _upper(ticker)),
+            ).fetchone()
+        if row is None:
+            return []
+        payload = json.loads(row["payload_json"])
+        return payload if isinstance(payload, list) else []
+
+    def save_gex_rows(
+        self,
+        day: str,
+        ticker: str,
+        period: str,
+        rows_by_mode: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        if not _valid_day(day):
+            raise ValueError("day must use YYYY-MM-DD format.")
+        with self._connect() as connection:
+            for mode, rows in rows_by_mode.items():
+                if mode not in {"classic", "state"} or not isinstance(rows, list):
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO historical_gex_rows(session_date, ticker, period, mode, payload_json)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(session_date, ticker, period, mode) DO UPDATE SET
+                        payload_json = excluded.payload_json,
+                        fetched_at = CURRENT_TIMESTAMP
+                    """,
+                    (day, _upper(ticker), period.lower(), mode, json.dumps(rows, separators=(",", ":"))),
+                )
+
+    def cache_status(
+        self,
+        day: str,
+        *,
+        period: str | None = None,
+        provider: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if not _valid_day(day):
+            raise ValueError("day must use YYYY-MM-DD format.")
+        clauses = ["session_date = ?"]
+        params: list[Any] = [day]
+        if period:
+            clauses.append("period = ?")
+            params.append(period.lower())
+        if provider:
+            clauses.append("provider = ?")
+            params.append(_upper(provider))
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT session_date, ticker, period, provider, status,
+                       option_contract_count, detail_json, completed_at, updated_at
+                FROM historical_cache_status
+                WHERE {' AND '.join(clauses)}
+                ORDER BY ticker
+                """,
+                params,
+            )
+            return [
+                {
+                    "date": row["session_date"],
+                    "ticker": row["ticker"],
+                    "period": row["period"],
+                    "provider": row["provider"],
+                    "status": row["status"],
+                    "option_contract_count": row["option_contract_count"],
+                    "detail": json.loads(row["detail_json"]),
+                    "completed_at": row["completed_at"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in rows
+            ]
+
+    def save_cache_status(
+        self,
+        day: str,
+        ticker: str,
+        period: str,
+        provider: str,
+        *,
+        status: str,
+        option_contract_count: int,
+        detail: dict[str, Any],
+    ) -> None:
+        if not _valid_day(day):
+            raise ValueError("day must use YYYY-MM-DD format.")
+        completed = "CURRENT_TIMESTAMP" if status == "complete" else "NULL"
+        with self._connect() as connection:
+            connection.execute(
+                f"""
+                INSERT INTO historical_cache_status(
+                    session_date, ticker, period, provider, status,
+                    option_contract_count, detail_json, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, {completed})
+                ON CONFLICT(session_date, ticker, period, provider) DO UPDATE SET
+                    status = excluded.status,
+                    option_contract_count = excluded.option_contract_count,
+                    detail_json = excluded.detail_json,
+                    completed_at = excluded.completed_at,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    day, _upper(ticker), period.lower(), _upper(provider), status,
+                    max(0, int(option_contract_count)), json.dumps(detail, separators=(",", ":")),
+                ),
+            )
 
     @staticmethod
     def _payloads(connection: sqlite3.Connection, table: str, order_by: str) -> list[dict[str, Any]]:

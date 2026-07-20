@@ -15,7 +15,12 @@ from urllib.parse import parse_qs, urlparse
 from trading_bot.alpaca_client import AlpacaApiError, AlpacaClient, PaperOrderRequest
 from trading_bot.analysis import analyze_gex
 from trading_bot.config import AlpacaSettings, Settings
-from trading_bot.gex_client import AGGREGATION_PERIODS, GexApiError, GexClient
+from trading_bot.gex_client import (
+    AGGREGATION_PERIODS,
+    GexApiError,
+    GexClient,
+    historical_gex_inputs_from_rows,
+)
 from trading_bot.market_data import MarketDataClient, MarketDataError, create_market_data_client
 from trading_bot.options_analysis import _black_scholes_delta, _black_scholes_gamma, _solve_implied_volatility, recommend_option_contracts
 from trading_bot.options_replay import replay_option_recommendation
@@ -29,6 +34,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 EASTERN = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 DEFAULT_STOCK_DATA_FEED = "iex"
+MAX_OPTION_MARK_SPREAD_RATIO = 0.50
 TECHNICAL_UNDERLYING_OVERRIDES = {
     "SPX": "SPY",
     "NDX": "QQQ",
@@ -102,6 +108,10 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             self._handle_storage_history(parsed_url.query)
             return
 
+        if parsed_url.path == "/api/cache/status":
+            self._handle_cache_status(parsed_url.query)
+            return
+
         self._send_json({"error": "Not found."}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
@@ -121,6 +131,10 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
 
         if parsed_url.path == "/api/storage/delete-day":
             self._handle_storage_delete_day()
+            return
+
+        if parsed_url.path == "/api/cache/day":
+            self._handle_cache_day()
             return
 
         self._send_json({"error": "Not found."}, status=HTTPStatus.NOT_FOUND)
@@ -232,7 +246,11 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             replay_date = params.get("date", [""])[0].strip()
             replay_time = params.get("time", [""])[0].strip()
             if replay_date and replay_time:
-                self._send_json({"prices": _historical_option_prices(_market_data_client(), symbols, replay_date, replay_time)})
+                self._send_json({
+                    "prices": _historical_option_prices(
+                        _market_data_client(), symbols, replay_date, replay_time, option_bar_cache=_storage()
+                    )
+                })
                 return
             snapshots = _market_data_client().get_option_snapshots(symbols)
         except (MarketDataError, ValueError) as exc:
@@ -246,20 +264,10 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
         self._send_json({"prices": prices})
 
     def _handle_option_replay_prefetch(self, query: str) -> None:
-        params = parse_qs(query)
-        ticker = params.get("ticker", ["AAPL"])[0].strip().upper()
-        period = params.get("period", ["zero"])[0].strip().lower()
-        replay_date = params.get("date", [""])[0].strip()
-        try:
-            if not replay_date:
-                raise ValueError("date is required.")
-            if period not in AGGREGATION_PERIODS:
-                raise ValueError(f"period must be one of: {', '.join(AGGREGATION_PERIODS)}.")
-            payload = GexClient(Settings.from_env()).prefetch_historical_gex_date(ticker, period, replay_date)
-        except (GexApiError, ValueError) as exc:
-            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-            return
-        self._send_json(payload)
+        self._send_json(
+            {"error": "Historical prefetch is disabled. Use Cache Day once after the market closes."},
+            status=HTTPStatus.GONE,
+        )
 
     def _handle_option_replay(self, query: str) -> None:
         params = parse_qs(query)
@@ -270,6 +278,9 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
         max_expiration_days_raw = params.get("max_expiration_days", ["14"])[0]
         limit_raw = params.get("limit", ["5"])[0]
         max_contract_cost_raw = params.get("max_contract_cost", [""])[0].strip()
+        # Replay is deliberately SQLite-only. Cache Day is the sole path that
+        # downloads completed-session data from market/GEX providers.
+        local_only = True
 
         try:
             if not replay_date:
@@ -281,6 +292,18 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             if max_contract_cost is not None and max_contract_cost <= 0:
                 raise ValueError("max_contract_cost must be greater than zero.")
             requested_limit = int(limit_raw)
+            if local_only:
+                payload = _cached_replay_payload(
+                    storage=_storage(),
+                    ticker=ticker,
+                    period=period,
+                    replay_date=replay_date,
+                    replay_time=replay_time,
+                    limit=requested_limit,
+                    max_contract_cost=max_contract_cost,
+                )
+                self._send_json(payload)
+                return
             alpaca_client = _market_data_client()
             analysis = _analyze_ticker(ticker, period, replay_date=replay_date, replay_time=replay_time)
             recommendation = recommend_option_contracts(
@@ -331,8 +354,8 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             if period not in AGGREGATION_PERIODS:
                 allowed = ", ".join(AGGREGATION_PERIODS)
                 raise ValueError(f"period must be one of: {allowed}.")
-            payload = GexClient(Settings.from_env()).validate_historical_gex_date(ticker, period, replay_date)
-        except (GexApiError, ValueError) as exc:
+            rows = _storage().gex_rows(replay_date, ticker, period)
+        except (OSError, sqlite3.Error, ValueError) as exc:
             self._send_json(
                 {
                     "valid": False,
@@ -344,8 +367,16 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             )
             return
 
-        valid = bool(payload["classic_available"] and payload["state_available"])
-        self._send_json({"valid": valid, **payload})
+        valid = set(rows) == {"classic", "state"}
+        self._send_json({
+            "valid": valid,
+            "ticker": ticker,
+            "period": period,
+            "date": replay_date,
+            "classic_available": "classic" in rows,
+            "state_available": "state" in rows,
+            "source": "SQLite",
+        })
 
     def _handle_submit_alpaca_order(self) -> None:
         try:
@@ -372,7 +403,9 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
                 raise ValueError("entries are required.")
             if len(entries) > 1000:
                 raise ValueError("At most 1,000 option entries can be evaluated at once.")
-            outcomes = _option_outcomes(_market_data_client(), entries, option_bar_cache=_storage())
+            outcomes = _option_outcomes(
+                _market_data_client(), entries, option_bar_cache=_storage(), allow_remote=True
+            )
             self._send_json({"outcomes": outcomes})
         except (MarketDataError, ValueError) as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
@@ -419,6 +452,38 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             self._send_json({"deleted": deleted, "record_type": record_type, "day": day})
         except (OSError, sqlite3.Error, ValueError) as exc:
             self._send_json({"error": f"Database delete failed: {exc}"}, status=HTTPStatus.BAD_REQUEST)
+
+    def _handle_cache_status(self, query: str) -> None:
+        try:
+            params = parse_qs(query)
+            day = params.get("date", [""])[0].strip()
+            period = params.get("period", [""])[0].strip().lower() or None
+            provider = str(getattr(_market_data_client(), "provider_name", "market-data"))
+            rows = _storage().cache_status(day, period=period, provider=provider)
+            self._send_json({"date": day, "provider": provider, "caches": rows})
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            self._send_json({"error": f"Cache status read failed: {exc}"}, status=HTTPStatus.BAD_REQUEST)
+
+    def _handle_cache_day(self) -> None:
+        try:
+            payload = self._read_json_body()
+            day = str(payload.get("date") or "").strip()
+            period = str(payload.get("period") or "zero").strip().lower()
+            tickers = payload.get("tickers")
+            if tickers is not None and not isinstance(tickers, list):
+                raise ValueError("tickers must be an array when provided.")
+            result = _cache_completed_day(
+                storage=_storage(),
+                market_client=_market_data_client(),
+                gex_client=GexClient(Settings.from_env()),
+                replay_date=day,
+                period=period,
+                tickers=[str(value) for value in tickers] if tickers else None,
+                force=bool(payload.get("force")),
+            )
+            self._send_json(result)
+        except (MarketDataError, GexApiError, OSError, sqlite3.Error, ValueError) as exc:
+            self._send_json({"error": f"Day cache failed: {exc}"}, status=HTTPStatus.BAD_REQUEST)
 
     def _send_file(self, path: Path, content_type: str) -> None:
         try:
@@ -542,11 +607,308 @@ def _stock_technicals(ticker: str, replay_date: str | None = None, replay_time: 
     )
 
 
+def _cache_completed_day(
+    *,
+    storage: TradingBotStorage,
+    market_client: MarketDataClient,
+    gex_client: GexClient,
+    replay_date: str,
+    period: str,
+    tickers: list[str] | None,
+    force: bool,
+) -> dict[str, object]:
+    if period not in AGGREGATION_PERIODS:
+        raise ValueError(f"period must be one of: {', '.join(AGGREGATION_PERIODS)}.")
+    session_day = date.fromisoformat(replay_date)
+    session_close = datetime.combine(session_day, time(16, 0), tzinfo=EASTERN)
+    if datetime.now(EASTERN) <= session_close:
+        raise ValueError("The selected market session must be complete before it can be cached.")
+
+    history = storage.history_for_day(replay_date)["trade_history"]
+    requested = {str(value).strip().upper() for value in (tickers or []) if str(value).strip()}
+    available = sorted({
+        str(row.get("ticker") or row.get("underlying") or "").strip().upper()
+        for row in history
+        if isinstance(row, dict)
+    } - {""})
+    selected = sorted(requested.intersection(available)) if requested else available
+    if not selected:
+        raise ValueError("No recorded contracts were found for the selected date and tickers.")
+
+    provider = str(getattr(market_client, "provider_name", "market-data"))
+    results: list[dict[str, object]] = []
+    for ticker in selected:
+        ticker_rows = [
+            row for row in history
+            if isinstance(row, dict)
+            and str(row.get("ticker") or row.get("underlying") or "").strip().upper() == ticker
+        ]
+        symbols = sorted({str(row.get("symbol") or "").strip().upper() for row in ticker_rows} - {""})
+        existing = storage.cache_status(replay_date, period=period, provider=provider)
+        already_complete = any(row["ticker"] == ticker and row["status"] == "complete" for row in existing)
+        stock_symbol = TECHNICAL_UNDERLYING_OVERRIDES.get(ticker, ticker)
+        cached_options = storage.option_bars(provider, replay_date, symbols)
+        cached_minute_bars = storage.stock_bars(provider, replay_date, stock_symbol, "1Min")
+        cached_daily_bars = storage.stock_bars(provider, replay_date, stock_symbol, "1Day")
+        cached_gex_modes = set(storage.gex_rows(replay_date, ticker, period))
+        cache_is_complete = (
+            set(cached_options) == set(symbols)
+            and cached_minute_bars is not None
+            and cached_daily_bars is not None
+            and cached_gex_modes == {"classic", "state"}
+        )
+        if already_complete and cache_is_complete and not force:
+            results.append({"ticker": ticker, "status": "complete", "cached": True, "contracts": len(symbols)})
+            continue
+
+        detail: dict[str, object] = {"contracts": symbols, "errors": []}
+        storage.save_cache_status(
+            replay_date, ticker, period, provider,
+            status="building", option_contract_count=len(symbols), detail=detail,
+        )
+        try:
+            market_open = datetime.combine(session_day, time(9, 30), tzinfo=EASTERN)
+            cached_options = {} if force else cached_options
+            missing_symbols = [symbol for symbol in symbols if symbol not in cached_options]
+            for index in range(0, len(missing_symbols), 50):
+                batch = missing_symbols[index:index + 50]
+                fetched = market_client.get_option_bars(
+                    batch,
+                    start=_to_utc_iso(market_open),
+                    end=_to_utc_iso(session_close),
+                    timeframe="1Min",
+                    limit=10000,
+                )
+                storage.save_option_bars(
+                    provider,
+                    replay_date,
+                    {symbol: fetched.get(symbol, []) for symbol in batch},
+                )
+
+            stock_feed = None if provider.lower() == "databento" else DEFAULT_STOCK_DATA_FEED
+            minute_bars = None if force else cached_minute_bars
+            if minute_bars is None:
+                minute_bars = market_client.get_stock_bars(
+                    stock_symbol,
+                    start=_to_utc_iso(market_open),
+                    end=_to_utc_iso(session_close),
+                    timeframe="1Min",
+                    feed=stock_feed,
+                    limit=10000,
+                )
+                storage.save_stock_bars(provider, replay_date, stock_symbol, "1Min", minute_bars)
+
+            daily_bars = None if force else cached_daily_bars
+            if daily_bars is None:
+                daily_bars = market_client.get_stock_bars(
+                    stock_symbol,
+                    start=(session_day - timedelta(days=360)).isoformat(),
+                    end=session_day.isoformat(),
+                    timeframe="1Day",
+                    feed=stock_feed,
+                    limit=300,
+                )
+                storage.save_stock_bars(provider, replay_date, stock_symbol, "1Day", daily_bars)
+
+            if force or cached_gex_modes != {"classic", "state"}:
+                gex_client.prefetch_historical_gex_date(ticker, period, replay_date)
+                storage.save_gex_rows(
+                    replay_date,
+                    ticker,
+                    period,
+                    gex_client.cached_historical_gex_rows(ticker, period, replay_date),
+                )
+
+            detail.update({
+                "option_bars": len(symbols),
+                "stock_symbol": stock_symbol,
+                "stock_minute_bars": len(minute_bars),
+                "stock_daily_bars": len(daily_bars),
+                "gex_modes": ["classic", "state"],
+            })
+            storage.save_cache_status(
+                replay_date, ticker, period, provider,
+                status="complete", option_contract_count=len(symbols), detail=detail,
+            )
+            results.append({"ticker": ticker, "status": "complete", "cached": False, "contracts": len(symbols)})
+        except (MarketDataError, GexApiError, OSError, sqlite3.Error, ValueError) as exc:
+            detail["errors"] = [str(exc)]
+            storage.save_cache_status(
+                replay_date, ticker, period, provider,
+                status="error", option_contract_count=len(symbols), detail=detail,
+            )
+            results.append({"ticker": ticker, "status": "error", "error": str(exc), "contracts": len(symbols)})
+
+    return {
+        "date": replay_date,
+        "period": period,
+        "provider": provider,
+        "results": results,
+        "complete": all(row["status"] == "complete" for row in results),
+    }
+
+
+def _cached_stock_technicals(
+    storage: TradingBotStorage,
+    provider: str,
+    ticker: str,
+    replay_date: str,
+    replay_time: str,
+) -> StockTechnicals:
+    symbol = TECHNICAL_UNDERLYING_OVERRIDES.get(ticker, ticker)
+    minute_bars = storage.stock_bars(provider, replay_date, symbol, "1Min")
+    daily_bars = storage.stock_bars(provider, replay_date, symbol, "1Day")
+    if minute_bars is None or daily_bars is None:
+        raise ValueError(f"{ticker} stock bars for {replay_date} are not fully cached.")
+    as_of = _technical_as_of(replay_date, replay_time)
+    visible_minutes = [
+        bar for bar in minute_bars
+        if not isinstance(bar, dict) or _bar_datetime(bar) is None or _bar_datetime(bar) <= as_of
+    ]
+    return calculate_stock_technicals(
+        symbol=symbol,
+        as_of=as_of.isoformat(),
+        minute_bars=visible_minutes,
+        daily_bars=daily_bars,
+    )
+
+
+def _cached_replay_payload(
+    *,
+    storage: TradingBotStorage,
+    ticker: str,
+    period: str,
+    replay_date: str,
+    replay_time: str,
+    limit: int,
+    max_contract_cost: float | None,
+) -> dict[str, object]:
+    provider = str(getattr(_market_data_client(), "provider_name", "market-data"))
+    status = storage.cache_status(replay_date, period=period, provider=provider)
+    if not any(row["ticker"] == ticker and row["status"] == "complete" for row in status):
+        raise ValueError(
+            f"{ticker} {replay_date} is not fully cached in SQLite. Use Cache Day after the market closes."
+        )
+    rows_by_mode = storage.gex_rows(replay_date, ticker, period)
+    classic, state, classic_change, state_change = historical_gex_inputs_from_rows(
+        rows_by_mode, replay_date, replay_time
+    )
+    technicals = _cached_stock_technicals(storage, provider, ticker, replay_date, replay_time)
+    analysis = analyze_gex(
+        period=period,
+        classic_major_levels=classic,
+        state_major_levels=state,
+        classic_max_change=classic_change,
+        state_max_change=state_change,
+        technicals=technicals,
+    )
+
+    selected_dt = _technical_as_of(replay_date, replay_time)
+    history = [
+        row for row in storage.history_for_day(replay_date)["trade_history"]
+        if isinstance(row, dict)
+        and str(row.get("ticker") or row.get("underlying") or "").strip().upper() == ticker
+        and (_history_record_datetime(row) is None or _history_record_datetime(row) <= selected_dt)
+    ]
+    history.sort(key=lambda row: _history_record_datetime(row) or datetime.min.replace(tzinfo=EASTERN), reverse=True)
+    latest_minute = (_history_record_datetime(history[0]).replace(second=0, microsecond=0) if history else None)
+    picks = [
+        row for row in history
+        if latest_minute is not None
+        and _history_record_datetime(row) is not None
+        and _history_record_datetime(row).replace(second=0, microsecond=0) == latest_minute
+    ][:max(1, limit)]
+
+    symbols = [str(row.get("symbol") or "").upper() for row in picks]
+    bars_by_symbol = storage.option_bars(provider, replay_date, symbols)
+    candidates: list[dict[str, object]] = []
+    recommendation_candidates: list[dict[str, object]] = []
+    for row in picks:
+        symbol = str(row.get("symbol") or "").upper()
+        bars = [
+            bar for bar in bars_by_symbol.get(symbol, [])
+            if isinstance(bar, dict) and (_bar_datetime(bar) is None or _bar_datetime(bar) <= selected_dt)
+        ]
+        latest = max(bars, key=lambda bar: _bar_datetime(bar) or datetime.min.replace(tzinfo=EASTERN)) if bars else {}
+        close = _optional_snapshot_float(latest.get("c"))
+        if max_contract_cost is not None and close is not None and close * 100 > max_contract_cost:
+            continue
+        contract = row.get("decisionSnapshot", {}).get("contract", {}) if isinstance(row.get("decisionSnapshot"), dict) else {}
+        base = {
+            "symbol": symbol,
+            "expiration_date": row.get("expirationDate") or contract.get("expiration"),
+            "strike_price": row.get("strikePrice") or contract.get("strike"),
+            "contract_type": row.get("contractType") or row.get("side") or contract.get("type"),
+            "delta": contract.get("delta") or (row.get("entryGreeks") or {}).get("delta"),
+            "gamma": contract.get("gamma") or (row.get("entryGreeks") or {}).get("gamma"),
+            "implied_volatility": contract.get("impliedVolatility") or (row.get("entryGreeks") or {}).get("implied_volatility"),
+            "score": row.get("score"),
+        }
+        recommendation_candidates.append({
+            **base,
+            "bid": contract.get("bid"), "ask": contract.get("ask"), "mid": close,
+            "spread": None, "spread_pct": contract.get("spreadPercent"),
+            "open_interest": contract.get("openInterest"), "reasons": [], "price_path": [],
+        })
+        candidates.append({
+            **base,
+            "last_time": latest.get("t"),
+            "open": _optional_snapshot_float(latest.get("o")),
+            "high": _optional_snapshot_float(latest.get("h")),
+            "low": _optional_snapshot_float(latest.get("l")),
+            "close": close,
+            "volume": _optional_snapshot_float(latest.get("v")),
+            "day_change_pct": None,
+            "replay_score": row.get("score"),
+            "price_path": [
+                value for value in (_optional_snapshot_float(bar.get("c")) for bar in bars) if value is not None
+            ],
+        })
+
+    permission = str(picks[0].get("permission") if picks else analysis.trade_permission)
+    recommendation = {
+        "ticker": ticker,
+        "underlying_symbol": ticker,
+        "period": period,
+        "gex_timestamp": analysis.timestamp,
+        "gex_spot": analysis.spot,
+        "bias": analysis.bias,
+        "contract_type": picks[0].get("contractType") if picks else None,
+        "target_level": None,
+        "trade_permission": permission,
+        "recommendation": "Cached recorded candidates nearest the selected replay minute.",
+        "candidates": recommendation_candidates,
+        "warnings": [],
+    }
+    return {
+        "date": replay_date,
+        "selected_time": replay_time,
+        "recommendation": recommendation,
+        "candidates": candidates,
+        "warning": None if candidates else "No recorded candidates existed by this replay time.",
+        "analysis": analysis.as_dict(),
+        "cached_replay": True,
+    }
+
+
+def _history_record_datetime(row: dict[str, object]) -> datetime | None:
+    timestamp = row.get("timestamp")
+    value = timestamp.get("iso") if isinstance(timestamp, dict) else row.get("timestamp_iso")
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=EASTERN) if parsed.tzinfo is None else parsed.astimezone(EASTERN)
+
+
 def _option_outcomes(
     alpaca_client: MarketDataClient,
     raw_entries: list[object],
     *,
     option_bar_cache: TradingBotStorage | None = None,
+    allow_remote: bool = True,
 ) -> dict[str, dict[str, object]]:
     entries = [_normalize_option_outcome_entry(entry) for entry in raw_entries]
     entries = [entry for entry in entries if entry is not None]
@@ -564,6 +926,7 @@ def _option_outcomes(
 
         provider = str(getattr(alpaca_client, "provider_name", "market-data"))
         is_completed_session = date.fromisoformat(outcome_date) < datetime.now(EASTERN).date()
+        allow_remote_for_date = allow_remote and not is_completed_session
         option_bars = (
             option_bar_cache.option_bars(provider, outcome_date, symbols)
             if option_bar_cache is not None and is_completed_session
@@ -571,7 +934,7 @@ def _option_outcomes(
         )
         missing_symbols = [symbol for symbol in symbols if symbol not in option_bars]
         option_bars_error = None
-        if missing_symbols:
+        if missing_symbols and allow_remote_for_date:
             fetch_start = start_dt
             fetch_end = end_dt
             if is_completed_session:
@@ -590,7 +953,20 @@ def _option_outcomes(
                     option_bar_cache.save_option_bars(provider, outcome_date, fetched_bars)
             except MarketDataError as exc:
                 option_bars_error = str(exc)
-        stock_bars_by_underlying = _load_outcome_stock_bars(alpaca_client, date_entries, start_dt, end_dt)
+        stock_bars_by_underlying = _load_outcome_stock_bars(
+            alpaca_client,
+            date_entries,
+            start_dt,
+            end_dt,
+            stock_bar_cache=option_bar_cache,
+            outcome_date=outcome_date,
+            allow_remote=allow_remote_for_date,
+        )
+        gex_spots_by_underlying = {
+            underlying: option_bar_cache.gex_spot_rows(outcome_date, underlying)
+            for underlying in sorted({str(entry["underlying"]) for entry in date_entries})
+            if option_bar_cache is not None and underlying in TECHNICAL_UNDERLYING_OVERRIDES
+        }
 
         for entry in date_entries:
             bars = [
@@ -602,9 +978,29 @@ def _option_outcomes(
                 )
             ]
             if bars:
-                outcomes[entry["id"]] = _outcome_for_entry(entry, bars, stock_bars_by_underlying.get(entry["underlying"], []))
+                outcomes[entry["id"]] = _outcome_for_entry(
+                    entry,
+                    bars,
+                    stock_bars_by_underlying.get(entry["underlying"], []),
+                    gex_spots_by_underlying.get(entry["underlying"], []),
+                )
             else:
-                outcomes[entry["id"]] = _fallback_outcome_for_entry(entry, option_bars_error)
+                symbol_bars = option_bars.get(entry["symbol"])
+                if symbol_bars is None:
+                    cache_message = (
+                        option_bars_error
+                        or "Contract is not cached in SQLite. Run Cache Day after the market closes."
+                    )
+                elif symbol_bars:
+                    cache_message = (
+                        "Cached in SQLite; no option trade occurred between the recorded buy time "
+                        "and the selected replay time."
+                    )
+                else:
+                    cache_message = (
+                        "Cached in SQLite; the market-data provider reported no trades for this contract that day."
+                    )
+                outcomes[entry["id"]] = _fallback_outcome_for_entry(entry, cache_message)
 
     return outcomes
 
@@ -687,13 +1083,30 @@ def _load_outcome_stock_bars(
     entries: list[dict[str, object]],
     start_dt: datetime,
     end_dt: datetime,
+    *,
+    stock_bar_cache: TradingBotStorage | None = None,
+    outcome_date: str = "",
+    allow_remote: bool = True,
 ) -> dict[str, list[dict[str, object]]]:
     bars_by_underlying: dict[str, list[dict[str, object]]] = {}
-    stock_feed = None if getattr(alpaca_client, "provider_name", "alpaca") == "databento" else DEFAULT_STOCK_DATA_FEED
+    provider = str(getattr(alpaca_client, "provider_name", "alpaca"))
+    stock_feed = None if provider == "databento" else DEFAULT_STOCK_DATA_FEED
     for underlying in sorted({str(entry["underlying"]) for entry in entries if entry.get("underlying")}):
+        symbol = TECHNICAL_UNDERLYING_OVERRIDES.get(underlying, underlying)
+        cached = (
+            stock_bar_cache.stock_bars(provider, outcome_date, symbol, "1Min")
+            if stock_bar_cache is not None and outcome_date
+            else None
+        )
+        if cached is not None:
+            bars_by_underlying[underlying] = cached
+            continue
+        if not allow_remote:
+            bars_by_underlying[underlying] = []
+            continue
         try:
             bars_by_underlying[underlying] = alpaca_client.get_stock_bars(
-                underlying,
+                symbol,
                 start=_to_utc_iso(start_dt),
                 end=_to_utc_iso(end_dt),
                 timeframe="1Min",
@@ -709,6 +1122,7 @@ def _outcome_for_entry(
     entry: dict[str, object],
     bars: list[dict[str, object]],
     stock_bars: list[dict[str, object]],
+    gex_spot_rows: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     if not bars:
         return {"error": "No option bars found after the recorded buy time."}
@@ -736,10 +1150,10 @@ def _outcome_for_entry(
     return {
         "high": high_price,
         "high_time": high_time.isoformat() if high_time else None,
-        "high_greeks": _estimate_outcome_greeks(entry, high_price, high_time, stock_bars),
+        "high_greeks": _estimate_outcome_greeks(entry, high_price, high_time, stock_bars, gex_spot_rows),
         "low": low_price,
         "low_time": low_time.isoformat() if low_time else None,
-        "low_greeks": _estimate_outcome_greeks(entry, low_price, low_time, stock_bars),
+        "low_greeks": _estimate_outcome_greeks(entry, low_price, low_time, stock_bars, gex_spot_rows),
         "current": current_price,
         "current_time": current_time.isoformat() if current_time else None,
         "current_age_seconds": current_age_seconds,
@@ -793,10 +1207,11 @@ def _estimate_outcome_greeks(
     option_price: float | None,
     as_of: datetime | None,
     stock_bars: list[dict[str, object]],
+    gex_spot_rows: list[dict[str, object]] | None = None,
 ) -> dict[str, float | bool] | None:
     if option_price is None or as_of is None:
         return None
-    spot = _spot_at_or_before(stock_bars, as_of) or entry.get("entry_spot")
+    spot = _outcome_underlying_spot(entry, as_of, stock_bars, gex_spot_rows or [])
     strike = entry.get("strike_price")
     expiration_date = str(entry.get("expiration_date") or "")
     contract_type = str(entry.get("contract_type") or "")
@@ -827,6 +1242,49 @@ def _estimate_outcome_greeks(
         "implied_volatility": volatility,
         "estimated": True,
     }
+
+
+def _outcome_underlying_spot(
+    entry: dict[str, object],
+    as_of: datetime,
+    stock_bars: list[dict[str, object]],
+    gex_spot_rows: list[dict[str, object]],
+) -> float | None:
+    underlying = str(entry.get("underlying") or "").upper()
+    entry_spot = entry.get("entry_spot")
+    if underlying in TECHNICAL_UNDERLYING_OVERRIDES:
+        gex_spot = _gex_spot_at_or_before(gex_spot_rows, as_of)
+        if gex_spot is not None:
+            return gex_spot
+
+        proxy_spot = _spot_at_or_before(stock_bars, as_of)
+        entry_proxy_spot = _spot_at_or_before(stock_bars, entry["start_dt"])
+        if (
+            isinstance(entry_spot, float)
+            and proxy_spot is not None
+            and entry_proxy_spot is not None
+            and entry_proxy_spot > 0
+        ):
+            return proxy_spot * entry_spot / entry_proxy_spot
+        return entry_spot if isinstance(entry_spot, float) else None
+    return _spot_at_or_before(stock_bars, as_of) or (entry_spot if isinstance(entry_spot, float) else None)
+
+
+def _gex_spot_at_or_before(rows: list[dict[str, object]], as_of: datetime) -> float | None:
+    target = as_of.timestamp()
+    best_timestamp: float | None = None
+    best_spot: float | None = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        timestamp = _optional_snapshot_float(row.get("timestamp"))
+        spot = _optional_snapshot_float(row.get("spot"))
+        if timestamp is None or spot is None or timestamp > target:
+            continue
+        if best_timestamp is None or timestamp > best_timestamp:
+            best_timestamp = timestamp
+            best_spot = spot
+    return best_spot
 
 
 def _years_to_expiration_at(expiration_date: str, as_of: datetime) -> float | None:
@@ -909,7 +1367,12 @@ def _option_price_from_snapshot(snapshot: object) -> dict[str, float | None]:
     last = _optional_snapshot_float(trade.get("p"))
     mid = None
     if bid is not None and ask is not None and bid > 0 and ask > 0 and ask >= bid:
-        mid = (bid + ask) / 2
+        quote_mid = (bid + ask) / 2
+        spread_ratio = (ask - bid) / quote_mid
+        if spread_ratio <= MAX_OPTION_MARK_SPREAD_RATIO:
+            mid = quote_mid
+        elif last is not None and last > 0:
+            mid = last
     elif last is not None and last > 0:
         mid = last
 
@@ -926,26 +1389,26 @@ def _historical_option_prices(
     symbols: list[str],
     replay_date: str,
     replay_time: str,
+    *,
+    option_bar_cache: TradingBotStorage | None = None,
 ) -> dict[str, dict[str, float | str | None]]:
     as_of = _technical_as_of(replay_date, replay_time)
-    market_open = datetime.combine(as_of.date(), time(9, 30), tzinfo=EASTERN)
-    bars_by_symbol = alpaca_client.get_option_bars(
-        symbols,
-        start=_to_utc_iso(market_open),
-        end=_to_utc_iso(as_of),
-        timeframe="1Min",
-    )
+    provider = str(getattr(alpaca_client, "provider_name", "market-data"))
+    bars_by_symbol = option_bar_cache.option_bars(provider, replay_date, symbols) if option_bar_cache else {}
     prices: dict[str, dict[str, float | str | None]] = {}
     for symbol in symbols:
-        bars = bars_by_symbol.get(symbol, [])
-        latest = bars[-1] if isinstance(bars, list) and bars else {}
+        bars = [
+            bar for bar in bars_by_symbol.get(symbol, [])
+            if isinstance(bar, dict) and (_bar_datetime(bar) is None or _bar_datetime(bar) <= as_of)
+        ]
+        latest = max(bars, key=lambda bar: _bar_datetime(bar) or datetime.min.replace(tzinfo=EASTERN)) if bars else {}
         close = _optional_snapshot_float(latest.get("c")) if isinstance(latest, dict) else None
         prices[symbol] = {
             "bid": None,
             "ask": None,
             "last": close,
             "mid": close,
-            "source": "historical option bar",
+            "source": "SQLite historical option bar" if symbol in bars_by_symbol else "not cached in SQLite",
         }
     return prices
 

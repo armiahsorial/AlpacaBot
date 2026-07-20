@@ -492,6 +492,25 @@ class GexClient:
             loaded.append(mode)
         return {"ticker": ticker, "period": aggregation_period, "date": replay_date, "loaded": loaded, "cached": cached}
 
+    def cached_historical_gex_rows(
+        self,
+        ticker: str,
+        aggregation_period: str,
+        replay_date: str,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return already-downloaded whole-day rows without making a request."""
+        ticker, aggregation_period = _normalize_ticker_and_period(ticker, aggregation_period)
+        rows_by_mode: dict[str, list[dict[str, Any]]] = {}
+        for mode in ("classic", "state"):
+            history_key = f"{ticker}:{mode}:{aggregation_period}:{replay_date}"
+            rows = _HISTORICAL_ROWS_CACHE.get(history_key) or _read_disk_history_cache(history_key)
+            if rows is None:
+                raise GexApiError(
+                    f"{ticker} {mode} GEX history for {replay_date} is not cached. Prefetch the day first."
+                )
+            rows_by_mode[mode] = rows
+        return rows_by_mode
+
     def _get_json(self, path: str) -> Any:
         global _GEX_HISTORY_RATE_LIMITED_UNTIL
         if path.startswith("/hist/") and time.time() < _GEX_HISTORY_RATE_LIMITED_UNTIL:
@@ -785,6 +804,27 @@ def _select_historical_row(rows: list[dict[str, Any]], target_timestamp: int) ->
             return row
 
     raise GexApiError("GEX historical rows did not include timestamps.")
+
+
+def historical_gex_inputs_from_rows(
+    rows_by_mode: dict[str, list[dict[str, Any]]],
+    replay_date: str,
+    replay_time: str,
+) -> tuple[GexMajorLevels, GexMajorLevels, GexMaxChange, GexMaxChange]:
+    """Build replay inputs from durable rows without contacting GEX."""
+    classic_rows = rows_by_mode.get("classic")
+    state_rows = rows_by_mode.get("state")
+    if not isinstance(classic_rows, list) or not isinstance(state_rows, list):
+        raise GexApiError("Cached GEX data must include classic and state rows.")
+    target_timestamp = _market_timestamp(replay_date, replay_time)
+    classic_chain = GexChain.from_json(_select_historical_row(classic_rows, target_timestamp))
+    state_chain = GexChain.from_json(_select_historical_row(state_rows, target_timestamp))
+    return (
+        _major_levels_from_chain(classic_chain),
+        _major_levels_from_chain(state_chain),
+        _max_change_from_chain(classic_chain),
+        _max_change_from_chain(state_chain),
+    )
 
 
 def _is_expired_signed_url_error(error: GexApiError) -> bool:

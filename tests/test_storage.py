@@ -110,6 +110,35 @@ class TradingBotStorageTests(unittest.TestCase):
 
         self.assertEqual(loaded, bars)
 
+    def test_complete_historical_cache_round_trips_without_replacing_history(self):
+        stock_bars = [{"t": "2026-07-17T15:30:00Z", "c": 628.0}]
+        gex_rows = {
+            "classic": [{"timestamp": 1, "ticker": "SPX"}],
+            "state": [{"timestamp": 1, "ticker": "SPX"}],
+        }
+        self.storage.sync(trade_history=[{
+            "id": "permission-cache",
+            "replayDate": "2026-07-17",
+            "ticker": "SPX",
+            "symbol": "SPXW260717C07500000",
+        }])
+        self.storage.save_stock_bars("databento", "2026-07-17", "SPY", "1Min", stock_bars)
+        self.storage.save_gex_rows("2026-07-17", "SPX", "zero", gex_rows)
+        self.storage.save_cache_status(
+            "2026-07-17", "SPX", "zero", "databento",
+            status="complete", option_contract_count=1, detail={"stock_symbol": "SPY"},
+        )
+
+        self.assertEqual(
+            self.storage.stock_bars("databento", "2026-07-17", "SPY", "1Min"),
+            stock_bars,
+        )
+        self.assertEqual(self.storage.gex_rows("2026-07-17", "SPX", "zero"), gex_rows)
+        status = self.storage.cache_status("2026-07-17", period="zero", provider="databento")
+        self.assertEqual(status[0]["status"], "complete")
+        self.assertEqual(status[0]["option_contract_count"], 1)
+        self.assertEqual(len(self.storage.snapshot()["trade_history"]), 1)
+
     def test_delete_day_rejects_invalid_inputs(self):
         with self.assertRaises(ValueError):
             self.storage.delete_day("unknown", "2026-07-17")

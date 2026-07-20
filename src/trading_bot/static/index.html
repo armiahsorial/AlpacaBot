@@ -30,7 +30,7 @@
             </div>
             <div id="saved-ticker-groups" class="saved-ticker-groups" aria-label="Saved ticker groups"></div>
             <div id="ticker-checklist" class="ticker-checklist" aria-label="Ticker checklist">
-              <label><input type="checkbox" value="NDX" data-ticker-checkbox />NDX</label>
+              <label><input type="checkbox" value="NDX" data-ticker-checkbox checked />NDX</label>
               <label><input type="checkbox" value="SPX" data-ticker-checkbox checked />SPX</label>
               <label><input type="checkbox" value="RUT" data-ticker-checkbox />RUT</label>
               <label><input type="checkbox" value="VIX" data-ticker-checkbox />VIX</label>
@@ -155,7 +155,8 @@
             </div>
             <button id="replay-today" type="button">Today Now</button>
             <button id="replay-play" type="button">Play</button>
-            <button id="replay-refresh" type="button">Update Data</button>
+            <button id="cache-day" type="button">Cache Day</button>
+            <button id="replay-refresh" type="button">Reload SQLite</button>
             <button id="run-day-simulation" type="button">Run Day Simulation</button>
             <div class="speed-buttons" aria-label="Replay speed">
               <button type="button" data-speed="1">1x</button>
@@ -166,6 +167,7 @@
               <button type="button" data-speed="50">50x</button>
             </div>
               </div>
+              <div id="cache-status" class="mini-status">Historical cache status will appear here.</div>
               <p id="replay-resolution-note" class="replay-resolution-note">The clock moves second by second. Historical statistics update at each available one-minute bar.</p>
               <section class="tracking-overview" aria-labelledby="tracking-overview-title">
             <div class="tracking-overview-heading">

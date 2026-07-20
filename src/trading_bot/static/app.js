@@ -25,6 +25,8 @@ const replayTime = document.querySelector("#replay-time");
 const replayClock = document.querySelector("#replay-clock");
 const replayPlay = document.querySelector("#replay-play");
 const replayRefresh = document.querySelector("#replay-refresh");
+const cacheDayButton = document.querySelector("#cache-day");
+const cacheStatus = document.querySelector("#cache-status");
 const replayToday = document.querySelector("#replay-today");
 const runDaySimulationButton = document.querySelector("#run-day-simulation");
 const daySimulationStatus = document.querySelector("#day-simulation-status");
@@ -54,6 +56,7 @@ let replayTimer = null;
 let replayScrubTimer = null;
 let replayRequestId = 0;
 let replaySpeed = 1;
+let replayClockRemainder = 0;
 let lastAnalysis = null;
 const latestAnalysisByTicker = new Map();
 let isAnalysisRunning = false;
@@ -66,11 +69,15 @@ let lastReplayFetchStartedAt = 0;
 let currentBestPick = null;
 let daySimulationRunning = false;
 let daySimulationStopRequested = false;
+let cachedTickersForReplay = new Set();
 const replayOutcomeCache = new Map();
+const displayedHistoryOutcomes = new Map();
+const historicalLedgerOutcomeRequests = new Set();
 const REPLAY_FETCH_STEP_SECONDS = 60;
+const REPLAY_CLOCK_TICK_MS = 100;
 const DAY_SIMULATION_STEP_SECONDS = 15 * 60;
-// Price outcomes can advance from cached minute bars, but GEX and contract
-// replay calls still use external providers. Keep those calls rate-limited
+// Completed-day playback advances from cached SQLite rows. Keep rendering
+// rate-limited so rapid playback remains smooth even with large histories.
 // independently of the selected playback speed.
 const REPLAY_MIN_FETCH_INTERVAL_MS = 15000;
 const TRADE_HISTORY_STORAGE_KEY = "tradingBot.tradePermissionHistory";
@@ -306,6 +313,7 @@ replayDate.addEventListener("change", () => {
   renderTrackingOverview();
   renderTradeHistory();
   ensureHistoricalDateLoaded(replayDate.value);
+  refreshCacheStatus();
   loadOptionReplay();
 });
 
@@ -357,7 +365,12 @@ replayPlay.addEventListener("click", () => {
 
 replayRefresh.addEventListener("click", () => {
   stopLiveMode();
+  replayOutcomeCache.clear();
   loadOptionReplay({ force: true });
+});
+
+cacheDayButton?.addEventListener("click", () => {
+  cacheSelectedDay();
 });
 
 replayToday.addEventListener("click", () => {
@@ -732,7 +745,7 @@ function getSelectedTickers() {
   const selected = Array.from(document.querySelectorAll("[data-ticker-checkbox]:checked"))
     .map((checkbox) => checkbox.value.trim().toUpperCase())
     .filter(Boolean);
-  return selected.length > 0 ? [...new Set(selected)] : ["SPX"];
+  return selected.length > 0 ? [...new Set(selected)] : ["NDX", "SPX"];
 }
 
 function getMaxContractCost() {
@@ -763,7 +776,7 @@ function initializeMaxContractCost() {
 }
 
 function setSelectedTickers(tickers) {
-  const selected = new Set((tickers.length > 0 ? tickers : ["SPX"]).map((ticker) => ticker.toUpperCase()));
+  const selected = new Set((tickers.length > 0 ? tickers : ["NDX", "SPX"]).map((ticker) => ticker.toUpperCase()));
   for (const checkbox of document.querySelectorAll("[data-ticker-checkbox]")) {
     checkbox.checked = selected.has(checkbox.value.toUpperCase());
   }
@@ -859,7 +872,7 @@ async function refreshForTickerSelection() {
     recordTrackedTickers(currentHostDate(), getSelectedTickers());
   }
   renderTradeHistory();
-  if (replayDate.value && replayDate.value !== currentHostDate()) {
+  if (replayDate.value && !selectedReplayUsesLiveData()) {
     stopLiveMode();
     await loadOptionReplay({ force: true });
   } else {
@@ -968,7 +981,7 @@ function scheduleRefresh() {
     refreshTimer = null;
   }
 
-  if (!autoRefresh.checked) {
+  if (!autoRefresh.checked || !currentHostMarketSnapshot().isOpen) {
     return;
   }
 
@@ -985,6 +998,7 @@ initializeMaxContractCost();
 updateTickerSelectionCount();
 autoRefresh.checked = true;
 initializeMarketMode();
+refreshCacheStatus();
 scheduleRefresh();
 renderTradeHistory();
 initializePersistentStorage();
@@ -1277,6 +1291,7 @@ async function loadOptionReplaysForTickers(tickers, period, { signal } = {}) {
         time: getReplayMarketClock(),
         max_expiration_days: "14",
         limit: "3",
+        local_only: "1",
       }));
       payloads.push(await getJsonWithTimeout(`/api/options/replay?${query.toString()}`, {
         signal,
@@ -1298,7 +1313,7 @@ function replayErrorMessage(errors) {
 
 function showReplayError(error) {
   if (error.name === "AbortError") {
-    fields.contractSummary.textContent = "Previous replay request canceled. Press Update Data to try again.";
+    fields.contractSummary.textContent = "Previous replay request canceled. Press Reload SQLite to try again.";
   } else {
     fields.contractSummary.textContent = error.message;
     fields.contractSummary.classList.add("error");
@@ -1308,7 +1323,7 @@ function showReplayError(error) {
 
 async function loadOptionReplay({ force = false, refreshHistory = true } = {}) {
   updateReplayClock();
-  if (replayDate.value === currentHostDate()) {
+  if (selectedReplayUsesLiveData()) {
     stopReplay();
     isInspectingContract = false;
     fields.contractSummary.classList.remove("error");
@@ -1344,8 +1359,7 @@ async function loadOptionReplay({ force = false, refreshHistory = true } = {}) {
   isInspectingContract = true;
   lastReplayFetchStartedAt = now;
 
-  fields.contractSummary.textContent =
-    "Loading historical GEX and Alpaca option bars. First load for a ticker/date can take a minute or two...";
+  fields.contractSummary.textContent = "Loading historical replay from SQLite...";
   fields.contractSummary.classList.remove("error");
   fields.contractList.classList.add("is-refreshing");
   if (!renderedContractContentExists()) {
@@ -1390,7 +1404,7 @@ function clearReplayScrubTimer() {
 
 function scheduleReplayScrubRefresh() {
   clearReplayScrubTimer();
-  if (replayDate.value === currentHostDate()) {
+  if (selectedReplayUsesLiveData()) {
     return;
   }
   fields.contractSummary.classList.remove("error");
@@ -1434,26 +1448,12 @@ async function runDaySimulation() {
   }
 
   try {
-    const simulationTickers = [];
-    const prefetchErrors = [];
-    for (let tickerIndex = 0; tickerIndex < tickers.length; tickerIndex += 1) {
-      const ticker = tickers[tickerIndex];
-      setDaySimulationStatus(
-        `Preparing ${ticker} (${tickerIndex + 1} of ${tickers.length}) for ${formatContractDate(simulationDate)}...`,
-        false
-      );
-      try {
-        const prefetchQuery = new URLSearchParams({ ticker, period, date: simulationDate });
-        await getJsonWithTimeout(`/api/options/replay/prefetch?${prefetchQuery.toString()}`, {
-          timeoutMs: 120000,
-        });
-        simulationTickers.push(ticker);
-      } catch (error) {
-        prefetchErrors.push({ ticker, message: error.message || "History prefetch failed." });
-      }
-    }
+    const cacheRows = await refreshCacheStatus();
+    const simulationTickers = tickers.filter((ticker) =>
+      cacheRows.some((row) => row.ticker === ticker && row.status === "complete")
+    );
     if (simulationTickers.length === 0) {
-      throw new Error(replayErrorMessage(prefetchErrors));
+      throw new Error("No selected ticker is fully cached for this day. Press Cache Day first.");
     }
 
     for (let index = 0; index < checkpoints.length; index += 1) {
@@ -1471,7 +1471,7 @@ async function runDaySimulation() {
       if (payloads.length === 0) {
         throw new Error(replayErrorMessage(errors));
       }
-      renderOptionReplays(payloads, [...prefetchErrors, ...errors]);
+      renderOptionReplays(payloads, errors);
       await refreshReplayLedgerPrices(simulationDate, getReplayMarketClock(), second);
       await simulationDelay(250);
     }
@@ -1527,6 +1527,67 @@ function setDaySimulationStatus(message, isError) {
   daySimulationStatus.classList.toggle("error", Boolean(isError));
 }
 
+async function refreshCacheStatus() {
+  if (!cacheStatus || !replayDate.value || selectedReplayUsesLiveData()) {
+    cachedTickersForReplay = new Set();
+    if (cacheStatus) cacheStatus.textContent = "Live sessions use provider data; completed days can be cached after close.";
+    return [];
+  }
+  const { period } = getFormValues();
+  try {
+    const query = new URLSearchParams({ date: replayDate.value, period });
+    const payload = await getJson(`/api/cache/status?${query.toString()}`);
+    const rows = Array.isArray(payload.caches) ? payload.caches : [];
+    cachedTickersForReplay = new Set(
+      rows.filter((row) => row.status === "complete").map((row) => String(row.ticker).toUpperCase())
+    );
+    if (rows.length === 0) {
+      cacheStatus.textContent = "Not cached. Slider playback stays local and will not call an API. Use Cache Day once.";
+      cacheStatus.classList.remove("error");
+      return rows;
+    }
+    cacheStatus.textContent = rows.map((row) =>
+      `${row.ticker}: ${row.status === "complete" ? `${row.option_contract_count} contracts cached` : row.status}`
+    ).join(" · ");
+    cacheStatus.classList.toggle("error", rows.some((row) => row.status === "error"));
+    return rows;
+  } catch (error) {
+    cacheStatus.textContent = error.message;
+    cacheStatus.classList.add("error");
+    return [];
+  }
+}
+
+async function cacheSelectedDay() {
+  const day = replayDate.value;
+  if (!day || day > currentHostDate() || isWeekendDate(day)) {
+    cacheStatus.textContent = "Choose today after 4:00 PM ET or an earlier completed market day.";
+    cacheStatus.classList.add("error");
+    return;
+  }
+  const { period } = getFormValues();
+  cacheDayButton.disabled = true;
+  cacheStatus.classList.remove("error");
+  cacheStatus.textContent = `Caching every recorded contract, stock bar, and GEX row for ${formatContractDate(day)}...`;
+  try {
+    const payload = await postJson("/api/cache/day", { date: day, period });
+    const failed = (payload.results || []).filter((row) => row.status !== "complete");
+    cacheStatus.textContent = (payload.results || []).map((row) =>
+      `${row.ticker}: ${row.status === "complete" ? `${row.contracts} contracts ready` : row.error}`
+    ).join(" · ");
+    cacheStatus.classList.toggle("error", failed.length > 0);
+    replayOutcomeCache.clear();
+    await refreshCacheStatus();
+    await loadOptionReplay({ force: true });
+    renderTradeHistory();
+  } catch (error) {
+    cacheStatus.textContent = error.message;
+    cacheStatus.classList.add("error");
+  } finally {
+    cacheDayButton.disabled = false;
+  }
+}
+
 function renderOptionReplay(payload) {
   renderOptionReplays([payload], []);
 }
@@ -1561,7 +1622,9 @@ function renderOptionReplays(payloads, errors = [], { refreshHistory = true } = 
 
     let recorded = false;
     for (const payload of payloads) {
-      recorded = recordPayloadTradePermission(payload, "replay", { render: false }) || recorded;
+      if (!payload.cached_replay) {
+        recorded = recordPayloadTradePermission(payload, "replay", { render: false }) || recorded;
+      }
     }
     if (recorded && refreshHistory) {
       renderTradeHistory({ preserveScroll: false });
@@ -1656,6 +1719,10 @@ function currentHostMarketSnapshot() {
 
 function currentHostDate() {
   return formatDateInput(new Date());
+}
+
+function selectedReplayUsesLiveData() {
+  return replayDate.value === currentHostDate() && currentHostMarketSnapshot().isOpen;
 }
 
 function formatDateInput(date) {
@@ -1791,9 +1858,23 @@ function toggleReplay() {
 
   stopLiveMode();
   isInspectingContract = true;
-  replayTimer = setInterval(() => {
+  replayClockRemainder = 0;
+  replayTimer = setTimeout(runReplayClockTick, REPLAY_CLOCK_TICK_MS);
+  updatePlaybackButton();
+}
+
+function runReplayClockTick() {
+  if (replayTimer === null) {
+    return;
+  }
+
+  replayClockRemainder += replaySpeed * (REPLAY_CLOCK_TICK_MS / 1000);
+  const wholeSeconds = Math.floor(replayClockRemainder);
+  replayClockRemainder -= wholeSeconds;
+
+  if (wholeSeconds > 0) {
     const previousValue = Number(replayTime.value);
-    const nextValue = Math.min(previousValue + replaySpeed, Number(replayTime.max));
+    const nextValue = Math.min(previousValue + wholeSeconds, Number(replayTime.max));
     replayTime.value = String(nextValue);
     updateReplayClock();
     const crossedMinute = Math.floor(previousValue / REPLAY_FETCH_STEP_SECONDS) !==
@@ -1808,17 +1889,22 @@ function toggleReplay() {
       }
     }
     if (nextValue >= Number(replayTime.max)) {
-      toggleReplay();
+      stopReplay();
+      return;
     }
-  }, 1000);
-  updatePlaybackButton();
+  }
+
+  // Schedule from the end of this tick. If rendering or SQLite work takes a
+  // moment, playback pauses briefly instead of applying missed ticks at once.
+  replayTimer = setTimeout(runReplayClockTick, REPLAY_CLOCK_TICK_MS);
 }
 
 function stopReplay() {
   if (replayTimer !== null) {
-    clearInterval(replayTimer);
+    clearTimeout(replayTimer);
     replayTimer = null;
   }
+  replayClockRemainder = 0;
   updatePlaybackButton();
 }
 
@@ -2439,13 +2525,15 @@ function createTradeHistoryRow(item) {
       <strong>${item.timestamp?.label || "-"}</strong>
       <em>${historyRankLabel(item)}${item.contract || item.symbol || "Unknown contract"}</em>
     </span>
-    <span class="history-pill history-bias">${item.bias || "-"}</span>
-    <span class="history-pill">Score ${formatOptionalNumber(item.score)}</span>
-    <span class="history-stat"><i>Recorded</i><strong>${formatCurrency(item.entryPrice)}</strong></span>
+    <span class="history-tags">
+      <span class="history-pill history-bias">${item.bias || "-"}</span>
+      <span class="history-pill">Score ${formatOptionalNumber(item.score)}</span>
+    </span>
+    <span class="history-stat history-recorded-stat"><i>Recorded</i><strong>${formatCurrency(item.entryPrice)}</strong></span>
     <span class="history-stat history-high-stat"><i class="history-high-label">Highest after buy</i><strong class="history-high">Loading...</strong><em class="history-high-time">-</em><em class="history-high-greeks">-</em></span>
     <span class="history-stat history-current-stat"><i>Last traded</i><strong class="history-current">Loading...</strong><em class="history-current-time">-</em></span>
-    <span class="history-stat"><i>Change</i><strong class="history-change">-</strong></span>
-    <span class="history-stat"><i>Exit</i><strong class="history-exit">Checking...</strong></span>
+    <span class="history-stat history-change-stat"><i>Change</i><strong class="history-change">-</strong></span>
+    <span class="history-stat history-exit-stat"><i>Exit</i><strong class="history-exit">Checking...</strong></span>
   `;
   row.addEventListener("click", () => {
     stageCandidate(
@@ -2566,14 +2654,30 @@ function renderPaperLedger({ preserveScroll = true } = {}) {
       : "No simulated paper trades yet.";
     return;
   }
+  if (isHistoricalDay) {
+    refreshHistoricalPaperLedgerOutcomes(ledger, getReplayPoint());
+  }
 
   fields.paperLedger.innerHTML = "";
   for (const trade of ledger) {
     const row = document.createElement("div");
     row.className = `paper-ledger-row contract-${trade.side || "call"} status-${trade.status || "open"}`;
     row.dataset.scrollKey = `ledger:${trade.id || trade.symbol || trade.timestamp?.iso || ""}`;
-    const current = optionalNumber(trade.currentPrice) ?? optionalNumber(trade.exitPrice) ?? optionalNumber(trade.entryPrice);
-    const pnl = paperTradePnl({ ...trade, currentPrice: current });
+    const replayMinute = isHistoricalDay ? getReplayPoint().iso.slice(0, 16) : null;
+    const cachedReplayOutcome = isHistoricalDay ? displayedHistoryOutcomes.get(trade.sourceHistoryId) : null;
+    const replayOutcome = cachedReplayOutcome?.replayMinute === replayMinute ? cachedReplayOutcome : null;
+    const replayOutcomeIsAuthoritative = replayOutcome?.source === "market-data option bars";
+    const entry = optionalNumber(trade.entryPrice);
+    const replayHigh = replayOutcomeIsAuthoritative ? optionalNumber(replayOutcome.high) : null;
+    const displayedHigh = replayOutcomeIsAuthoritative
+      ? Math.max(...[entry, replayHigh].filter((value) => value !== null))
+      : (replayOutcome?.error ? entry : optionalNumber(trade.highPrice) ?? entry);
+    const replayCurrent = replayOutcomeIsAuthoritative ? optionalNumber(replayOutcome.current) : null;
+    const current = trade.status === "closed"
+      ? optionalNumber(trade.exitPrice) ?? optionalNumber(trade.currentPrice) ?? entry
+      : (replayOutcomeIsAuthoritative ? replayCurrent : optionalNumber(trade.currentPrice) ?? entry);
+    const displayedTrade = { ...trade, currentPrice: current, highPrice: displayedHigh };
+    const pnl = paperTradePnl(displayedTrade);
     const pnlPct = paperTradePnlPct(trade.entryPrice, trade.status === "closed" ? trade.exitPrice : current);
     const advisory = gexSellAdvisory(trade);
     row.innerHTML = `
@@ -2583,8 +2687,8 @@ function renderPaperLedger({ preserveScroll = true } = {}) {
       </span>
       <span class="history-pill">${trade.status === "closed" ? "Closed" : "Open"}</span>
       <span class="history-stat"><i>Entry</i><strong>${formatCurrency(trade.entryPrice)}</strong></span>
-      <span class="history-stat"><i>Highest since entry</i><strong class="positive">${formatCurrency(trade.highPrice ?? current)}</strong></span>
-      <span class="history-stat"><i>Now</i><strong>${formatCurrency(current)}</strong></span>
+      <span class="history-stat"><i>Highest since entry</i><strong class="positive">${formatCurrency(displayedHigh ?? current)}</strong></span>
+      <span class="history-stat"><i>${trade.status === "closed" ? "Exit" : "Now"}</i><strong>${formatCurrency(current)}</strong></span>
       <span class="history-stat"><i>P/L</i><strong class="${pnl >= 0 ? "positive" : "negative"}">${formatCurrency(pnl)}</strong></span>
       <span class="history-stat"><i>Move</i><strong class="${pnlPct >= 0 ? "positive" : "negative"}">${formatPercent(pnlPct)}</strong></span>
       <span class="history-stat"><i>GEX exit read</i><strong class="${advisory.className}">${advisory.label}</strong></span>
@@ -2595,6 +2699,51 @@ function renderPaperLedger({ preserveScroll = true } = {}) {
     `;
     fields.paperLedger.appendChild(row);
   }
+}
+
+function refreshHistoricalPaperLedgerOutcomes(ledger, replayPoint) {
+  const replayMinute = replayPoint.iso.slice(0, 16);
+  const pending = ledger.filter((trade) =>
+    trade.sourceHistoryId && displayedHistoryOutcomes.get(trade.sourceHistoryId)?.replayMinute !== replayMinute
+  );
+  if (pending.length === 0) {
+    return;
+  }
+  const requestKey = `${replayMinute}:${pending.map((trade) => trade.sourceHistoryId).sort().join(",")}`;
+  if (historicalLedgerOutcomeRequests.has(requestKey)) {
+    return;
+  }
+  historicalLedgerOutcomeRequests.add(requestKey);
+  const historyItems = pending.map((trade) => {
+    const contract = trade.decisionSnapshot?.contract || {};
+    return {
+      id: trade.sourceHistoryId,
+      symbol: trade.symbol,
+      ticker: trade.ticker,
+      underlying: trade.ticker,
+      timestamp: trade.timestamp,
+      entryPrice: trade.entryPrice,
+      entryGreeks: trade.entryGreeks,
+      expirationDate: contract.expiration,
+      strikePrice: contract.strike,
+      contractType: trade.side || contract.type,
+    };
+  });
+  fetchTradeHistoryOutcomes(historyItems, replayPoint)
+    .then((outcomes) => {
+      for (const [id, outcome] of Object.entries(outcomes)) {
+        displayedHistoryOutcomes.set(id, { ...outcome, replayMinute });
+      }
+      if (Number(replayTime.value) >= Number(replayTime.max)) {
+        updatePaperLedgerExtremesFromOutcomes(outcomes);
+      } else {
+        renderPaperLedger();
+      }
+    })
+    .catch((error) => {
+      historicalLedgerOutcomeRequests.delete(requestKey);
+      console.warn("Could not load historical paper-ledger outcomes from SQLite.", error);
+    });
 }
 
 function renderPaperLedgerSummary(ledger) {
@@ -2706,7 +2855,7 @@ function updatePaperLedgerPrices(priceMap, asOfIso = null) {
     if (trade.status === "closed") {
       return trade;
     }
-    const current = optionalNumber(priceMap?.[trade.symbol]?.mid);
+    const current = reliableOptionMark(priceMap?.[trade.symbol]);
     if (!current || current <= 0) {
       return trade;
     }
@@ -2755,6 +2904,24 @@ function updatePaperLedgerPrices(priceMap, asOfIso = null) {
     savePaperLedger(updated);
     renderPaperLedger();
   }
+}
+
+function reliableOptionMark(priceRow) {
+  if (!priceRow || typeof priceRow !== "object") {
+    return null;
+  }
+  const bid = optionalNumber(priceRow.bid);
+  const ask = optionalNumber(priceRow.ask);
+  const last = optionalNumber(priceRow.last);
+  const mid = optionalNumber(priceRow.mid);
+  if (bid !== null && ask !== null && bid > 0 && ask >= bid) {
+    const quoteMid = (bid + ask) / 2;
+    const spreadRatio = quoteMid > 0 ? (ask - bid) / quoteMid : Infinity;
+    if (spreadRatio > 0.50) {
+      return last !== null && last > 0 ? last : null;
+    }
+  }
+  return mid !== null && mid > 0 ? mid : (last !== null && last > 0 ? last : null);
 }
 
 function paperTradePnl(trade) {
@@ -3021,6 +3188,10 @@ async function updateTradeHistoryOutcomes(history, { replayPoint = null, persist
     // Historical replay must never replace a failed as-of query with entry
     // prices; doing so makes a previously reached high appear to disappear.
     const mergedOutcomes = replayPoint ? outcomes : mergeOutcomeFallbacks(history, outcomes);
+    const replayMinute = replayPoint?.iso?.slice(0, 16) || null;
+    for (const [id, outcome] of Object.entries(mergedOutcomes)) {
+      displayedHistoryOutcomes.set(id, { ...outcome, replayMinute });
+    }
     if (persist) {
       saveTradeHistoryOutcomes(mergedOutcomes);
       updatePaperLedgerExtremesFromOutcomes(mergedOutcomes);
@@ -3033,6 +3204,9 @@ async function updateTradeHistoryOutcomes(history, { replayPoint = null, persist
       }
       renderHistoryOutcome(row, mergedOutcomes[id], item);
     }
+    if (replayPoint) {
+      renderPaperLedger();
+    }
   } catch (error) {
     if (historyOutcomeRequestVersions.get(requestKey) !== requestVersion) {
       return;
@@ -3042,6 +3216,10 @@ async function updateTradeHistoryOutcomes(history, { replayPoint = null, persist
           error: `Historical replay unavailable after retry: ${error?.message || error}`,
         }]))
       : mergeOutcomeFallbacks(history, {});
+    const replayMinute = replayPoint?.iso?.slice(0, 16) || null;
+    for (const [id, outcome] of Object.entries(fallbackOutcomes)) {
+      displayedHistoryOutcomes.set(id, { ...outcome, replayMinute });
+    }
     if (persist) {
       saveTradeHistoryOutcomes(fallbackOutcomes);
       updatePaperLedgerExtremesFromOutcomes(fallbackOutcomes);
@@ -3057,6 +3235,9 @@ async function updateTradeHistoryOutcomes(history, { replayPoint = null, persist
         item
       );
     }
+    if (replayPoint) {
+      renderPaperLedger();
+    }
   }
 }
 
@@ -3070,11 +3251,23 @@ function updatePaperLedgerExtremesFromOutcomes(outcomes) {
     }
     const high = optionalNumber(outcome.high);
     const low = optionalNumber(outcome.low);
+    const current = optionalNumber(outcome.current);
+    const entry = optionalNumber(trade.entryPrice);
     const previousHigh = optionalNumber(trade.highPrice) ?? optionalNumber(trade.entryPrice);
     const previousLow = optionalNumber(trade.lowPrice) ?? optionalNumber(trade.entryPrice);
-    const nextHigh = high !== null && (previousHigh === null || high > previousHigh) ? high : previousHigh;
-    const nextLow = low !== null && (previousLow === null || low < previousLow) ? low : previousLow;
-    if (nextHigh === previousHigh && nextLow === previousLow) {
+    const authoritative = outcome.source === "market-data option bars";
+    const authoritativeHighs = [entry, high].filter((value) => value !== null);
+    const authoritativeLows = [entry, low].filter((value) => value !== null);
+    const nextHigh = authoritative
+      ? (authoritativeHighs.length ? Math.max(...authoritativeHighs) : previousHigh)
+      : (high !== null && (previousHigh === null || high > previousHigh) ? high : previousHigh);
+    const nextLow = authoritative
+      ? (authoritativeLows.length ? Math.min(...authoritativeLows) : previousLow)
+      : (low !== null && (previousLow === null || low < previousLow) ? low : previousLow);
+    const nextCurrent = authoritative && trade.status !== "closed" && current !== null
+      ? current
+      : trade.currentPrice;
+    if (nextHigh === previousHigh && nextLow === previousLow && nextCurrent === trade.currentPrice) {
       return trade;
     }
     changed = true;
@@ -3082,8 +3275,16 @@ function updatePaperLedgerExtremesFromOutcomes(outcomes) {
       ...trade,
       highPrice: nextHigh,
       lowPrice: nextLow,
-      highTimestampIso: nextHigh !== previousHigh ? outcome.high_time || trade.highTimestampIso : trade.highTimestampIso,
-      lowTimestampIso: nextLow !== previousLow ? outcome.low_time || trade.lowTimestampIso : trade.lowTimestampIso,
+      currentPrice: nextCurrent,
+      highTimestampIso: authoritative || nextHigh !== previousHigh
+        ? (nextHigh === entry ? trade.timestamp?.iso : outcome.high_time) || trade.highTimestampIso
+        : trade.highTimestampIso,
+      lowTimestampIso: authoritative || nextLow !== previousLow
+        ? (nextLow === entry ? trade.timestamp?.iso : outcome.low_time) || trade.lowTimestampIso
+        : trade.lowTimestampIso,
+      lastUpdatedIso: authoritative && outcome.current_time
+        ? outcome.current_time
+        : trade.lastUpdatedIso,
     };
   });
   if (changed) {
@@ -3216,7 +3417,10 @@ async function fetchTradeHistoryOutcomes(history, replayPoint = null) {
   const outcomeBatchSize = replayPoint ? 1000 : 100;
   for (let index = 0; index < pendingEntries.length; index += outcomeBatchSize) {
     const batch = pendingEntries.slice(index, index + outcomeBatchSize);
-    const payload = await postJsonWithRetry("/api/options/outcomes", { entries: batch }, 3);
+    const payload = await postJsonWithRetry("/api/options/outcomes", {
+      entries: batch,
+      local_only: Boolean(replayPoint),
+    }, 3);
     Object.assign(outcomes, payload.outcomes || {});
     if (cacheMinute) {
       for (const entry of batch) {
@@ -3290,7 +3494,7 @@ function renderHistoryOutcome(row, outcome, item = null) {
   if (highTimeEl) {
     highTimeEl.textContent = outcome.high_time ? `Hit ${formatOutcomeTimestamp(outcome.high_time)}` : "Time unavailable";
   }
-  highGreeksEl.textContent = greekOutcomeSummary(outcome.high_greeks);
+  renderGreekOutcomeSummary(highGreeksEl, outcome.high_greeks);
   const current = optionalNumber(outcome.current);
   const entryPrice = optionalNumber(row.dataset.entryPrice);
   const currentEl = row.querySelector(".history-current");
@@ -3370,6 +3574,31 @@ function greekOutcomeSummary(greeks) {
   }
   const suffix = greeks.estimated ? " est" : "";
   return `${formatGreek("delta", greeks.delta)} ${formatGreek("gamma", greeks.gamma)} ${formatGreek("iv", greeks.implied_volatility)}${suffix}`;
+}
+
+function renderGreekOutcomeSummary(container, greeks) {
+  container.replaceChildren();
+  if (!greeks) {
+    container.textContent = "Greeks n/a";
+    return;
+  }
+  const values = [
+    ["Delta", formatGreekValue("delta", greeks.delta)],
+    ["Gamma", formatGreekValue("gamma", greeks.gamma)],
+    ["IV", formatGreekValue("iv", greeks.implied_volatility)],
+  ];
+  values.forEach(([label, value]) => {
+    const part = document.createElement("span");
+    part.className = "history-greek";
+    part.textContent = `${label} ${value}`;
+    container.appendChild(part);
+  });
+  if (greeks.estimated) {
+    const estimate = document.createElement("span");
+    estimate.className = "history-greek-estimate";
+    estimate.textContent = "estimated";
+    container.appendChild(estimate);
+  }
 }
 
 async function updateTradeHistoryPrices(history, { historicalAsOf = null } = {}) {
@@ -4171,10 +4400,21 @@ function formatGreek(label, value) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) {
     return `${label}: n/a`;
   }
-  if (label === "iv") {
-    return `${label}: ${formatPercent(value)}`;
+  return `${label}: ${formatGreekValue(label, value)}`;
+}
+
+function formatGreekValue(label, value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    return "n/a";
   }
-  return `${label}: ${Number(value).toFixed(3)}`;
+  if (label === "iv") {
+    return formatPercent(value);
+  }
+  if (label === "gamma") {
+    const absolute = Math.abs(Number(value));
+    return Number(value).toFixed(absolute > 0 && absolute < 0.001 ? 6 : 4);
+  }
+  return Number(value).toFixed(3);
 }
 
 function greekSummary(candidate) {

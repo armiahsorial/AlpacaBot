@@ -139,6 +139,39 @@ class TradingBotStorageTests(unittest.TestCase):
         self.assertEqual(status[0]["option_contract_count"], 1)
         self.assertEqual(len(self.storage.snapshot()["trade_history"]), 1)
 
+    def test_gex_rows_at_uses_timestamp_index_and_keeps_original_rows(self):
+        def row(timestamp, spot):
+            return {
+                "timestamp": timestamp,
+                "ticker": "SPX",
+                "min_dte": 0,
+                "sec_min_dte": 0,
+                "spot": spot,
+                "zero_gamma": 7500.0,
+                "major_pos_vol": 7520.0,
+                "major_pos_oi": 7525.0,
+                "major_neg_vol": 7480.0,
+                "major_neg_oi": 7475.0,
+                "strikes": [[7500.0, 1.0, 2.0, []]],
+                "sum_gex_vol": 10.0,
+                "sum_gex_oi": 20.0,
+                "delta_risk_reversal": 0.0,
+                "max_priors": [[7500.0, 1.0]],
+            }
+
+        rows = {
+            "classic": [row(100, 7501.0), row(200, 7502.0)],
+            "state": [row(100, 7503.0), row(200, 7504.0)],
+        }
+        self.storage.save_gex_rows("2026-07-20", "SPX", "zero", rows)
+
+        selected = self.storage.gex_rows_at("2026-07-20", "SPX", "zero", 150)
+
+        self.assertEqual(selected["classic"][0]["spot"], 7501.0)
+        self.assertEqual(selected["state"][0]["spot"], 7503.0)
+        self.assertEqual(selected["classic"][0]["strikes"], [])
+        self.assertEqual(self.storage.gex_rows("2026-07-20", "SPX", "zero"), rows)
+
     def test_delete_day_rejects_invalid_inputs(self):
         with self.assertRaises(ValueError):
             self.storage.delete_day("unknown", "2026-07-17")

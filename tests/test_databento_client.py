@@ -16,6 +16,27 @@ from trading_bot.config import DatabentoSettings
 
 
 class DatabentoClientTests(unittest.TestCase):
+    def test_stream_setup_does_not_hold_snapshot_callback_lock(self):
+        client = DatabentoClient(DatabentoSettings(api_key="key"))
+
+        def simulate_stream_setup(symbols):
+            def deliver_callback():
+                with client._live_option_lock:
+                    client._live_option_snapshots[symbols[0]] = {
+                        "latestQuote": {"bp": 4.0, "ap": 4.2}
+                    }
+
+            callback_thread = Thread(target=deliver_callback)
+            callback_thread.start()
+            callback_thread.join(timeout=0.5)
+            self.assertFalse(callback_thread.is_alive(), "stream callback was blocked by the request lock")
+
+        client._ensure_live_option_stream = MagicMock(side_effect=simulate_stream_setup)
+
+        snapshots = client.get_streaming_option_snapshots(["SPXW260721C07500000"])
+
+        self.assertIn("SPXW260721C07500000", snapshots)
+
     def test_index_option_roots_include_weekly_contract_families(self):
         self.assertEqual(OPTION_PARENT_ROOTS["SPX"], ("SPX", "SPXW"))
         self.assertEqual(OPTION_PARENT_ROOTS["NDX"], ("NDX", "NDXP"))

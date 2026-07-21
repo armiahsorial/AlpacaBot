@@ -245,11 +245,31 @@
                   <span>Win rate</span>
                   <strong id="ledger-win-rate">-</strong>
                 </div>
-                <p>Records each exact Pick #1 contract once per day. The bot closes a simulated position after two consecutive adverse GEX, zero-gamma, or VWAP readings and saves the exit reason.</p>
+                <p>Opens the first 10 unique Pick #1 contracts per day with score 100 or higher. The bot closes a simulated position after two consecutive adverse GEX, zero-gamma, or VWAP readings and saves the exit reason.</p>
               </div>
-              <div id="paper-ledger" class="paper-ledger-list">No simulated paper trades yet.</div>
+              <div id="paper-ledger" class="paper-ledger-sections">
+                <section class="ledger-section" aria-labelledby="open-trades-title">
+                  <div class="ledger-section-heading">
+                    <h4 id="open-trades-title">Open Trades</h4>
+                    <span>New positions glow for two minutes</span>
+                  </div>
+                  <div id="paper-ledger-open" class="paper-ledger-list">No open trades.</div>
+                </section>
+                <section class="ledger-section" aria-labelledby="closed-trades-title">
+                  <div class="ledger-section-heading">
+                    <h4 id="closed-trades-title">Closed Trades</h4>
+                    <span>Recent exits glow for two minutes</span>
+                  </div>
+                  <div id="paper-ledger-closed" class="paper-ledger-list">No closed trades yet.</div>
+                </section>
+              </div>
             </div>
             <div id="trade-history" class="trade-history-list">No trade-permission picks yet.</div>
+            <details class="lower-confidence-panel">
+              <summary>Below-100 Signal Log</summary>
+              <p>Trade-permission signals that were recorded but intentionally skipped by the simulation ledger.</p>
+              <div id="lower-confidence-log" class="lower-confidence-log">No below-100 signals yet.</div>
+            </details>
               </div>
               <div id="contract-list" class="contract-list">-</div>
             </div>

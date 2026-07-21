@@ -20,6 +20,7 @@ from trading_bot.gex_client import (
     GexApiError,
     GexClient,
     historical_gex_inputs_from_rows,
+    historical_state_greek_flow_from_rows,
 )
 from trading_bot.market_data import MarketDataClient, MarketDataError, create_market_data_client
 from trading_bot.options_analysis import _black_scholes_delta, _black_scholes_gamma, _solve_implied_volatility, recommend_option_contracts
@@ -164,6 +165,7 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
                 state_major_levels=client.get_state_gex_major_levels(ticker, period),
                 classic_max_change=client.get_gex_max_change(ticker, period),
                 state_max_change=client.get_state_gex_max_change(ticker, period),
+                greek_flow=_live_greek_flow(client, ticker, period),
             )
         except (GexApiError, ValueError) as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
@@ -601,6 +603,7 @@ def _analyze_ticker(ticker: str, period: str, replay_date: str | None = None, re
             classic_max_change=classic_max_change,
             state_max_change=state_max_change,
             technicals=technicals,
+            greek_flow=None,
         )
 
     return analyze_gex(
@@ -610,7 +613,15 @@ def _analyze_ticker(ticker: str, period: str, replay_date: str | None = None, re
         classic_max_change=client.get_gex_max_change(ticker, period),
         state_max_change=client.get_state_gex_max_change(ticker, period),
         technicals=technicals,
+        greek_flow=_live_greek_flow(client, ticker, period),
     )
+
+
+def _live_greek_flow(client: GexClient, ticker: str, period: str):
+    try:
+        return client.get_state_greek_flow(ticker, period)
+    except GexApiError:
+        return None
 
 
 def _stock_technicals(ticker: str, replay_date: str | None = None, replay_time: str | None = None) -> StockTechnicals:
@@ -691,11 +702,12 @@ def _cache_completed_day(
         cached_minute_bars = storage.stock_bars(provider, replay_date, stock_symbol, "1Min")
         cached_daily_bars = storage.stock_bars(provider, replay_date, stock_symbol, "1Day")
         cached_gex_modes = set(storage.gex_rows(replay_date, ticker, period))
+        required_gex_modes = {"classic", "state"} if period == "full" else {"classic", "state", "vanna", "charm"}
         cache_is_complete = (
             set(cached_options) == set(symbols)
             and cached_minute_bars is not None
             and cached_daily_bars is not None
-            and cached_gex_modes == {"classic", "state"}
+            and cached_gex_modes == required_gex_modes
         )
         if already_complete and cache_is_complete and not force:
             results.append({"ticker": ticker, "status": "complete", "cached": True, "contracts": len(symbols)})
@@ -750,21 +762,21 @@ def _cache_completed_day(
                 )
                 storage.save_stock_bars(provider, replay_date, stock_symbol, "1Day", daily_bars)
 
-            if force or cached_gex_modes != {"classic", "state"}:
+            if force or not {"classic", "state"}.issubset(cached_gex_modes):
                 gex_client.prefetch_historical_gex_date(ticker, period, replay_date)
-                storage.save_gex_rows(
-                    replay_date,
-                    ticker,
-                    period,
-                    gex_client.cached_historical_gex_rows(ticker, period, replay_date),
-                )
+            gex_rows = gex_client.cached_historical_gex_rows(ticker, period, replay_date)
+            if period != "full" and (force or not {"vanna", "charm"}.issubset(cached_gex_modes)):
+                gex_client.prefetch_historical_state_greeks_date(ticker, period, replay_date)
+            if period != "full":
+                gex_rows.update(gex_client.cached_historical_state_greek_rows(ticker, period, replay_date))
+            storage.save_gex_rows(replay_date, ticker, period, gex_rows)
 
             detail.update({
                 "option_bars": len(symbols),
                 "stock_symbol": stock_symbol,
                 "stock_minute_bars": len(minute_bars),
                 "stock_daily_bars": len(daily_bars),
-                "gex_modes": ["classic", "state"],
+                "gex_modes": sorted(required_gex_modes),
             })
             storage.save_cache_status(
                 replay_date, ticker, period, provider,
@@ -847,6 +859,12 @@ def _cached_replay_payload(
         classic_max_change=classic_change,
         state_max_change=state_change,
         technicals=technicals,
+        greek_flow=historical_state_greek_flow_from_rows(
+            rows_by_mode,
+            replay_date,
+            replay_time,
+            period=period,
+        ),
     )
 
     history = [

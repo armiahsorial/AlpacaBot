@@ -279,6 +279,8 @@ class WebAppTests(unittest.TestCase):
         client.get_state_gex_major_levels.return_value = state_major_levels
         client.get_gex_max_change.return_value = classic_max_change
         client.get_state_gex_max_change.return_value = state_max_change
+        greek_flow = MagicMock()
+        client.get_state_greek_flow.return_value = greek_flow
 
         with patch("trading_bot.web_app.Settings.from_env", return_value=MagicMock()):
             with patch("trading_bot.web_app.GexClient", return_value=client):
@@ -303,6 +305,7 @@ class WebAppTests(unittest.TestCase):
             state_major_levels=state_major_levels,
             classic_max_change=classic_max_change,
             state_max_change=state_max_change,
+            greek_flow=greek_flow,
         )
 
     def test_handle_analyze_rejects_bad_period(self):

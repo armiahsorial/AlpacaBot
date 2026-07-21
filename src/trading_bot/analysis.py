@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from trading_bot.gex_client import GexMajorLevels, GexMaxChange
+from trading_bot.gex_client import GexMajorLevels, GexMaxChange, StateGreekFlow
 from trading_bot.technicals import StockTechnicals
 
 
@@ -43,6 +43,7 @@ class GexAnalysis:
     score_breakdown: tuple[str, ...]
     no_trade_reasons: tuple[str, ...]
     technicals: StockTechnicals | None = None
+    greek_flow: StateGreekFlow | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -79,6 +80,7 @@ class GexAnalysis:
             "score_breakdown": list(self.score_breakdown),
             "no_trade_reasons": list(self.no_trade_reasons),
             "technicals": self.technicals.as_dict() if self.technicals else None,
+            "greek_flow": self.greek_flow.as_dict() if self.greek_flow else None,
         }
 
 
@@ -90,6 +92,7 @@ def analyze_gex(
     classic_max_change: GexMaxChange,
     state_max_change: GexMaxChange,
     technicals: StockTechnicals | None = None,
+    greek_flow: StateGreekFlow | None = None,
 ) -> GexAnalysis:
     score = 0
     reasons: list[str] = []
@@ -169,6 +172,15 @@ def analyze_gex(
             reasons.append(reason)
         score_breakdown.append(f"{technicals.score_adjustment:+d} VWAP/50-day/200-day technical context")
 
+    if greek_flow is not None:
+        if greek_flow.flow_bias == "supportive":
+            reasons.append("Net -vanna and charm both indicate supportive passive dealer hedging flow into expiry.")
+        elif greek_flow.flow_bias == "selling pressure":
+            reasons.append("Net -vanna and charm both indicate passive dealer selling pressure into expiry.")
+        else:
+            reasons.append(f"Net -vanna and charm flow is {greek_flow.flow_bias}, so it does not confirm direction.")
+        score_breakdown.append("0 -vanna/charm beta context (informational only)")
+
     if _is_too_close(spot, classic_major_levels.mpos_vol):
         no_trade_reasons.append("Spot is close to classic major positive GEX; upside chase risk is elevated.")
     if _is_too_close(spot, classic_major_levels.mneg_vol):
@@ -221,6 +233,7 @@ def analyze_gex(
         score_breakdown=tuple(score_breakdown),
         no_trade_reasons=tuple(no_trade_reasons),
         technicals=technicals,
+        greek_flow=greek_flow,
     )
 
 

@@ -639,6 +639,28 @@ button:disabled {
   line-height: 1.35;
 }
 
+.sidebar-greek-flow h3 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sidebar-greek-flow > p {
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.35;
+}
+
+.beta-label {
+  border: 1px solid rgba(119, 255, 218, 0.35);
+  padding: 1px 4px;
+  color: var(--accent);
+  font-size: 8px;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
 .sidebar-action p {
   margin: 6px 0 0;
   color: var(--ink);

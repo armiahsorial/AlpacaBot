@@ -126,6 +126,13 @@ const fields = {
   technicalFib200: document.querySelector("#technical-fib-200"),
   technicalLean: document.querySelector("#technical-lean"),
   technicalReasons: document.querySelector("#technical-reasons"),
+  greekFlowBias: document.querySelector("#greek-flow-bias"),
+  vannaNet: document.querySelector("#vanna-net"),
+  charmNet: document.querySelector("#charm-net"),
+  vannaLevels: document.querySelector("#vanna-levels"),
+  charmLevels: document.querySelector("#charm-levels"),
+  pressureVannaNet: document.querySelector("#pressure-vanna-net"),
+  pressureCharmNet: document.querySelector("#pressure-charm-net"),
   strikeChart: document.querySelector("#strike-chart"),
   action: document.querySelector("#action"),
   marketRegime: document.querySelector("#market-regime"),
@@ -594,6 +601,7 @@ function renderMultiTickerSummary(results) {
     }
 
     const analysis = result.payload;
+    const flow = analysis.greek_flow;
     card.className = `multi-ticker-card permission-${permissionClass(analysis.trade_permission)}`;
     card.innerHTML = `
       <strong>${result.ticker}</strong>
@@ -601,6 +609,7 @@ function renderMultiTickerSummary(results) {
       <span>${analysis.bias}</span>
       <span>score ${formatOptionalNumber(analysis.score)}</span>
       <span>spot ${formatOptionalNumber(analysis.spot)}</span>
+      <span>flow ${flow ? flow.flow_bias : "unavailable"}</span>
     `;
     fields.multiTickerList.appendChild(card);
   }
@@ -750,6 +759,7 @@ function renderAnalysis(analysis) {
   fields.stateNet.textContent = formatNumber(analysis.state_net_imbalance);
   fields.classicChange.textContent = formatChange(analysis.classic_thirty_min_change);
   fields.stateChange.textContent = formatChange(analysis.state_thirty_min_change);
+  renderGreekFlow(analysis.greek_flow);
   fields.risk.textContent = analysis.risk_note;
   renderTechnicals(analysis.technicals);
   renderStrikeChart(analysis);
@@ -766,6 +776,37 @@ function renderAnalysis(analysis) {
   }
 
   resultsEl.classList.remove("hidden");
+}
+
+function renderGreekFlow(flow) {
+  if (!flow) {
+    fields.greekFlowBias.textContent = "Unavailable";
+    fields.vannaNet.textContent = "-";
+    fields.charmNet.textContent = "-";
+    fields.vannaLevels.textContent = "-";
+    fields.charmLevels.textContent = "-";
+    fields.pressureVannaNet.textContent = "-";
+    fields.pressureCharmNet.textContent = "-";
+    return;
+  }
+  const vanna = formatGreekExposure(flow.vanna_net);
+  const charm = formatGreekExposure(flow.charm_net);
+  fields.greekFlowBias.textContent = flow.flow_bias;
+  fields.vannaNet.textContent = vanna;
+  fields.charmNet.textContent = charm;
+  fields.vannaLevels.textContent = `${formatNumber(flow.vanna_major_positive)} / ${formatNumber(flow.vanna_major_negative)}`;
+  fields.charmLevels.textContent = `${formatNumber(flow.charm_major_positive)} / ${formatNumber(flow.charm_major_negative)}`;
+  fields.pressureVannaNet.textContent = vanna;
+  fields.pressureCharmNet.textContent = charm;
+}
+
+function formatGreekExposure(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return "-";
+  }
+  const sign = parsed > 0 ? "+" : "";
+  return `${sign}$${formatNumber(parsed)}M`;
 }
 
 function renderTechnicals(technicals) {

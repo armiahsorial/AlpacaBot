@@ -12,6 +12,7 @@ from trading_bot.gex_client import (
     GexMaxChange,
     StateGreekProfile,
     Tickers,
+    state_greek_flow_from_profiles,
 )
 
 
@@ -130,6 +131,19 @@ class StateGreekProfileTests(unittest.TestCase):
 
         with self.assertRaisesRegex(GexApiError, "mini contract row"):
             StateGreekProfile.from_json(payload)
+
+    def test_state_greek_flow_sums_profiles_and_labels_aligned_flow(self):
+        vanna = StateGreekProfile.from_json(_state_greek_profile_payload())
+        charm_payload = _state_greek_profile_payload()
+        charm_payload["mini_contracts"][1][3] = 100.0
+        charm = StateGreekProfile.from_json(charm_payload)
+
+        flow = state_greek_flow_from_profiles(vanna, charm, period="zero")
+
+        self.assertEqual(flow.vanna_net, 52.36)
+        self.assertEqual(flow.charm_net, 100.0)
+        self.assertEqual(flow.flow_bias, "supportive")
+        self.assertEqual(flow.as_dict()["score_adjustment"], 0)
 
 
 class GexClientTests(unittest.TestCase):

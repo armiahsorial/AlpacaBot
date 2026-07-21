@@ -340,6 +340,40 @@ class StateGreekProfile:
         }
 
 
+@dataclass(frozen=True)
+class StateGreekFlow:
+    timestamp: int
+    ticker: str
+    period: str
+    vanna_net: float
+    charm_net: float
+    vanna_gross: float
+    charm_gross: float
+    vanna_major_positive: float
+    vanna_major_negative: float
+    charm_major_positive: float
+    charm_major_negative: float
+    flow_bias: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "timestamp": self.timestamp,
+            "ticker": self.ticker,
+            "period": self.period,
+            "vanna_net": self.vanna_net,
+            "charm_net": self.charm_net,
+            "vanna_gross": self.vanna_gross,
+            "charm_gross": self.charm_gross,
+            "vanna_major_positive": self.vanna_major_positive,
+            "vanna_major_negative": self.vanna_major_negative,
+            "charm_major_positive": self.charm_major_positive,
+            "charm_major_negative": self.charm_major_negative,
+            "flow_bias": self.flow_bias,
+            "score_adjustment": 0,
+            "score_note": "Informational beta context; not included in the permission score.",
+        }
+
+
 class GexClient:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -422,6 +456,16 @@ class GexClient:
 
         return StateGreekProfile.from_json(payload)
 
+    def get_state_greek_flow(self, ticker: str, aggregation_period: str) -> StateGreekFlow | None:
+        suffix = _state_greek_period_suffix(aggregation_period)
+        if suffix is None:
+            return None
+        return state_greek_flow_from_profiles(
+            self.get_state_greek_profile(ticker, f"vanna_{suffix}"),
+            self.get_state_greek_profile(ticker, f"charm_{suffix}"),
+            period=aggregation_period,
+        )
+
     def get_historical_gex_inputs(
         self,
         ticker: str,
@@ -491,6 +535,71 @@ class GexClient:
             _write_disk_history_cache(history_key, rows)
             loaded.append(mode)
         return {"ticker": ticker, "period": aggregation_period, "date": replay_date, "loaded": loaded, "cached": cached}
+
+    def prefetch_historical_state_greeks_date(
+        self,
+        ticker: str,
+        aggregation_period: str,
+        replay_date: str,
+    ) -> dict[str, Any]:
+        """Download daily -vanna and charm profiles when the period supports them."""
+        ticker, aggregation_period = _normalize_ticker_and_period(ticker, aggregation_period)
+        suffix = _state_greek_period_suffix(aggregation_period)
+        if suffix is None:
+            return {"ticker": ticker, "period": aggregation_period, "date": replay_date, "loaded": [], "cached": []}
+
+        loaded: list[str] = []
+        cached: list[str] = []
+        for greek in (f"vanna_{suffix}", f"charm_{suffix}"):
+            history_key = f"{ticker}:state:{greek}:{replay_date}"
+            rows = _HISTORICAL_ROWS_CACHE.get(history_key) or _read_disk_history_cache(history_key)
+            if rows is not None:
+                cached.append(greek)
+                continue
+            url = self._get_historical_signed_url(
+                history_key=history_key,
+                safe_ticker=quote(ticker, safe=""),
+                safe_mode="state",
+                safe_period=quote(greek, safe=""),
+                safe_date=quote(replay_date, safe=""),
+            )
+            try:
+                rows = self._get_signed_history_rows(url)
+            except GexApiError as exc:
+                if not _is_expired_signed_url_error(exc):
+                    raise
+                _HISTORICAL_URL_CACHE.pop(history_key, None)
+                url = self._get_historical_signed_url(
+                    history_key=history_key,
+                    safe_ticker=quote(ticker, safe=""),
+                    safe_mode="state",
+                    safe_period=quote(greek, safe=""),
+                    safe_date=quote(replay_date, safe=""),
+                )
+                rows = self._get_signed_history_rows(url)
+            _HISTORICAL_ROWS_CACHE[history_key] = rows
+            _write_disk_history_cache(history_key, rows)
+            loaded.append(greek)
+        return {"ticker": ticker, "period": aggregation_period, "date": replay_date, "loaded": loaded, "cached": cached}
+
+    def cached_historical_state_greek_rows(
+        self,
+        ticker: str,
+        aggregation_period: str,
+        replay_date: str,
+    ) -> dict[str, list[dict[str, Any]]]:
+        ticker, aggregation_period = _normalize_ticker_and_period(ticker, aggregation_period)
+        suffix = _state_greek_period_suffix(aggregation_period)
+        if suffix is None:
+            return {}
+        result: dict[str, list[dict[str, Any]]] = {}
+        for name in ("vanna", "charm"):
+            history_key = f"{ticker}:state:{name}_{suffix}:{replay_date}"
+            rows = _HISTORICAL_ROWS_CACHE.get(history_key) or _read_disk_history_cache(history_key)
+            if rows is None:
+                raise GexApiError(f"{ticker} state {name} history for {replay_date} is not cached.")
+            result[name] = rows
+        return result
 
     def cached_historical_gex_rows(
         self,
@@ -725,6 +834,105 @@ def _normalize_ticker_and_period(ticker: str, aggregation_period: str) -> tuple[
         raise ValueError(f"aggregation_period must be one of: {allowed}.")
 
     return ticker, aggregation_period
+
+
+def _state_greek_period_suffix(aggregation_period: str) -> str | None:
+    period = aggregation_period.strip().lower()
+    if period == "zero":
+        return "zero"
+    if period == "one":
+        return "one"
+    return None
+
+
+def state_greek_flow_from_profiles(
+    vanna: StateGreekProfile,
+    charm: StateGreekProfile,
+    *,
+    period: str,
+) -> StateGreekFlow:
+    if vanna.ticker != charm.ticker:
+        raise GexApiError("Vanna and charm profiles must use the same ticker.")
+    vanna_values = [contract.greek_value for contract in vanna.mini_contracts]
+    charm_values = [contract.greek_value for contract in charm.mini_contracts]
+    vanna_net = sum(vanna_values)
+    charm_net = sum(charm_values)
+    return StateGreekFlow(
+        timestamp=min(vanna.timestamp, charm.timestamp),
+        ticker=vanna.ticker,
+        period=period,
+        vanna_net=vanna_net,
+        charm_net=charm_net,
+        vanna_gross=sum(abs(value) for value in vanna_values),
+        charm_gross=sum(abs(value) for value in charm_values),
+        vanna_major_positive=vanna.major_positive,
+        vanna_major_negative=vanna.major_negative,
+        charm_major_positive=charm.major_positive,
+        charm_major_negative=charm.major_negative,
+        flow_bias=_state_greek_flow_bias(vanna_net, charm_net),
+    )
+
+
+def historical_state_greek_flow_from_rows(
+    rows_by_mode: dict[str, list[dict[str, Any]]],
+    replay_date: str,
+    replay_time: str,
+    *,
+    period: str,
+) -> StateGreekFlow | None:
+    vanna_rows = rows_by_mode.get("vanna")
+    charm_rows = rows_by_mode.get("charm")
+    if not isinstance(vanna_rows, list) or not isinstance(charm_rows, list):
+        return None
+    target_timestamp = _market_timestamp(replay_date, replay_time)
+    vanna = _state_greek_summary(_select_historical_row(vanna_rows, target_timestamp))
+    charm = _state_greek_summary(_select_historical_row(charm_rows, target_timestamp))
+    return StateGreekFlow(
+        timestamp=min(vanna[0], charm[0]),
+        ticker=vanna[1],
+        period=period,
+        vanna_net=vanna[2],
+        charm_net=charm[2],
+        vanna_gross=vanna[3],
+        charm_gross=charm[3],
+        vanna_major_positive=vanna[4],
+        vanna_major_negative=vanna[5],
+        charm_major_positive=charm[4],
+        charm_major_negative=charm[5],
+        flow_bias=_state_greek_flow_bias(vanna[2], charm[2]),
+    )
+
+
+def _state_greek_summary(row: dict[str, Any]) -> tuple[int, str, float, float, float, float]:
+    if "net_greek" in row:
+        return (
+            _read_int(row, "timestamp"),
+            _read_string(row, "ticker").upper(),
+            _read_number(row.get("net_greek"), "net_greek"),
+            _read_number(row.get("gross_greek"), "gross_greek"),
+            _read_number(row.get("major_positive"), "major_positive"),
+            _read_number(row.get("major_negative"), "major_negative"),
+        )
+    profile = StateGreekProfile.from_json(row)
+    values = [contract.greek_value for contract in profile.mini_contracts]
+    return (
+        profile.timestamp,
+        profile.ticker,
+        sum(values),
+        sum(abs(value) for value in values),
+        profile.major_positive,
+        profile.major_negative,
+    )
+
+
+def _state_greek_flow_bias(vanna_net: float, charm_net: float) -> str:
+    if vanna_net > 0 and charm_net > 0:
+        return "supportive"
+    if vanna_net < 0 and charm_net < 0:
+        return "selling pressure"
+    if vanna_net == 0 and charm_net == 0:
+        return "neutral"
+    return "mixed"
 
 
 def _read_string(payload: dict[str, Any], field_name: str) -> str:

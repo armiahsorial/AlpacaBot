@@ -683,6 +683,24 @@ def _compact_gex_row(row: Any) -> dict[str, Any] | None:
     """Keep the fields replay analysis needs and omit the large strike map."""
     if not isinstance(row, dict) or not isinstance(row.get("timestamp"), int):
         return None
+    mini_contracts = row.get("mini_contracts")
+    if isinstance(mini_contracts, list):
+        values = [
+            float(contract[3])
+            for contract in mini_contracts
+            if isinstance(contract, list)
+            and len(contract) >= 4
+            and isinstance(contract[3], (int, float))
+            and not isinstance(contract[3], bool)
+        ]
+        return {
+            "timestamp": row.get("timestamp"),
+            "ticker": row.get("ticker"),
+            "net_greek": sum(values),
+            "gross_greek": sum(abs(value) for value in values),
+            "major_positive": row.get("major_positive"),
+            "major_negative": row.get("major_negative"),
+        }
     keys = (
         "timestamp",
         "ticker",

@@ -2079,98 +2079,14 @@ function payloadWarning(payload, mode) {
 }
 
 function renderTickerContractColumns(payloads, errors, mode) {
-  fields.contractList.innerHTML = "";
-  fields.contractList.classList.toggle("multi-ticker-columns", payloads.length + errors.length > 1);
-  for (const payload of payloads) {
-    const recommendation = payloadRecommendation(payload, mode);
-    const analysis = payload.analysis || {};
-    const ticker = recommendation.ticker || analysis.ticker || payload.ticker || "Ticker";
-    const candidates = (payload.candidates || []).slice(0, 3);
-    const column = document.createElement("section");
-    column.className = `ticker-contract-column permission-${permissionClass(recommendation.trade_permission)}`;
-    column.dataset.ticker = ticker;
-    column.dataset.scrollKey = `contract-column:${ticker}`;
-    column.innerHTML = `
-      <header class="ticker-column-header">
-        <div>
-          <strong>${escapeHtml(ticker)}</strong>
-          <span>${escapeHtml(recommendation.trade_permission || "No trade read")}</span>
-        </div>
-        <div class="ticker-column-stats">
-          <span>${escapeHtml(recommendation.bias || analysis.bias || "unknown")}</span>
-          <span>Spot ${formatOptionalNumber(analysis.spot ?? recommendation.gex_spot)}</span>
-        </div>
-      </header>
-      <div class="ticker-candidate-list"></div>
-    `;
-    const list = column.querySelector(".ticker-candidate-list");
-    if (candidates.length === 0) {
-      const empty = document.createElement("p");
-      empty.className = "ticker-column-empty";
-      empty.textContent = payloadWarning(payload, mode)
-        || recommendation.recommendation
-        || "No ranked contracts are available for this ticker.";
-      list.appendChild(empty);
-    } else {
-      candidates.forEach((candidate, index) => list.appendChild(createTickerCandidateRow(candidate, mode, index + 1)));
-    }
-    fields.contractList.appendChild(column);
-  }
-
-  for (const error of errors) {
-    const column = document.createElement("section");
-    column.className = "ticker-contract-column error";
-    column.dataset.ticker = error.ticker;
-    column.dataset.scrollKey = `contract-column:${error.ticker}`;
-    column.innerHTML = `
-      <header class="ticker-column-header">
-        <div><strong>${escapeHtml(error.ticker)}</strong><span>Unavailable</span></div>
-      </header>
-      <p class="ticker-column-empty">${escapeHtml(error.message)}</p>
-    `;
-    fields.contractList.appendChild(column);
-  }
-
-  if (payloads.length === 0 && errors.length === 0) {
-    fields.contractList.textContent = mode === "replay" ? "No replay contracts found." : "No contract candidates.";
-  }
-}
-
-function createTickerCandidateRow(candidate, mode, rank) {
-  const replay = mode === "replay";
-  const price = replay ? candidate.close : candidate.mid;
-  const row = document.createElement("button");
-  row.type = "button";
-  row.className = `contract-row contract-${contractSide(candidate)}`;
-  row.innerHTML = `
-    <span class="candidate-rank">Pick #${rank}</span>
-    ${contractTitleMarkup(candidate)}
-    ${optionSparklineMarkup(candidate)}
-    ${replay
-      ? contractMetric("Price / cost", formatOptionPriceAndCost(price), "The old quoted option price and total cost for one 100-share contract at the selected replay time.")
-      : contractMetric("Mid / cost", formatOptionPriceAndCost(price), "The quote midpoint and approximate total debit for one 100-share contract.")}
-    ${replay
-      ? contractMetric("Day", formatPercent(candidate.day_change_pct), "How much this option had moved that day by the selected replay time.")
-      : contractMetric("Spread", formatPercent(candidate.spread_pct), "The gap between buy and sell prices. Smaller is usually better.")}
-    ${replay
-      ? contractMetric("Volume", formatNumber(candidate.volume || 0), "How many of this exact option traded in the latest one-minute bar.")
-      : contractMetric("Open int", candidate.open_interest ?? "n/a", "How many of this option are still open in the market.")}
-    ${replay
-      ? contractMetric("Replay score", formatNumber(candidate.replay_score), "The bot's historical replay rank for this contract.")
-      : contractMetric("Score", formatNumber(candidate.score), "The bot's quality rank for this contract.")}
-    <small>${greekSummary(candidate)}</small>
-  `;
-  row.addEventListener("click", () => {
-    isInspectingContract = true;
-    stageCandidate(
-      candidate,
-      price,
-      replay
-        ? `Staged ${candidate.symbol} from replay at ${replayClock.value} ${hostTimeZoneLabel()}.`
-        : `Staged ${candidate.symbol} as a paper limit order.`
-    );
-  });
-  return row;
+  // Candidate data is consumed by Best Pick, permission history, and the ledger.
+  // Keep this hidden target for the existing loading lifecycle without duplicating cards.
+  fields.contractList.replaceChildren();
+  fields.contractList.dataset.mode = mode;
+  fields.contractList.dataset.candidateCount = String(
+    payloads.reduce((total, payload) => total + (payload.candidates || []).length, 0)
+  );
+  fields.contractList.dataset.errorCount = String(errors.length);
 }
 
 function payloadHasTradePermission(payload, mode) {
@@ -2739,6 +2655,7 @@ function recordPaperLedgerTrade(item) {
     side: item.side,
     entryPrice: entry,
     entryGreeks: item.entryGreeks || null,
+    pricePath: Array.isArray(item.pricePath) ? item.pricePath.slice(-120) : [entry],
     quantity: 1,
     status: "open",
     score,
@@ -2849,10 +2766,15 @@ function renderPaperLedgerRows(container, trades, { isHistoricalDay, state }) {
     const highQualifier = hasObservedLiveMark
       ? "Observed market marks"
       : "Entry only - awaiting live mark";
+    const ledgerPricePath = paperLedgerPricePath(trade, current);
     row.innerHTML = `
       <span class="ledger-contract">
         <strong>${trade.timestamp?.label || "-"}</strong>
         <em>${trade.contract || trade.symbol}</em>
+        <span class="ledger-price-chart">
+          <i>Price path</i>
+          ${optionSparklineMarkup({ price_path: ledgerPricePath })}
+        </span>
       </span>
       <span class="history-pill">${trade.status === "closed" ? "Closed" : "Open"}</span>
       <span class="history-stat"><i>Entry</i><strong>${formatCurrency(trade.entryPrice)}</strong></span>
@@ -3108,6 +3030,7 @@ function updatePaperLedgerPrices(priceMap, asOfIso = null, { evaluateExit = true
         highTimestampIso: madeHigh ? now.toISOString() : trade.highTimestampIso || trade.timestamp?.iso || null,
         lowTimestampIso: madeLow ? now.toISOString() : trade.lowTimestampIso || trade.timestamp?.iso || null,
         lastUpdatedIso: now.toISOString(),
+        pricePath: appendPaperLedgerPrice(trade.pricePath, current),
       };
     }
     const decision = gexSellDecision(trade);
@@ -3127,6 +3050,7 @@ function updatePaperLedgerPrices(priceMap, asOfIso = null, { evaluateExit = true
       highTimestampIso: madeHigh ? now.toISOString() : trade.highTimestampIso || trade.timestamp?.iso || null,
       lowTimestampIso: madeLow ? now.toISOString() : trade.lowTimestampIso || trade.timestamp?.iso || null,
       lastUpdatedIso: now.toISOString(),
+      pricePath: appendPaperLedgerPrice(trade.pricePath, current),
       exitSignalKey: decision.shouldExit ? decision.key : null,
       exitSignalCount,
       exitSignalLabel: decision.shouldExit ? decision.label : null,
@@ -3156,6 +3080,32 @@ function currentOpenPaperTrades() {
   return loadPaperLedger().filter((trade) =>
     trade.status !== "closed" && paperLedgerDay(trade) === day
   );
+}
+
+function appendPaperLedgerPrice(pricePath, current) {
+  const points = (Array.isArray(pricePath) ? pricePath : [])
+    .map(Number)
+    .filter(Number.isFinite);
+  const value = optionalNumber(current);
+  if (value !== null && points[points.length - 1] !== value) {
+    points.push(value);
+  }
+  return points.slice(-120);
+}
+
+function paperLedgerPricePath(trade, current = null) {
+  let points = appendPaperLedgerPrice(trade.pricePath, current);
+  if (points.length >= 2) {
+    return points;
+  }
+  const selectedDate = replayDate.value || paperLedgerDay(trade);
+  const history = selectedReplayUsesLiveData()
+    ? loadTradeHistory()
+    : historicalTradeHistoryForDate(selectedDate);
+  const source = history.find((item) => item.id === trade.sourceHistoryId)
+    || history.find((item) => item.symbol === trade.symbol && historyItemDate(item) === paperLedgerDay(trade));
+  points = appendPaperLedgerPrice(source?.pricePath, current ?? trade.currentPrice ?? trade.entryPrice);
+  return points.length ? points : [trade.entryPrice].filter((value) => optionalNumber(value) !== null);
 }
 
 async function forceClosePaperTrades(tradeIds) {
@@ -4421,26 +4371,6 @@ function uniquePaperLedgerTrades(ledger) {
       return true;
     })
     .sort((a, b) => String(b.timestamp?.iso || "").localeCompare(String(a.timestamp?.iso || "")));
-}
-
-function contractTitleMarkup(candidate) {
-  const side = contractSide(candidate);
-  return `
-    <span class="contract-title">
-      <strong>${readableContractName(candidate)}</strong>
-      <em>${candidate.symbol}</em>
-      <b class="contract-badge ${side}">${side.toUpperCase()}</b>
-    </span>
-  `;
-}
-
-function contractMetric(label, value, description) {
-  return `
-    <span class="contract-metric">
-      <i>${label}<b class="info-dot" data-tooltip="${escapeAttribute(description)}" aria-label="${escapeAttribute(description)}" tabindex="0">i</b></i>
-      <strong>${value}</strong>
-    </span>
-  `;
 }
 
 function optionSparklineMarkup(candidate) {

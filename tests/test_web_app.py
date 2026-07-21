@@ -108,6 +108,34 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Promise.allSettled([outcomeUpdate, updateTradeHistoryPrices(history)])", javascript)
         self.assertIn("}, 300);", javascript)
 
+    def test_market_snapshot_and_report_are_inside_sticky_sidebar(self):
+        html = (STATIC_DIR / "index.html").read_text()
+        stylesheet = (STATIC_DIR / "styles.css").read_text()
+
+        sidebar_start = html.index('class="watchlist-sidebar"')
+        sidebar_end = html.index('class="watchlist-main"')
+        insights = html.index('id="sidebar-insights"')
+        tracking = html.index('id="tracking-overview-rows"')
+
+        self.assertLess(sidebar_start, tracking)
+        self.assertLess(tracking, insights)
+        self.assertLess(insights, sidebar_end)
+        self.assertEqual(html.count('id="trade-permission"'), 1)
+        self.assertEqual(html.count('id="technical-vwap"'), 1)
+        self.assertEqual(html.count('id="report-profitable"'), 1)
+        self.assertIn(".sidebar-report .report-card-grid", stylesheet)
+        self.assertIn("max-height: calc(100vh - 24px)", stylesheet)
+
+    def test_paper_ledger_reuses_saved_price_paths_without_api_requests(self):
+        javascript = (STATIC_DIR / "app.js").read_text()
+        stylesheet = (STATIC_DIR / "styles.css").read_text()
+
+        self.assertIn("pricePath: Array.isArray(item.pricePath) ? item.pricePath.slice(-120) : [entry]", javascript)
+        self.assertIn("function paperLedgerPricePath(trade, current = null)", javascript)
+        self.assertIn("optionSparklineMarkup({ price_path: ledgerPricePath })", javascript)
+        self.assertIn("pricePath: appendPaperLedgerPrice(trade.pricePath, current)", javascript)
+        self.assertIn(".ledger-price-chart .option-sparkline", stylesheet)
+
     def test_trade_history_rows_wrap_status_age_and_greeks_without_clipping(self):
         javascript = (STATIC_DIR / "app.js").read_text()
         stylesheet = (STATIC_DIR / "styles.css").read_text()
@@ -154,16 +182,17 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("/api/options/stream-prices?", javascript)
         self.assertIn("{ evaluateExit: false }", javascript)
 
-    def test_frontend_groups_three_contract_picks_per_ticker(self):
+    def test_frontend_records_three_picks_without_duplicate_candidate_cards(self):
+        html = (STATIC_DIR / "index.html").read_text()
         javascript = (STATIC_DIR / "app.js").read_text()
-        stylesheet = (STATIC_DIR / "styles.css").read_text()
 
         self.assertIn("const MAX_RECORDED_PERMISSION_CANDIDATES = 3", javascript)
         self.assertEqual(javascript.count('limit: "3"'), 2)
         self.assertIn("renderTickerContractColumns(payloads, errors, \"live\")", javascript)
         self.assertIn("renderTickerContractColumns(payloads, errors, \"replay\")", javascript)
-        self.assertIn(".contract-list.multi-ticker-columns", stylesheet)
-        self.assertIn(".ticker-contract-column", stylesheet)
+        self.assertIn('id="contract-list" class="hidden" aria-hidden="true"', html)
+        renderer = javascript.split("function renderTickerContractColumns", 1)[1].split("function payloadHasTradePermission", 1)[0]
+        self.assertNotIn("createTickerCandidateRow(", renderer)
 
     def test_frontend_preserves_scroll_during_auto_refresh(self):
         javascript = (STATIC_DIR / "app.js").read_text()
@@ -172,7 +201,6 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("function restoreViewportAnchor(anchor)", javascript)
         self.assertIn('fields.contractList.classList.add("is-refreshing")', javascript)
         self.assertNotIn('fields.contractList.textContent = "-"', javascript)
-        self.assertIn("column.dataset.scrollKey", javascript)
         self.assertIn("row.dataset.scrollKey", javascript)
 
     def test_frontend_compacts_trade_history_when_browser_storage_is_full(self):

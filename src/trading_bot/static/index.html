@@ -182,6 +182,71 @@
               <div id="tracking-overview-rows"></div>
             </div>
               </section>
+              <section id="sidebar-insights" class="sidebar-insights" aria-label="Current market analysis">
+                <div class="sidebar-insights-heading">
+                  <h3>Market Snapshot</h3>
+                  <span>Live analysis</span>
+                </div>
+                <div class="sidebar-summary">
+                  <div>
+                    <span class="label">Permission</span>
+                    <strong id="trade-permission">-</strong>
+                  </div>
+                  <div>
+                    <span class="label">Bias</span>
+                    <strong id="bias">-</strong>
+                  </div>
+                  <div>
+                    <span class="label">Confidence</span>
+                    <strong id="confidence">-</strong>
+                  </div>
+                  <div>
+                    <span class="label">Score</span>
+                    <strong id="score">-</strong>
+                  </div>
+                  <div>
+                    <span class="label">Spot</span>
+                    <strong id="spot">-</strong>
+                  </div>
+                  <div>
+                    <span class="label">Zero Gamma</span>
+                    <strong id="zero-gamma">-</strong>
+                  </div>
+                </div>
+
+                <section class="sidebar-widget sidebar-technicals">
+                  <h3>Technicals</h3>
+                  <dl>
+                    <div><dt>VWAP</dt><dd id="technical-vwap">-</dd></div>
+                    <div><dt>50-day MA</dt><dd id="technical-sma-50">-</dd></div>
+                    <div><dt>200-day MA</dt><dd id="technical-sma-200">-</dd></div>
+                    <div><dt>Fib near 200 MA</dt><dd id="technical-fib-200">-</dd></div>
+                    <div><dt>Technical lean</dt><dd id="technical-lean">-</dd></div>
+                  </dl>
+                  <ul id="technical-reasons" class="compact-list"></ul>
+                </section>
+
+                <section class="sidebar-widget sidebar-action">
+                  <h3>Action</h3>
+                  <p id="action">-</p>
+                </section>
+
+                <section class="sidebar-widget sidebar-report daily-report-card">
+                  <h3>Daily Report Card</h3>
+                  <div class="report-card-grid">
+                    <div><span>Total trades</span><strong id="report-total-trades">0</strong></div>
+                    <div><span>Win rate</span><strong id="report-win-rate">-</strong></div>
+                    <div><span>Average win</span><strong id="report-average-win">-</strong></div>
+                    <div><span>Average loss</span><strong id="report-average-loss">-</strong></div>
+                    <div><span>Profit factor</span><strong id="report-profit-factor">-</strong></div>
+                    <div><span>Max drawdown</span><strong id="report-max-drawdown">-</strong></div>
+                    <div><span>Best ticker</span><strong id="report-best-ticker">-</strong></div>
+                    <div><span>Worst ticker</span><strong id="report-worst-ticker">-</strong></div>
+                    <div class="report-verdict"><span>Would this day have been profitable?</span><strong id="report-profitable">No trades yet</strong></div>
+                  </div>
+                  <p>Uses one simulated contract per unique Pick #1 and the bot's recorded entry and exit decisions.</p>
+                </section>
+              </section>
             </aside>
             <div class="watchlist-main">
               <div id="day-simulation-status" class="mini-status hidden" aria-live="polite"></div>
@@ -274,73 +339,13 @@
               <div id="lower-confidence-log" class="lower-confidence-log">No below-100 signals yet.</div>
             </details>
               </div>
-              <div id="contract-list" class="contract-list">-</div>
+              <div id="contract-list" class="hidden" aria-hidden="true"></div>
             </div>
           </div>
         </section>
       </section>
 
       <section id="results" class="results hidden" aria-live="polite">
-        <div class="summary">
-          <div>
-            <span class="label">Permission</span>
-            <strong id="trade-permission">-</strong>
-          </div>
-          <div>
-            <span class="label">Bias</span>
-            <strong id="bias">-</strong>
-          </div>
-          <div>
-            <span class="label">Confidence</span>
-            <strong id="confidence">-</strong>
-          </div>
-          <div>
-            <span class="label">Score</span>
-            <strong id="score">-</strong>
-          </div>
-          <div>
-            <span class="label">Spot</span>
-            <strong id="spot">-</strong>
-          </div>
-          <div>
-            <span class="label">Zero Gamma</span>
-            <strong id="zero-gamma">-</strong>
-          </div>
-        </div>
-
-        <section class="panel">
-          <h2>Technicals</h2>
-          <dl>
-            <div><dt>VWAP</dt><dd id="technical-vwap">-</dd></div>
-            <div><dt>50-day MA</dt><dd id="technical-sma-50">-</dd></div>
-            <div><dt>200-day MA</dt><dd id="technical-sma-200">-</dd></div>
-            <div><dt>Fib near 200 MA</dt><dd id="technical-fib-200">-</dd></div>
-            <div><dt>Technical lean</dt><dd id="technical-lean">-</dd></div>
-          </dl>
-          <ul id="technical-reasons" class="compact-list"></ul>
-        </section>
-
-        <section class="panel">
-          <h2>Action</h2>
-          <p id="action"></p>
-        </section>
-
-        <section class="panel daily-report-card">
-          <h2>Daily Report Card</h2>
-          <div class="report-card-grid">
-            <div><span>Total trades</span><strong id="report-total-trades">0</strong></div>
-            <div><span>Win rate</span><strong id="report-win-rate">-</strong></div>
-            <div><span>Average win</span><strong id="report-average-win">-</strong></div>
-            <div><span>Average loss</span><strong id="report-average-loss">-</strong></div>
-            <div><span>Profit factor</span><strong id="report-profit-factor">-</strong></div>
-            <div><span>Max drawdown</span><strong id="report-max-drawdown">-</strong></div>
-            <div><span>Best ticker</span><strong id="report-best-ticker">-</strong></div>
-            <div><span>Worst ticker</span><strong id="report-worst-ticker">-</strong></div>
-            <div class="report-verdict"><span>Would this day have been profitable?</span><strong id="report-profitable">No trades yet</strong></div>
-          </div>
-          <p>Uses one simulated contract per unique Pick #1 and the bot's recorded entry and exit decisions.</p>
-        </section>
-
         <section class="panel chart-panel">
           <h2>Strike Map</h2>
           <div id="strike-chart" class="strike-chart" aria-label="Strike level chart"></div>

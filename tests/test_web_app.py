@@ -139,8 +139,12 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("const PAPER_LEDGER_HIGHLIGHT_MS = 2 * 60 * 1000", javascript)
         self.assertIn('id="paper-ledger-open"', html)
         self.assertIn('id="paper-ledger-closed"', html)
+        self.assertIn('id="force-close-paper-ledger"', html)
         self.assertIn('id="lower-confidence-log"', html)
         self.assertIn("function acknowledgePaperLedgerHighlight(id, state)", javascript)
+        self.assertIn("function forceClosePaperTrades(tradeIds)", javascript)
+        self.assertIn('exitReason: "Manual force close"', javascript)
+        self.assertIn('data-ledger-force-close=', javascript)
 
     def test_frontend_streams_open_ledger_marks_without_rechecking_gex(self):
         javascript = (STATIC_DIR / "app.js").read_text()

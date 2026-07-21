@@ -6,7 +6,7 @@ import os
 import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
-from threading import Lock
+from threading import Lock, RLock, Thread
 from typing import Any, Iterable
 
 from trading_bot.config import DatabentoSettings
@@ -57,6 +57,15 @@ class DatabentoClient:
         self._equities_fallback = equities_fallback
         self._client_lock = Lock()
         self._historical_client: Any | None = None
+        self._live_option_setup_lock = Lock()
+        self._live_option_network_lock = Lock()
+        self._live_option_lock = RLock()
+        self._live_option_client: Any | None = None
+        self._live_option_started = False
+        self._live_option_symbols: set[str] = set()
+        self._live_option_mappings: dict[int, str] = {}
+        self._live_option_snapshots: dict[str, dict[str, Any]] = {}
+        self._live_option_setup_error: str | None = None
 
     def get_latest_bar(self, symbol: str, *, feed: str | None = None) -> dict[str, Any]:
         del feed
@@ -186,6 +195,93 @@ class DatabentoClient:
             if last is not None:
                 snapshot["latestTrade"] = {"p": last, "t": row.get("t")}
         return latest
+
+    def get_streaming_option_snapshots(self, symbols: list[str]) -> dict[str, Any]:
+        """Return in-memory one-second option marks from one persistent live session."""
+        clean_symbols = [_clean_symbol(symbol) for symbol in symbols if symbol.strip()]
+        if not clean_symbols:
+            raise ValueError("symbols are required.")
+        # Databento may deliver callbacks while start/subscribe is still running.
+        # Do not hold the snapshot lock here or the callback and request can deadlock.
+        self._ensure_live_option_stream(clean_symbols)
+        with self._live_option_setup_lock:
+            setup_error = self._live_option_setup_error
+        if setup_error:
+            raise DatabentoApiError(f"Databento streaming request failed: {setup_error}")
+        with self._live_option_lock:
+            return {
+                symbol: dict(self._live_option_snapshots.get(symbol, {}))
+                for symbol in clean_symbols
+            }
+
+    def _ensure_live_option_stream(self, symbols: list[str]) -> None:
+        with self._live_option_setup_lock:
+            new_symbols = [symbol for symbol in symbols if symbol not in self._live_option_symbols]
+            if not new_symbols:
+                return
+            # Reserve these symbols before starting network work so one-second HTTP
+            # polling cannot launch duplicate subscriptions while the gateway connects.
+            self._live_option_symbols.update(new_symbols)
+        Thread(
+            target=self._subscribe_live_option_symbols,
+            args=(new_symbols,),
+            name="databento-option-stream-setup",
+            daemon=True,
+        ).start()
+
+    def _subscribe_live_option_symbols(self, symbols: list[str]) -> None:
+        try:
+            # Databento authentication/subscription can take several seconds. Keep it
+            # off the HTTP request thread and serialize additions to the live session.
+            with self._live_option_network_lock:
+                if self._live_option_client is None:
+                    db = _databento_module()
+                    self._live_option_client = db.Live(key=self._settings.api_key)
+                    self._live_option_client.add_callback(self._receive_live_option_record)
+                start = None
+                if not self._live_option_started:
+                    start = (
+                        datetime.now(timezone.utc) - timedelta(seconds=self._settings.live_replay_seconds)
+                    ).isoformat()
+                self._live_option_client.subscribe(
+                    dataset=self._settings.options_dataset,
+                    schema="cbbo-1s",
+                    symbols=[_to_databento_option_symbol(symbol) for symbol in symbols],
+                    stype_in="raw_symbol",
+                    start=start,
+                )
+                if not self._live_option_started:
+                    self._live_option_client.start()
+                    self._live_option_started = True
+            with self._live_option_setup_lock:
+                self._live_option_setup_error = None
+        except Exception as exc:
+            with self._live_option_setup_lock:
+                self._live_option_symbols.difference_update(symbols)
+                self._live_option_setup_error = str(exc)
+
+    def _receive_live_option_record(self, record: Any) -> None:
+        instrument_id = _instrument_id(record)
+        mapped_symbol = getattr(record, "stype_out_symbol", None)
+        with self._live_option_lock:
+            if mapped_symbol is not None and instrument_id is not None:
+                self._live_option_mappings[instrument_id] = _from_databento_option_symbol(str(mapped_symbol))
+                return
+            row = _live_record_row(record)
+            raw_symbol = self._live_option_mappings.get(
+                instrument_id,
+                _from_databento_option_symbol(str(row.get("raw_symbol") or row.get("symbol") or "")),
+            )
+            if not raw_symbol:
+                return
+            quote = _quote_from_row(row)
+            if quote is None:
+                return
+            snapshot = self._live_option_snapshots.setdefault(raw_symbol, {})
+            snapshot["latestQuote"] = quote
+            last = _price(row.get("price"))
+            if last is not None:
+                snapshot["latestTrade"] = {"p": last, "t": row.get("t")}
 
     def get_option_bars(
         self,

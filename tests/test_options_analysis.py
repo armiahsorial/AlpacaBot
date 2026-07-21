@@ -1,4 +1,5 @@
 import unittest
+from datetime import date, timedelta
 
 from trading_bot.analysis import GexAnalysis
 from trading_bot.options_analysis import recommend_option_contracts
@@ -92,6 +93,7 @@ class _FakeAlpacaClient:
 
     def get_option_contracts(self, underlying, **_kwargs):
         self.requested_underlying = underlying
+        active_expiration = (date.today() + timedelta(days=7)).isoformat()
         return [
             {
                 "symbol": "AAPL260110C00200000",
@@ -99,7 +101,7 @@ class _FakeAlpacaClient:
                 "type": "call",
                 "status": "active",
                 "tradable": True,
-                "expiration_date": "2026-07-17",
+                "expiration_date": active_expiration,
                 "strike_price": "200",
                 "open_interest": "1500",
             },
@@ -109,7 +111,7 @@ class _FakeAlpacaClient:
                 "type": "put",
                 "status": "active",
                 "tradable": True,
-                "expiration_date": "2026-07-17",
+                "expiration_date": active_expiration,
                 "strike_price": "190",
                 "open_interest": "1500",
             },

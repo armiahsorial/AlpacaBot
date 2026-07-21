@@ -121,6 +121,26 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Sell: spot fell below zero gamma", javascript)
         self.assertIn("Sell: underlying fell below VWAP", javascript)
 
+    def test_frontend_caps_high_confidence_ledger_and_splits_trade_states(self):
+        html = (STATIC_DIR / "index.html").read_text()
+        javascript = (STATIC_DIR / "app.js").read_text()
+
+        self.assertIn("const PAPER_LEDGER_DAILY_TRADE_LIMIT = 10", javascript)
+        self.assertIn("const PAPER_LEDGER_MIN_SCORE = 100", javascript)
+        self.assertIn("const PAPER_LEDGER_HIGHLIGHT_MS = 2 * 60 * 1000", javascript)
+        self.assertIn('id="paper-ledger-open"', html)
+        self.assertIn('id="paper-ledger-closed"', html)
+        self.assertIn('id="lower-confidence-log"', html)
+        self.assertIn("function acknowledgePaperLedgerHighlight(id, state)", javascript)
+
+    def test_frontend_streams_open_ledger_marks_without_rechecking_gex(self):
+        javascript = (STATIC_DIR / "app.js").read_text()
+
+        self.assertIn("ledgerPriceTimer = setInterval(refreshOpenPaperLedgerPrices, 1000)", javascript)
+        self.assertIn("Entry only - awaiting live mark", javascript)
+        self.assertIn("/api/options/stream-prices?", javascript)
+        self.assertIn("{ evaluateExit: false }", javascript)
+
     def test_frontend_groups_three_contract_picks_per_ticker(self):
         javascript = (STATIC_DIR / "app.js").read_text()
         stylesheet = (STATIC_DIR / "styles.css").read_text()
@@ -330,6 +350,23 @@ class WebAppTests(unittest.TestCase):
         payload = json.loads(handler.body.decode("utf-8"))
         self.assertEqual(payload["prices"]["AAPL260710C00310000"]["mid"], 2.5)
         alpaca.get_option_snapshots.assert_called_once_with(["AAPL260710C00310000"])
+
+    def test_handle_option_stream_prices_uses_persistent_stream_method(self):
+        handler = _handler()
+        market_data = MagicMock()
+        market_data.get_streaming_option_snapshots.return_value = {
+            "SPXW260721C07500000": {
+                "latestQuote": {"bp": 4.0, "ap": 4.2},
+            }
+        }
+
+        with patch("trading_bot.web_app._market_data_client", return_value=market_data):
+            handler._handle_option_stream_prices("symbols=SPXW260721C07500000")
+
+        self.assertEqual(handler.status, HTTPStatus.OK)
+        payload = json.loads(handler.body.decode("utf-8"))
+        self.assertTrue(payload["streaming"])
+        self.assertEqual(payload["prices"]["SPXW260721C07500000"]["mid"], 4.1)
 
     def test_handle_option_replay_returns_json(self):
         handler = _handler()

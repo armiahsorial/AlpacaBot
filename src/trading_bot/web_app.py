@@ -88,6 +88,10 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             self._handle_option_prices(parsed_url.query)
             return
 
+        if parsed_url.path == "/api/options/stream-prices":
+            self._handle_option_stream_prices(parsed_url.query)
+            return
+
         if parsed_url.path == "/api/options/replay":
             self._handle_option_replay(parsed_url.query)
             return
@@ -262,6 +266,36 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
             for symbol in symbols
         }
         self._send_json({"prices": prices})
+
+    def _handle_option_stream_prices(self, query: str) -> None:
+        params = parse_qs(query)
+        symbols = [
+            symbol.strip().upper()
+            for symbol in params.get("symbols", [""])[0].split(",")
+            if symbol.strip()
+        ]
+        try:
+            if not symbols:
+                raise ValueError("symbols are required.")
+            if len(symbols) > 10:
+                raise ValueError("The streaming ledger supports at most 10 option symbols.")
+            client = _market_data_client()
+            stream_method = getattr(client, "get_streaming_option_snapshots", None)
+            if stream_method is None:
+                self._send_json(
+                    {"error": "One-second marks require Databento live streaming."},
+                    status=HTTPStatus.CONFLICT,
+                )
+                return
+            snapshots = stream_method(symbols)
+        except (MarketDataError, ValueError) as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        prices = {
+            symbol: _option_price_from_snapshot(snapshots.get(symbol, {}))
+            for symbol in symbols
+        }
+        self._send_json({"prices": prices, "streaming": True})
 
     def _handle_option_replay_prefetch(self, query: str) -> None:
         self._send_json(
@@ -497,7 +531,10 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store, max-age=0")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def _send_json(self, payload: dict[str, object], status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -505,7 +542,10 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def _read_json_body(self) -> dict[str, object]:
         length = int(self.headers.get("Content-Length", "0"))

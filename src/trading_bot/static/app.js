@@ -52,6 +52,8 @@ document.body.appendChild(metricTooltip);
 let refreshTimer = null;
 let liveTimer = null;
 let liveClockTimer = null;
+let ledgerPriceTimer = null;
+let ledgerHighlightTimer = null;
 let replayTimer = null;
 let replayScrubTimer = null;
 let replayRequestId = 0;
@@ -62,6 +64,7 @@ const latestAnalysisByTicker = new Map();
 let isAnalysisRunning = false;
 let isInspectingContract = false;
 let isLiveLoading = false;
+let isLedgerPriceLoading = false;
 let isReplayLoading = false;
 let replayAbortController = null;
 let lastReplayFetchSecond = null;
@@ -95,6 +98,9 @@ const MAX_TRADE_HISTORY_ITEMS = 2000;
 const MAX_PAPER_LEDGER_ITEMS = 500;
 const COMPACT_TRADE_HISTORY_ITEMS = 600;
 const MAX_RECORDED_PERMISSION_CANDIDATES = 3;
+const PAPER_LEDGER_DAILY_TRADE_LIMIT = 10;
+const PAPER_LEDGER_MIN_SCORE = 100;
+const PAPER_LEDGER_HIGHLIGHT_MS = 2 * 60 * 1000;
 const MARKET_TIME_ZONE = "America/New_York";
 let persistentStorageSyncTimer = null;
 let persistentStorageSyncInFlight = false;
@@ -157,6 +163,9 @@ const fields = {
   bestPickExit: document.querySelector("#best-pick-exit"),
   tradeHistory: document.querySelector("#trade-history"),
   paperLedger: document.querySelector("#paper-ledger"),
+  paperLedgerOpen: document.querySelector("#paper-ledger-open"),
+  paperLedgerClosed: document.querySelector("#paper-ledger-closed"),
+  lowerConfidenceLog: document.querySelector("#lower-confidence-log"),
   ledgerRealized: document.querySelector("#ledger-realized"),
   ledgerOpenPl: document.querySelector("#ledger-open-pl"),
   ledgerClosedCount: document.querySelector("#ledger-closed-count"),
@@ -403,6 +412,14 @@ clearPaperLedgerButton?.addEventListener("click", () => {
   renderPaperLedger();
 });
 
+fields.paperLedger?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-ledger-ack]");
+  if (!button) {
+    return;
+  }
+  acknowledgePaperLedgerHighlight(button.dataset.ledgerAck, button.dataset.ledgerState);
+});
+
 exportTradeHistoryButton?.addEventListener("click", async () => {
   await downloadTradeHistoryForSelectedDay();
 });
@@ -600,15 +617,21 @@ async function runLiveUpdate({ manual = false } = {}) {
 function startLiveMode() {
   stopLiveMode();
   stopReplay();
+  if (refreshTimer !== null) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
   const seconds = Math.max(15, Number(liveInterval.value || 15));
   liveToggleButton.textContent = "Stop Auto Live";
-  liveStatus.textContent = `Auto Live is on. Refreshing contracts every ${seconds} seconds.`;
+  liveStatus.textContent = `Auto Live is on. GEX decisions refresh every ${seconds} seconds; open ledger prices stream every second.`;
   syncLiveClock();
   liveClockTimer = setInterval(syncLiveClock, 1000);
   runLiveUpdate();
   liveTimer = setInterval(() => {
     runLiveUpdate();
   }, seconds * 1000);
+  refreshOpenPaperLedgerPrices();
+  ledgerPriceTimer = setInterval(refreshOpenPaperLedgerPrices, 1000);
   updatePlaybackButton();
 }
 
@@ -621,10 +644,41 @@ function stopLiveMode() {
     clearInterval(liveClockTimer);
     liveClockTimer = null;
   }
+  if (ledgerPriceTimer !== null) {
+    clearInterval(ledgerPriceTimer);
+    ledgerPriceTimer = null;
+  }
   liveToggleButton.textContent = "Start Auto Live";
   updatePlaybackButton();
   if (!isLiveLoading) {
     liveStatus.textContent = "Auto Live is off. Historical replay remains available.";
+  }
+}
+
+async function refreshOpenPaperLedgerPrices() {
+  if (isLedgerPriceLoading || replayDate.value !== currentHostDate()) {
+    return;
+  }
+  const symbols = [...new Set(loadPaperLedger()
+    .filter((trade) => trade.status !== "closed" && paperLedgerDay(trade) === currentHostDate())
+    .map((trade) => String(trade.symbol || "").toUpperCase())
+    .filter(Boolean))]
+    .slice(0, PAPER_LEDGER_DAILY_TRADE_LIMIT);
+  if (symbols.length === 0) {
+    return;
+  }
+  isLedgerPriceLoading = true;
+  try {
+    const query = new URLSearchParams({ symbols: symbols.join(",") });
+    const payload = await getJson(`/api/options/stream-prices?${query.toString()}`);
+    updatePaperLedgerPrices(payload.prices || {}, null, { evaluateExit: false });
+  } catch (error) {
+    if (/require Databento live streaming/i.test(String(error?.message || error))) {
+      clearInterval(ledgerPriceTimer);
+      ledgerPriceTimer = null;
+    }
+  } finally {
+    isLedgerPriceLoading = false;
   }
 }
 
@@ -981,7 +1035,9 @@ function scheduleRefresh() {
     refreshTimer = null;
   }
 
-  if (!autoRefresh.checked || !currentHostMarketSnapshot().isOpen) {
+  // Auto Live recommendations already include a full GEX analysis. Running the
+  // separate analysis timer at the same time would duplicate every GEX call.
+  if (!autoRefresh.checked || !currentHostMarketSnapshot().isOpen || liveTimer !== null) {
     return;
   }
 
@@ -2370,6 +2426,7 @@ function renderTradeHistory({ preserveScroll = true, refreshData = true } = {}) 
     (isHistoricalDay || matchesTickerFilter(item, selectedTickers)) &&
     historyItemVisibleAtReplayPoint(item, selectedDate, replayPoint)
   );
+  renderLowerConfidenceLog(history);
   renderPaperLedger({ preserveScroll: false });
   if (history.length === 0) {
     if (isHistoricalDay && persistentHistoryRequests.has(selectedDate) && !persistentHistoryByDate.has(selectedDate)) {
@@ -2389,6 +2446,35 @@ function renderTradeHistory({ preserveScroll = true, refreshData = true } = {}) 
       fields.tradeHistory.appendChild(createTradeHistoryRow(item));
     }
     refreshRenderedTradeHistory(history, { refreshData });
+  }
+}
+
+function renderLowerConfidenceLog(history) {
+  if (!fields.lowerConfidenceLog) {
+    return;
+  }
+  const skipped = history
+    .filter((item) => {
+      const score = optionalNumber(item.score);
+      return score !== null && score < PAPER_LEDGER_MIN_SCORE;
+    })
+    .slice(0, 100);
+  if (skipped.length === 0) {
+    fields.lowerConfidenceLog.textContent = `No permission signals below score ${PAPER_LEDGER_MIN_SCORE} at this replay point.`;
+    return;
+  }
+  fields.lowerConfidenceLog.innerHTML = "";
+  for (const item of skipped) {
+    const row = document.createElement("div");
+    row.className = `lower-confidence-row contract-${item.side || "call"}`;
+    row.innerHTML = `
+      <span><strong>${escapeHtml(item.timestamp?.label || "-")}</strong><em>${escapeHtml(item.contract || item.symbol || "Unknown contract")}</em></span>
+      <span>${escapeHtml(historyItemTicker(item))}</span>
+      <span>${escapeHtml(item.bias || "-")}</span>
+      <span>Score ${formatOptionalNumber(item.score)}</span>
+      <span>Skipped by ledger</span>
+    `;
+    fields.lowerConfidenceLog.appendChild(row);
   }
 }
 
@@ -2590,7 +2676,8 @@ function recordPaperLedgerTrade(item) {
     return;
   }
   const entry = optionalNumber(item.entryPrice);
-  if (!item.id || !item.symbol || !entry || entry <= 0) {
+  const score = optionalNumber(item.score);
+  if (!item.id || !item.symbol || !entry || entry <= 0 || score === null || score < PAPER_LEDGER_MIN_SCORE) {
     return;
   }
 
@@ -2603,6 +2690,13 @@ function recordPaperLedgerTrade(item) {
   )) {
     return;
   }
+  if (ledger.filter((trade) => paperLedgerDay(trade) === tradeDay).length >= PAPER_LEDGER_DAILY_TRADE_LIMIT) {
+    return;
+  }
+
+  const openedAtIso = tradeDay === currentHostDate()
+    ? new Date().toISOString()
+    : item.timestamp?.iso || null;
 
   const trade = {
     id: ledgerId,
@@ -2618,6 +2712,9 @@ function recordPaperLedgerTrade(item) {
     entryGreeks: item.entryGreeks || null,
     quantity: 1,
     status: "open",
+    score,
+    openedAtIso,
+    openHighlightAcknowledged: false,
     currentPrice: entry,
     highPrice: entry,
     lowPrice: entry,
@@ -2649,19 +2746,40 @@ function renderPaperLedger({ preserveScroll = true } = {}) {
   renderDailyReportCard(ledger);
 
   if (ledger.length === 0) {
-    fields.paperLedger.textContent = selectedDate
+    const message = selectedDate
       ? `No simulated paper trades recorded on ${formatContractDate(selectedDate)}.`
       : "No simulated paper trades yet.";
+    fields.paperLedgerOpen.textContent = message;
+    fields.paperLedgerClosed.textContent = "No closed trades yet.";
     return;
   }
   if (isHistoricalDay) {
     refreshHistoricalPaperLedgerOutcomes(ledger, getReplayPoint());
   }
 
-  fields.paperLedger.innerHTML = "";
-  for (const trade of ledger) {
+  const openTrades = ledger.filter((trade) => trade.status !== "closed");
+  const closedTrades = ledger.filter((trade) => trade.status === "closed");
+  renderPaperLedgerRows(fields.paperLedgerOpen, openTrades, { isHistoricalDay, state: "open" });
+  renderPaperLedgerRows(fields.paperLedgerClosed, closedTrades, { isHistoricalDay, state: "closed" });
+  scheduleLedgerHighlightExpiry(ledger, isHistoricalDay);
+}
+
+function renderPaperLedgerRows(container, trades, { isHistoricalDay, state }) {
+  if (!container) {
+    return;
+  }
+  if (trades.length === 0) {
+    container.textContent = state === "open" ? "No open trades." : "No closed trades yet.";
+    return;
+  }
+  container.innerHTML = "";
+  for (const trade of trades) {
     const row = document.createElement("div");
     row.className = `paper-ledger-row contract-${trade.side || "call"} status-${trade.status || "open"}`;
+    const highlight = paperLedgerHighlightState(trade, isHistoricalDay);
+    if (highlight) {
+      row.classList.add(`is-new-${highlight}`);
+    }
     row.dataset.scrollKey = `ledger:${trade.id || trade.symbol || trade.timestamp?.iso || ""}`;
     const replayMinute = isHistoricalDay ? getReplayPoint().iso.slice(0, 16) : null;
     const cachedReplayOutcome = isHistoricalDay ? displayedHistoryOutcomes.get(trade.sourceHistoryId) : null;
@@ -2680,6 +2798,10 @@ function renderPaperLedger({ preserveScroll = true } = {}) {
     const pnl = paperTradePnl(displayedTrade);
     const pnlPct = paperTradePnlPct(trade.entryPrice, trade.status === "closed" ? trade.exitPrice : current);
     const advisory = gexSellAdvisory(trade);
+    const hasObservedLiveMark = trade.status === "closed" || isHistoricalDay || Boolean(trade.lastUpdatedIso);
+    const highQualifier = hasObservedLiveMark
+      ? "Observed market marks"
+      : "Entry only - awaiting live mark";
     row.innerHTML = `
       <span class="ledger-contract">
         <strong>${trade.timestamp?.label || "-"}</strong>
@@ -2687,18 +2809,76 @@ function renderPaperLedger({ preserveScroll = true } = {}) {
       </span>
       <span class="history-pill">${trade.status === "closed" ? "Closed" : "Open"}</span>
       <span class="history-stat"><i>Entry</i><strong>${formatCurrency(trade.entryPrice)}</strong></span>
-      <span class="history-stat"><i>Highest since entry</i><strong class="positive">${formatCurrency(displayedHigh ?? current)}</strong></span>
+      <span class="history-stat"><i>Highest since entry</i><strong class="positive">${formatCurrency(displayedHigh ?? current)}</strong><small>${highQualifier}</small></span>
       <span class="history-stat"><i>${trade.status === "closed" ? "Exit" : "Now"}</i><strong>${formatCurrency(current)}</strong></span>
       <span class="history-stat"><i>P/L</i><strong class="${pnl >= 0 ? "positive" : "negative"}">${formatCurrency(pnl)}</strong></span>
       <span class="history-stat"><i>Move</i><strong class="${pnlPct >= 0 ? "positive" : "negative"}">${formatPercent(pnlPct)}</strong></span>
       <span class="history-stat"><i>GEX exit read</i><strong class="${advisory.className}">${advisory.label}</strong></span>
+      ${highlight ? `<button class="ledger-ack" type="button" data-ledger-ack="${escapeHtml(trade.id)}" data-ledger-state="${highlight}">Acknowledge</button>` : ""}
       <details class="ledger-reason">
         <summary>Why the bot bought this contract</summary>
         ${tradeDecisionSnapshotMarkup(trade)}
       </details>
     `;
-    fields.paperLedger.appendChild(row);
+    container.appendChild(row);
   }
+}
+
+function paperLedgerHighlightState(trade, isHistoricalDay = false) {
+  if (isHistoricalDay) {
+    return null;
+  }
+  const closedAt = Date.parse(trade.closedAtIso || trade.exitTimestamp || "");
+  if (trade.status === "closed" && !trade.closeHighlightAcknowledged && Number.isFinite(closedAt)
+      && Date.now() - closedAt < PAPER_LEDGER_HIGHLIGHT_MS) {
+    return "closed";
+  }
+  const openedAt = Date.parse(trade.openedAtIso || "");
+  if (trade.status !== "closed" && !trade.openHighlightAcknowledged && Number.isFinite(openedAt)
+      && Date.now() - openedAt < PAPER_LEDGER_HIGHLIGHT_MS) {
+    return "open";
+  }
+  return null;
+}
+
+function acknowledgePaperLedgerHighlight(id, state) {
+  if (!id) {
+    return;
+  }
+  const ledger = loadPaperLedger().map((trade) => {
+    if (trade.id !== id) {
+      return trade;
+    }
+    return {
+      ...trade,
+      ...(state === "closed" ? { closeHighlightAcknowledged: true } : { openHighlightAcknowledged: true }),
+    };
+  });
+  savePaperLedger(ledger);
+  renderPaperLedger();
+}
+
+function scheduleLedgerHighlightExpiry(ledger, isHistoricalDay) {
+  if (ledgerHighlightTimer !== null) {
+    clearTimeout(ledgerHighlightTimer);
+    ledgerHighlightTimer = null;
+  }
+  if (isHistoricalDay) {
+    return;
+  }
+  const expiries = ledger.flatMap((trade) => {
+    const timestamp = trade.status === "closed"
+      ? Date.parse(trade.closedAtIso || trade.exitTimestamp || "")
+      : Date.parse(trade.openedAtIso || "");
+    return paperLedgerHighlightState(trade, false) && Number.isFinite(timestamp)
+      ? [timestamp + PAPER_LEDGER_HIGHLIGHT_MS]
+      : [];
+  });
+  if (expiries.length === 0) {
+    return;
+  }
+  const delay = Math.max(50, Math.min(...expiries) - Date.now() + 50);
+  ledgerHighlightTimer = setTimeout(() => renderPaperLedger(), delay);
 }
 
 function refreshHistoricalPaperLedgerOutcomes(ledger, replayPoint) {
@@ -2847,7 +3027,7 @@ function tradeDecisionSnapshotMarkup(trade) {
   `;
 }
 
-function updatePaperLedgerPrices(priceMap, asOfIso = null) {
+function updatePaperLedgerPrices(priceMap, asOfIso = null, { evaluateExit = true } = {}) {
   const ledger = loadPaperLedger();
   let changed = false;
   const now = asOfIso ? new Date(asOfIso) : new Date();
@@ -2867,6 +3047,18 @@ function updatePaperLedgerPrices(priceMap, asOfIso = null) {
     const previousLow = optionalNumber(trade.lowPrice) ?? entry;
     const madeHigh = current > previousHigh;
     const madeLow = current < previousLow;
+    if (!evaluateExit) {
+      changed = true;
+      return {
+        ...trade,
+        currentPrice: current,
+        highPrice: madeHigh ? current : previousHigh,
+        lowPrice: madeLow ? current : previousLow,
+        highTimestampIso: madeHigh ? now.toISOString() : trade.highTimestampIso || trade.timestamp?.iso || null,
+        lowTimestampIso: madeLow ? now.toISOString() : trade.lowTimestampIso || trade.timestamp?.iso || null,
+        lastUpdatedIso: now.toISOString(),
+      };
+    }
     const decision = gexSellDecision(trade);
     const sameSignal = decision.shouldExit && trade.exitSignalKey === decision.key;
     const previousSignalTime = Date.parse(trade.exitSignalTimestamp || "");
@@ -2894,6 +3086,8 @@ function updatePaperLedgerPrices(priceMap, asOfIso = null) {
     if (shouldClose) {
       next.exitPrice = current;
       next.exitTimestamp = now.toISOString();
+      next.closedAtIso = now.toISOString();
+      next.closeHighlightAcknowledged = false;
       next.exitReason = decision.label;
     }
     changed = true;
@@ -3927,8 +4121,8 @@ function savePaperLedger(ledger) {
     localStorage.setItem(PAPER_LEDGER_STORAGE_KEY, JSON.stringify(uniquePaperLedgerTrades(ledger)));
     schedulePersistentStorageSync();
   } catch (_error) {
-    if (fields.paperLedger) {
-      fields.paperLedger.textContent = "Paper simulation ledger could not be saved in this browser.";
+    if (fields.paperLedgerOpen) {
+      fields.paperLedgerOpen.textContent = "Paper simulation ledger could not be saved in this browser.";
     }
   }
 }

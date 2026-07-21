@@ -855,6 +855,29 @@ button:disabled {
   padding: 0 12px;
 }
 
+.ledger-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+#force-close-paper-ledger,
+.ledger-force-close {
+  border-color: rgba(255, 84, 120, 0.55);
+  background: rgba(83, 24, 43, 0.72);
+  color: #ffdce5;
+}
+
+#force-close-paper-ledger:hover:not(:disabled),
+.ledger-force-close:hover:not(:disabled) {
+  border-color: var(--danger);
+  background: rgba(128, 31, 60, 0.88);
+}
+
+#force-close-paper-ledger:disabled {
+  opacity: 0.42;
+}
+
 .paper-ledger-summary {
   display: grid;
   grid-template-columns: repeat(5, minmax(110px, 1fr));
@@ -969,6 +992,20 @@ button:disabled {
   font-weight: 700;
   line-height: 1.2;
   white-space: normal;
+}
+
+.ledger-exit-read {
+  align-content: start;
+}
+
+.ledger-force-close {
+  width: fit-content;
+  min-height: 28px;
+  margin-top: 6px;
+  padding: 4px 9px;
+  font-size: 10px;
+  font-weight: 850;
+  white-space: nowrap;
 }
 
 .paper-ledger-row.contract-call {
@@ -2604,6 +2641,11 @@ td:nth-child(2) {
   .history-filters,
   .paper-ledger-summary {
     grid-template-columns: 1fr;
+  }
+
+  .ledger-actions {
+    width: 100%;
+    flex-wrap: wrap;
   }
 
   .trade-history-row > span:first-child {

@@ -33,6 +33,7 @@ const daySimulationStatus = document.querySelector("#day-simulation-status");
 const stageBestPickButton = document.querySelector("#stage-best-pick");
 const clearTradeHistoryButton = document.querySelector("#clear-trade-history");
 const clearPaperLedgerButton = document.querySelector("#clear-paper-ledger");
+const forceClosePaperLedgerButton = document.querySelector("#force-close-paper-ledger");
 const exportTradeHistoryButton = document.querySelector("#export-trade-history");
 const exportTradeHistoryRangeButton = document.querySelector("#export-trade-history-range");
 const historyStartDate = document.querySelector("#history-start-date");
@@ -415,12 +416,35 @@ clearPaperLedgerButton?.addEventListener("click", () => {
   renderPaperLedger();
 });
 
-fields.paperLedger?.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-ledger-ack]");
-  if (!button) {
+forceClosePaperLedgerButton?.addEventListener("click", async () => {
+  const openTrades = currentOpenPaperTrades();
+  if (openTrades.length === 0) {
+    setStatus("There are no open simulated trades to close.", false);
     return;
   }
-  acknowledgePaperLedgerHighlight(button.dataset.ledgerAck, button.dataset.ledgerState);
+  if (!window.confirm(`Force close ${openTrades.length} open simulated trade${openTrades.length === 1 ? "" : "s"} at the latest available prices?`)) {
+    return;
+  }
+  await forceClosePaperTrades(openTrades.map((trade) => trade.id));
+});
+
+fields.paperLedger?.addEventListener("click", (event) => {
+  const closeButton = event.target.closest("[data-ledger-force-close]");
+  if (closeButton) {
+    const tradeId = closeButton.dataset.ledgerForceClose;
+    const trade = loadPaperLedger().find((item) => item.id === tradeId && item.status !== "closed");
+    if (trade && window.confirm(`Force close ${trade.contract || trade.symbol} at the latest available price?`)) {
+      forceClosePaperTrades([tradeId]);
+    }
+    return;
+  }
+  const acknowledgeButton = event.target.closest("[data-ledger-ack]");
+  if (acknowledgeButton) {
+    acknowledgePaperLedgerHighlight(
+      acknowledgeButton.dataset.ledgerAck,
+      acknowledgeButton.dataset.ledgerState
+    );
+  }
 });
 
 exportTradeHistoryButton?.addEventListener("click", async () => {
@@ -2750,6 +2774,13 @@ function renderPaperLedger({ preserveScroll = true } = {}) {
       && (isReplayView || matchesTickerFilter(trade, selectedTickers))
       && (!isReplayView || paperLedgerVisibleAtReplayPoint(trade, selectedDate, replayPoint))
   );
+  if (forceClosePaperLedgerButton) {
+    const openCount = ledger.filter((trade) => trade.status !== "closed").length;
+    forceClosePaperLedgerButton.disabled = isReplayView || openCount === 0;
+    forceClosePaperLedgerButton.title = isReplayView
+      ? "Return to live mode to manually close simulated positions."
+      : openCount === 0 ? "There are no open simulated positions." : "Close every open simulated position.";
+  }
   renderPaperLedgerSummary(ledger);
   renderDailyReportCard(ledger);
 
@@ -2813,6 +2844,7 @@ function renderPaperLedgerRows(container, trades, { isHistoricalDay, state }) {
     const pnl = paperTradePnl(displayedTrade);
     const pnlPct = paperTradePnlPct(trade.entryPrice, trade.status === "closed" ? trade.exitPrice : current);
     const advisory = gexSellAdvisory(trade);
+    const canForceClose = trade.status !== "closed" && !isHistoricalDay;
     const hasObservedLiveMark = trade.status === "closed" || isHistoricalDay || Boolean(trade.lastUpdatedIso);
     const highQualifier = hasObservedLiveMark
       ? "Observed market marks"
@@ -2828,7 +2860,11 @@ function renderPaperLedgerRows(container, trades, { isHistoricalDay, state }) {
       <span class="history-stat"><i>${trade.status === "closed" ? "Exit" : "Now"}</i><strong>${formatCurrency(current)}</strong></span>
       <span class="history-stat"><i>P/L</i><strong class="${pnl >= 0 ? "positive" : "negative"}">${formatCurrency(pnl)}</strong></span>
       <span class="history-stat"><i>Move</i><strong class="${pnlPct >= 0 ? "positive" : "negative"}">${formatPercent(pnlPct)}</strong></span>
-      <span class="history-stat"><i>GEX exit read</i><strong class="${advisory.className}">${advisory.label}</strong></span>
+      <span class="history-stat ledger-exit-read">
+        <i>GEX exit read</i>
+        <strong class="${advisory.className}">${advisory.label}</strong>
+        ${canForceClose ? `<button class="ledger-force-close" type="button" data-ledger-force-close="${escapeHtml(trade.id)}">Force Close</button>` : ""}
+      </span>
       ${highlight ? `<button class="ledger-ack" type="button" data-ledger-ack="${escapeHtml(trade.id)}" data-ledger-state="${highlight}">Acknowledge</button>` : ""}
       <details class="ledger-reason">
         <summary>Why the bot bought this contract</summary>
@@ -3111,6 +3147,89 @@ function updatePaperLedgerPrices(priceMap, asOfIso = null, { evaluateExit = true
 
   if (changed) {
     savePaperLedger(updated);
+    renderPaperLedger();
+  }
+}
+
+function currentOpenPaperTrades() {
+  const day = currentHostDate();
+  return loadPaperLedger().filter((trade) =>
+    trade.status !== "closed" && paperLedgerDay(trade) === day
+  );
+}
+
+async function forceClosePaperTrades(tradeIds) {
+  const ids = new Set((tradeIds || []).filter(Boolean));
+  const openTrades = currentOpenPaperTrades().filter((trade) => ids.has(trade.id));
+  if (openTrades.length === 0) {
+    setStatus("Those simulated trades are no longer open.", false);
+    renderPaperLedger();
+    return;
+  }
+
+  const symbols = [...new Set(openTrades.map((trade) => String(trade.symbol || "").toUpperCase()).filter(Boolean))];
+  let priceMap = {};
+  forceClosePaperLedgerButton?.setAttribute("disabled", "");
+  document.querySelectorAll("[data-ledger-force-close]").forEach((button) => {
+    button.disabled = true;
+  });
+  try {
+    if (symbols.length) {
+      const query = new URLSearchParams({ symbols: symbols.join(",") });
+      const payload = await getJson(`/api/options/stream-prices?${query.toString()}`);
+      priceMap = payload.prices || {};
+    }
+  } catch (_error) {
+    // A saved live mark is still a valid fallback for a manual simulation exit.
+  }
+
+  const now = new Date();
+  let closedCount = 0;
+  const updated = loadPaperLedger().map((trade) => {
+    if (!ids.has(trade.id) || trade.status === "closed" || paperLedgerDay(trade) !== currentHostDate()) {
+      return trade;
+    }
+    const freshMark = reliableOptionMark(priceMap?.[trade.symbol]);
+    const exitPrice = freshMark
+      ?? optionalNumber(trade.currentPrice)
+      ?? optionalNumber(trade.entryPrice);
+    if (exitPrice === null || exitPrice <= 0) {
+      return trade;
+    }
+    const previousHigh = optionalNumber(trade.highPrice) ?? optionalNumber(trade.entryPrice) ?? exitPrice;
+    const previousLow = optionalNumber(trade.lowPrice) ?? optionalNumber(trade.entryPrice) ?? exitPrice;
+    closedCount += 1;
+    return {
+      ...trade,
+      status: "closed",
+      currentPrice: exitPrice,
+      exitPrice,
+      exitTimestamp: now.toISOString(),
+      closedAtIso: now.toISOString(),
+      closeHighlightAcknowledged: false,
+      exitReason: "Manual force close",
+      exitSignalKey: "manual-force-close",
+      exitSignalCount: EXIT_CONFIRMATION_REFRESHES,
+      exitSignalLabel: "Manual force close",
+      exitSignalTimestamp: now.toISOString(),
+      highPrice: Math.max(previousHigh, exitPrice),
+      lowPrice: Math.min(previousLow, exitPrice),
+      highTimestampIso: exitPrice > previousHigh ? now.toISOString() : trade.highTimestampIso,
+      lowTimestampIso: exitPrice < previousLow ? now.toISOString() : trade.lowTimestampIso,
+      lastUpdatedIso: now.toISOString(),
+      exitMarkSource: freshMark !== null ? "fresh market mark" : "last saved market mark",
+    };
+  });
+
+  if (closedCount > 0) {
+    savePaperLedger(updated);
+    renderPaperLedger();
+    setStatus(
+      `Force closed ${closedCount} simulated trade${closedCount === 1 ? "" : "s"} and recorded the realized P/L.`,
+      false
+    );
+  } else {
+    setStatus("No valid option price was available, so no simulated trade was closed.", true);
     renderPaperLedger();
   }
 }

@@ -6,11 +6,13 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+_GEX_SNAPSHOT_BUILD_LOCK = threading.Lock()
 
 
 class TradingBotStorage:
@@ -110,6 +112,18 @@ class TradingBotStorage:
                     fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (session_date, ticker, period, mode)
                 );
+
+                CREATE TABLE IF NOT EXISTS historical_gex_snapshots (
+                    session_date TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY (session_date, ticker, period, mode, timestamp)
+                );
+                CREATE INDEX IF NOT EXISTS historical_gex_snapshots_lookup
+                    ON historical_gex_snapshots(session_date, ticker, period, mode, timestamp);
 
                 CREATE TABLE IF NOT EXISTS historical_cache_status (
                     session_date TEXT NOT NULL,
@@ -345,24 +359,101 @@ class TradingBotStorage:
             )
         return {row["mode"]: json.loads(row["payload_json"]) for row in rows}
 
+    def gex_rows_at(
+        self,
+        day: str,
+        ticker: str,
+        period: str,
+        target_timestamp: int,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return the nearest cached GEX snapshot without decoding a whole day."""
+        if not _valid_day(day):
+            raise ValueError("day must use YYYY-MM-DD format.")
+        ticker = _upper(ticker)
+        period = period.lower()
+        self._ensure_gex_snapshots(day, ticker, period)
+        selected: dict[str, list[dict[str, Any]]] = {}
+        with self._connect() as connection:
+            for mode in ("classic", "state"):
+                row = connection.execute(
+                    """
+                    SELECT payload_json FROM historical_gex_snapshots
+                    WHERE session_date = ? AND ticker = ? AND period = ? AND mode = ?
+                      AND timestamp <= ?
+                    ORDER BY timestamp DESC LIMIT 1
+                    """,
+                    (day, ticker, period, mode, int(target_timestamp)),
+                ).fetchone()
+                if row is None:
+                    row = connection.execute(
+                        """
+                        SELECT payload_json FROM historical_gex_snapshots
+                        WHERE session_date = ? AND ticker = ? AND period = ? AND mode = ?
+                        ORDER BY timestamp ASC LIMIT 1
+                        """,
+                        (day, ticker, period, mode),
+                    ).fetchone()
+                if row is not None:
+                    selected[mode] = [json.loads(row["payload_json"])]
+        return selected
+
+    def _ensure_gex_snapshots(self, day: str, ticker: str, period: str) -> None:
+        with self._connect() as connection:
+            count = connection.execute(
+                """
+                SELECT COUNT(*) FROM historical_gex_snapshots
+                WHERE session_date = ? AND ticker = ? AND period = ?
+                """,
+                (day, ticker, period),
+            ).fetchone()[0]
+        if count:
+            return
+
+        # Older databases retain whole-day blobs. Convert them once, then all
+        # slider reads become indexed SQLite lookups.
+        with _GEX_SNAPSHOT_BUILD_LOCK:
+            with self._connect() as connection:
+                count = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM historical_gex_snapshots
+                    WHERE session_date = ? AND ticker = ? AND period = ?
+                    """,
+                    (day, ticker, period),
+                ).fetchone()[0]
+            if count:
+                return
+            rows_by_mode = self.gex_rows(day, ticker, period)
+            self._save_gex_snapshots(day, ticker, period, rows_by_mode)
+
     def gex_spot_rows(self, day: str, ticker: str) -> list[dict[str, Any]]:
         """Return one cached classic GEX stream for historical index spot lookup."""
         if not _valid_day(day):
             raise ValueError("day must use YYYY-MM-DD format.")
+        ticker = _upper(ticker)
         with self._connect() as connection:
-            row = connection.execute(
+            period_row = connection.execute(
                 """
-                SELECT payload_json FROM historical_gex_rows
+                SELECT period FROM historical_gex_rows
                 WHERE session_date = ? AND ticker = ? AND mode = 'classic'
                 ORDER BY CASE period WHEN 'zero' THEN 0 WHEN 'one' THEN 1 ELSE 2 END
                 LIMIT 1
                 """,
-                (day, _upper(ticker)),
+                (day, ticker),
             ).fetchone()
-        if row is None:
+        if period_row is None:
             return []
-        payload = json.loads(row["payload_json"])
-        return payload if isinstance(payload, list) else []
+        period = str(period_row["period"])
+        self._ensure_gex_snapshots(day, ticker, period)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload_json FROM historical_gex_snapshots
+                WHERE session_date = ? AND ticker = ? AND period = ? AND mode = 'classic'
+                ORDER BY timestamp
+                """,
+                (day, ticker, period),
+            )
+            return [json.loads(row["payload_json"]) for row in rows]
 
     def save_gex_rows(
         self,
@@ -386,6 +477,42 @@ class TradingBotStorage:
                         fetched_at = CURRENT_TIMESTAMP
                     """,
                     (day, _upper(ticker), period.lower(), mode, json.dumps(rows, separators=(",", ":"))),
+                )
+        self._save_gex_snapshots(day, _upper(ticker), period.lower(), rows_by_mode)
+
+    def _save_gex_snapshots(
+        self,
+        day: str,
+        ticker: str,
+        period: str,
+        rows_by_mode: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM historical_gex_snapshots
+                WHERE session_date = ? AND ticker = ? AND period = ?
+                """,
+                (day, ticker, period),
+            )
+            for mode, rows in rows_by_mode.items():
+                if mode not in {"classic", "state"} or not isinstance(rows, list):
+                    continue
+                snapshots = []
+                for row in rows:
+                    compact = _compact_gex_row(row)
+                    if compact is None:
+                        continue
+                    snapshots.append(
+                        (day, ticker, period, mode, compact["timestamp"], json.dumps(compact, separators=(",", ":")))
+                    )
+                connection.executemany(
+                    """
+                    INSERT OR REPLACE INTO historical_gex_snapshots(
+                        session_date, ticker, period, mode, timestamp, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    snapshots,
                 )
 
     def cache_status(
@@ -550,6 +677,33 @@ class TradingBotStorage:
 
 def _json(value: dict[str, Any]) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def _compact_gex_row(row: Any) -> dict[str, Any] | None:
+    """Keep the fields replay analysis needs and omit the large strike map."""
+    if not isinstance(row, dict) or not isinstance(row.get("timestamp"), int):
+        return None
+    keys = (
+        "timestamp",
+        "ticker",
+        "min_dte",
+        "sec_min_dte",
+        "spot",
+        "zero_gamma",
+        "major_pos_vol",
+        "major_pos_oi",
+        "major_neg_vol",
+        "major_neg_oi",
+        "sum_gex_vol",
+        "sum_gex_oi",
+        "delta_risk_reversal",
+        "max_priors",
+    )
+    compact = {key: row.get(key) for key in keys}
+    # GexChain validates this field, but replay analysis only consumes the
+    # already-computed major levels and max-prior values above.
+    compact["strikes"] = []
+    return compact
 
 
 def _record_id(row: dict[str, Any], prefix: str) -> str:

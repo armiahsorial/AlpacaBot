@@ -83,6 +83,15 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("renderTradeHistory();", javascript)
         self.assertIn("loadOptionReplay({ refreshHistory: false })", javascript)
         self.assertIn("renderOptionReplays(payloads, errors, { refreshHistory })", javascript)
+
+    def test_same_day_slider_uses_replay_cutoff_instead_of_live_day_shortcut(self):
+        javascript = (STATIC_DIR / "app.js").read_text()
+
+        self.assertIn('replayTime.addEventListener("input", () => {\n  // Moving the replay clock', javascript)
+        self.assertIn("&& liveTimer !== null", javascript)
+        self.assertIn("const isReplayView = Boolean(selectedDate && !selectedReplayUsesLiveData())", javascript)
+        self.assertIn("paperLedgerVisibleAtReplayPoint(trade, selectedDate, replayPoint)", javascript)
+        self.assertNotIn("if (!selectedDate || selectedDate === currentHostDate())", javascript)
         self.assertIn("const REPLAY_MIN_FETCH_INTERVAL_MS = 15000", javascript)
         self.assertIn("function getReplayPoint()", javascript)
 
@@ -194,7 +203,7 @@ class WebAppTests(unittest.TestCase):
         javascript = (STATIC_DIR / "app.js").read_text()
         stylesheet = (STATIC_DIR / "styles.css").read_text()
 
-        self.assertIn("(isHistoricalDay || matchesTickerFilter(item, selectedTickers))", javascript)
+        self.assertIn("(isReplayView || matchesTickerFilter(item, selectedTickers))", javascript)
         self.assertIn("function renderHistoricalTickerGroups", javascript)
         self.assertIn("function historicalTickerSummaryMarkup", javascript)
         self.assertIn("function createTradeHistoryRow", javascript)
@@ -208,7 +217,7 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("historyOutcomeRequestVersions", javascript)
         self.assertGreaterEqual(javascript.count("if (!item) {\n        continue;"), 2)
         self.assertIn("A live snapshot here would overwrite that", javascript)
-        self.assertIn("if (selectedDate && selectedDate !== currentHostDate())", javascript)
+        self.assertIn("if (selectedDate && !selectedReplayUsesLiveData())", javascript)
         self.assertIn("const mergedOutcomes = replayPoint ? outcomes", javascript)
         self.assertIn("as_of_iso: replayPoint?.iso || null", javascript)
         self.assertIn("const outcomeBatchSize = replayPoint ? 1000 : 100", javascript)

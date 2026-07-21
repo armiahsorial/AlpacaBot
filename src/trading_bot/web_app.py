@@ -829,7 +829,13 @@ def _cached_replay_payload(
         raise ValueError(
             f"{ticker} {replay_date} is not fully cached in SQLite. Use Cache Day after the market closes."
         )
-    rows_by_mode = storage.gex_rows(replay_date, ticker, period)
+    selected_dt = _technical_as_of(replay_date, replay_time)
+    rows_by_mode = storage.gex_rows_at(
+        replay_date,
+        ticker,
+        period,
+        int(selected_dt.timestamp()),
+    )
     classic, state, classic_change, state_change = historical_gex_inputs_from_rows(
         rows_by_mode, replay_date, replay_time
     )
@@ -843,7 +849,6 @@ def _cached_replay_payload(
         technicals=technicals,
     )
 
-    selected_dt = _technical_as_of(replay_date, replay_time)
     history = [
         row for row in storage.history_for_day(replay_date)["trade_history"]
         if isinstance(row, dict)

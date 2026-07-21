@@ -327,6 +327,9 @@ replayDate.addEventListener("change", () => {
 });
 
 replayTime.addEventListener("input", () => {
+  // Moving the replay clock is an explicit request to inspect an as-of point,
+  // even when the selected calendar date happens to be today.
+  stopLiveMode();
   updateReplayClock();
   renderTradeHistory({ refreshData: false });
   scheduleReplayScrubRefresh();
@@ -1778,7 +1781,9 @@ function currentHostDate() {
 }
 
 function selectedReplayUsesLiveData() {
-  return replayDate.value === currentHostDate() && currentHostMarketSnapshot().isOpen;
+  return replayDate.value === currentHostDate()
+    && currentHostMarketSnapshot().isOpen
+    && liveTimer !== null;
 }
 
 function formatDateInput(date) {
@@ -2413,23 +2418,23 @@ function renderTradeHistory({ preserveScroll = true, refreshData = true } = {}) 
   }
   const selectedDate = replayDate.value;
   const selectedTickers = getSelectedTickers();
-  const isHistoricalDay = Boolean(selectedDate && selectedDate !== currentHostDate());
-  const replayPoint = isHistoricalDay ? getReplayPoint() : null;
-  if (isHistoricalDay) {
+  const isReplayView = Boolean(selectedDate && !selectedReplayUsesLiveData());
+  const replayPoint = isReplayView ? getReplayPoint() : null;
+  if (isReplayView) {
     ensureHistoricalDateLoaded(selectedDate);
   }
-  const sourceHistory = isHistoricalDay
+  const sourceHistory = isReplayView
     ? historicalTradeHistoryForDate(selectedDate)
     : loadTradeHistory();
   const history = sourceHistory.filter((item) =>
     historyItemDate(item) === selectedDate &&
-    (isHistoricalDay || matchesTickerFilter(item, selectedTickers)) &&
+    (isReplayView || matchesTickerFilter(item, selectedTickers)) &&
     historyItemVisibleAtReplayPoint(item, selectedDate, replayPoint)
   );
   renderLowerConfidenceLog(history);
   renderPaperLedger({ preserveScroll: false });
   if (history.length === 0) {
-    if (isHistoricalDay && persistentHistoryRequests.has(selectedDate) && !persistentHistoryByDate.has(selectedDate)) {
+    if (isReplayView && persistentHistoryRequests.has(selectedDate) && !persistentHistoryByDate.has(selectedDate)) {
       fields.tradeHistory.textContent = `Loading saved history for ${formatContractDate(selectedDate)}...`;
       return;
     }
@@ -2439,7 +2444,7 @@ function renderTradeHistory({ preserveScroll = true, refreshData = true } = {}) 
     return;
   }
   fields.tradeHistory.innerHTML = "";
-  if (isHistoricalDay) {
+  if (isReplayView) {
     renderHistoricalTickerGroups(history, selectedDate, refreshData, replayPoint);
   } else {
     for (const item of history) {
@@ -2492,7 +2497,7 @@ function historicalPaperLedgerForDate(day) {
 }
 
 function ensureHistoricalDateLoaded(day) {
-  if (!day || day === currentHostDate() || persistentHistoryByDate.has(day)) {
+  if (!day || persistentHistoryByDate.has(day)) {
     return Promise.resolve(persistentHistoryByDate.get(day) || null);
   }
   if (persistentHistoryRequests.has(day)) {
@@ -2635,7 +2640,7 @@ function refreshRenderedTradeHistory(history, { refreshData = true, replayPoint 
   if (daySimulationRunning || !refreshData || history.length === 0) {
     return;
   }
-  const historicalReplayPoint = replayDate.value !== currentHostDate()
+  const historicalReplayPoint = !selectedReplayUsesLiveData()
     ? (replayPoint || getReplayPoint())
     : null;
   const outcomeUpdate = updateTradeHistoryOutcomes(history, {
@@ -2648,7 +2653,7 @@ function refreshRenderedTradeHistory(history, { refreshData = true, replayPoint 
 }
 
 function historyItemVisibleAtReplayPoint(item, selectedDate, replayPoint = null) {
-  if (!selectedDate || selectedDate === currentHostDate()) {
+  if (!selectedDate || selectedReplayUsesLiveData()) {
     return true;
   }
   const timestampIso = String(item.timestamp?.iso || "");
@@ -2735,12 +2740,15 @@ function renderPaperLedger({ preserveScroll = true } = {}) {
   }
   const selectedDate = replayDate.value || currentHostDate();
   const selectedTickers = getSelectedTickers();
-  const isHistoricalDay = selectedDate !== currentHostDate();
-  const sourceLedger = isHistoricalDay
+  const isReplayView = !selectedReplayUsesLiveData();
+  const replayPoint = isReplayView ? getReplayPoint() : null;
+  const sourceLedger = isReplayView
     ? historicalPaperLedgerForDate(selectedDate)
     : loadPaperLedger();
   const ledger = sourceLedger.filter((trade) =>
-    paperLedgerDay(trade) === selectedDate && (isHistoricalDay || matchesTickerFilter(trade, selectedTickers))
+    paperLedgerDay(trade) === selectedDate
+      && (isReplayView || matchesTickerFilter(trade, selectedTickers))
+      && (!isReplayView || paperLedgerVisibleAtReplayPoint(trade, selectedDate, replayPoint))
   );
   renderPaperLedgerSummary(ledger);
   renderDailyReportCard(ledger);
@@ -2753,15 +2761,22 @@ function renderPaperLedger({ preserveScroll = true } = {}) {
     fields.paperLedgerClosed.textContent = "No closed trades yet.";
     return;
   }
-  if (isHistoricalDay) {
-    refreshHistoricalPaperLedgerOutcomes(ledger, getReplayPoint());
+  if (isReplayView) {
+    refreshHistoricalPaperLedgerOutcomes(ledger, replayPoint);
   }
 
   const openTrades = ledger.filter((trade) => trade.status !== "closed");
   const closedTrades = ledger.filter((trade) => trade.status === "closed");
-  renderPaperLedgerRows(fields.paperLedgerOpen, openTrades, { isHistoricalDay, state: "open" });
-  renderPaperLedgerRows(fields.paperLedgerClosed, closedTrades, { isHistoricalDay, state: "closed" });
-  scheduleLedgerHighlightExpiry(ledger, isHistoricalDay);
+  renderPaperLedgerRows(fields.paperLedgerOpen, openTrades, { isHistoricalDay: isReplayView, state: "open" });
+  renderPaperLedgerRows(fields.paperLedgerClosed, closedTrades, { isHistoricalDay: isReplayView, state: "closed" });
+  scheduleLedgerHighlightExpiry(ledger, isReplayView);
+}
+
+function paperLedgerVisibleAtReplayPoint(trade, selectedDate, replayPoint) {
+  return historyItemVisibleAtReplayPoint({
+    mode: trade.mode,
+    timestamp: trade.timestamp,
+  }, selectedDate, replayPoint);
 }
 
 function renderPaperLedgerRows(container, trades, { isHistoricalDay, state }) {
@@ -3864,7 +3879,7 @@ function refreshVisibleTradeHistoryPrices() {
   // Historical rows get their as-of price and high from the same cached
   // one-minute outcome series. A live snapshot here would overwrite that
   // replay point with a later or end-of-day price.
-  if (selectedDate && selectedDate !== currentHostDate()) {
+  if (selectedDate && !selectedReplayUsesLiveData()) {
     return;
   }
   const selectedTickers = getSelectedTickers();

@@ -195,6 +195,58 @@ class DatabentoClientTests(unittest.TestCase):
         self.assertEqual(kwargs["stype_in"], "raw_symbol")
         self.assertNotIn("stype_out", kwargs)
 
+    def test_historical_request_retries_at_reported_available_end(self):
+        client = DatabentoClient(DatabentoSettings(api_key="key"))
+        historical = MagicMock()
+        successful_data = MagicMock()
+        successful_data.to_df.return_value.reset_index.return_value.to_dict.return_value = [
+            {"symbol": "NDXP260721C29260000", "t": "2026-07-21T19:39:00Z"}
+        ]
+        historical.timeseries.get_range.side_effect = [
+            RuntimeError(
+                "422 data_end_after_available_end The dataset OPRA.PILLAR has data available "
+                "up to '2026-07-21 19:40:00+00:00'. The `end` in the query "
+                "('2026-07-21 20:00:00+00:00') is after the available range."
+            ),
+            successful_data,
+        ]
+        client._historical_client = historical
+
+        rows = client._historical_rows(
+            dataset="OPRA.PILLAR",
+            schema="ohlcv-1m",
+            symbols=["NDXP 260721C29260000"],
+            stype_in="raw_symbol",
+            start="2026-07-21T16:00:00Z",
+            end="2026-07-21T20:00:00Z",
+        )
+
+        self.assertEqual(rows[0]["symbol"], "NDXP260721C29260000")
+        self.assertEqual(historical.timeseries.get_range.call_count, 2)
+        retry = historical.timeseries.get_range.call_args_list[1].kwargs
+        self.assertEqual(retry["end"], "2026-07-21T19:40:00+00:00")
+
+    def test_historical_request_returns_empty_when_start_is_not_available(self):
+        client = DatabentoClient(DatabentoSettings(api_key="key"))
+        historical = MagicMock()
+        historical.timeseries.get_range.side_effect = RuntimeError(
+            "422 data_end_after_available_end The dataset OPRA.PILLAR has data available "
+            "up to '2026-07-21 19:40:00+00:00'."
+        )
+        client._historical_client = historical
+
+        rows = client._historical_rows(
+            dataset="OPRA.PILLAR",
+            schema="ohlcv-1m",
+            symbols=["NDXP 260721C29260000"],
+            stype_in="raw_symbol",
+            start="2026-07-21T19:45:00Z",
+            end="2026-07-21T20:00:00Z",
+        )
+
+        self.assertEqual(rows, [])
+        self.assertEqual(historical.timeseries.get_range.call_count, 1)
+
     def test_historical_frame_materialization_is_serialized(self):
         client = DatabentoClient(DatabentoSettings(api_key="key"))
         historical = MagicMock()

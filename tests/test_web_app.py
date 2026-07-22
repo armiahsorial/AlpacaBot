@@ -1,11 +1,13 @@
 import json
 import unittest
+from datetime import datetime
 from io import BytesIO
 from http import HTTPStatus
 from unittest.mock import MagicMock, patch
 
 from trading_bot.alpaca_client import AlpacaApiError
 from trading_bot.web_app import (
+    EASTERN,
     STATIC_DIR,
     TradingBotWebHandler,
     _historical_option_prices,
@@ -60,7 +62,8 @@ class WebAppTests(unittest.TestCase):
         javascript = (STATIC_DIR / "app.js").read_text()
 
         self.assertIn("<h1>Trading Bot</h1>", html)
-        self.assertIn('<option value="1000" selected>$1,000</option>', html)
+        self.assertIn('<option value="5000" selected>$5,000</option>', html)
+        self.assertIn('MAX_CONTRACT_DEFAULT_VERSION_KEY) !== "5000-v1"', javascript)
         self.assertNotIn('id="live-update"', html)
         self.assertIn('id="tracking-overview-rows"', html)
         self.assertIn('const TRACKING_HISTORY_STORAGE_KEY = "tradingBot.trackedTickersByDate"', javascript)
@@ -126,6 +129,23 @@ class WebAppTests(unittest.TestCase):
         self.assertIn(".sidebar-report .report-card-grid", stylesheet)
         self.assertIn("max-height: calc(100vh - 24px)", stylesheet)
 
+    def test_market_inspector_consolidates_bottom_analysis_into_tabs(self):
+        html = (STATIC_DIR / "index.html").read_text()
+        javascript = (STATIC_DIR / "app.js").read_text()
+        stylesheet = (STATIC_DIR / "styles.css").read_text()
+
+        for tab in ("map", "plan", "levels", "flow", "report"):
+            self.assertIn(f'data-inspector-tab="{tab}"', html)
+            self.assertIn(f'data-inspector-panel="{tab}"', html)
+        self.assertEqual(html.count('id="results"'), 1)
+        self.assertEqual(html.count('id="strike-chart"'), 1)
+        self.assertLess(html.index('id="strike-chart"'), html.index('class="watchlist-main"'))
+        self.assertIn("strike-level-grid", javascript)
+        self.assertIn("function selectInspectorTicker(ticker)", javascript)
+        self.assertIn("lastAnalysis = inspectorAnalysis(primary.analysis)", javascript)
+        self.assertIn(".inspector-tablist", stylesheet)
+        self.assertIn(".inspector-panel[hidden]", stylesheet)
+
     def test_paper_ledger_reuses_saved_price_paths_without_api_requests(self):
         javascript = (STATIC_DIR / "app.js").read_text()
         stylesheet = (STATIC_DIR / "styles.css").read_text()
@@ -161,12 +181,25 @@ class WebAppTests(unittest.TestCase):
     def test_frontend_caps_high_confidence_ledger_and_splits_trade_states(self):
         html = (STATIC_DIR / "index.html").read_text()
         javascript = (STATIC_DIR / "app.js").read_text()
+        stylesheet = (STATIC_DIR / "styles.css").read_text()
 
-        self.assertIn("const PAPER_LEDGER_DAILY_TRADE_LIMIT = 10", javascript)
+        self.assertIn("const PAPER_LEDGER_BLOCK_SECONDS = 30 * 60", javascript)
+        self.assertIn("const PAPER_LEDGER_BLOCK_TRADE_LIMIT = 10", javascript)
         self.assertIn("const PAPER_LEDGER_MIN_SCORE = 100", javascript)
         self.assertIn("const PAPER_LEDGER_HIGHLIGHT_MS = 2 * 60 * 1000", javascript)
-        self.assertIn('id="paper-ledger-open"', html)
-        self.assertIn('id="paper-ledger-closed"', html)
+        self.assertIn('id="paper-ledger-blocks"', html)
+        self.assertIn("function renderPaperLedgerBlocks", javascript)
+        self.assertIn("paperLedgerBlockStartSeconds(trade) === blockStartSeconds", javascript)
+        self.assertIn("groups.set(activeStart, [])", javascript)
+        self.assertIn("marketWindow.max - 1", javascript)
+        self.assertIn("Waiting for a qualifying score-100 Pick #1 trade.", javascript)
+        self.assertIn("const expandedPaperLedgerBlocks = new Set()", javascript)
+        self.assertIn("block.open = isActive || expandedPaperLedgerBlocks.has(blockKey)", javascript)
+        self.assertIn("expandedPaperLedgerBlocks.add(blockKey)", javascript)
+        self.assertIn("function withFixedViewport(render)", javascript)
+        self.assertIn("return withFixedViewport(() => renderPaperLedger", javascript)
+        self.assertIn(".ledger-time-block.is-active", stylesheet)
+        self.assertIn("overflow-anchor: none", stylesheet)
         self.assertIn('id="force-close-paper-ledger"', html)
         self.assertIn('id="lower-confidence-log"', html)
         self.assertIn("function acknowledgePaperLedgerHighlight(id, state)", javascript)
@@ -520,6 +553,38 @@ class WebAppTests(unittest.TestCase):
         )
 
         self.assertEqual(outcomes["local-only"]["current"], 2.4)
+        market.get_option_bars.assert_not_called()
+        market.get_stock_bars.assert_not_called()
+
+    def test_current_day_local_only_outcomes_use_sqlite_cache(self):
+        today = datetime.now(EASTERN).date().isoformat()
+        market = MagicMock()
+        market.provider_name = "databento"
+        cache = MagicMock()
+        cache.option_bars.return_value = {
+            "NDXP260721C29220000": [
+                {"t": f"{today}T14:30:00Z", "h": 0.9, "l": 0.7, "c": 0.8},
+            ]
+        }
+        cache.stock_bars.return_value = []
+
+        outcomes = _option_outcomes(
+            market,
+            [{
+                "id": "current-local-only",
+                "symbol": "NDXP260721C29220000",
+                "date": today,
+                "timestamp_iso": f"{today}T14:30:00Z",
+                "underlying": "NDX",
+                "entry_price": 0.75,
+                "as_of_iso": f"{today}T14:31:00Z",
+            }],
+            option_bar_cache=cache,
+            allow_remote=False,
+        )
+
+        self.assertEqual(outcomes["current-local-only"]["current"], 0.8)
+        cache.option_bars.assert_called_once()
         market.get_option_bars.assert_not_called()
         market.get_stock_bars.assert_not_called()
 

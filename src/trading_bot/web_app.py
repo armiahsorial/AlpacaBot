@@ -439,8 +439,12 @@ class TradingBotWebHandler(BaseHTTPRequestHandler):
                 raise ValueError("entries are required.")
             if len(entries) > 1000:
                 raise ValueError("At most 1,000 option entries can be evaluated at once.")
+            local_only = bool(payload.get("local_only"))
             outcomes = _option_outcomes(
-                _market_data_client(), entries, option_bar_cache=_storage(), allow_remote=True
+                _market_data_client(),
+                entries,
+                option_bar_cache=_storage(),
+                allow_remote=not local_only,
             )
             self._send_json({"outcomes": outcomes})
         except (MarketDataError, ValueError) as exc:
@@ -988,11 +992,16 @@ def _option_outcomes(
             end_dt = start_dt + timedelta(minutes=1)
 
         provider = str(getattr(alpaca_client, "provider_name", "market-data"))
-        is_completed_session = date.fromisoformat(outcome_date) < datetime.now(EASTERN).date()
+        session_day = date.fromisoformat(outcome_date)
+        session_close = datetime.combine(session_day, time(16, 0), tzinfo=EASTERN)
+        is_completed_session = datetime.now(EASTERN) >= session_close
         allow_remote_for_date = allow_remote and not is_completed_session
+        use_cached_bars = option_bar_cache is not None and (
+            is_completed_session or not allow_remote_for_date
+        )
         option_bars = (
             option_bar_cache.option_bars(provider, outcome_date, symbols)
-            if option_bar_cache is not None and is_completed_session
+            if use_cached_bars
             else {}
         )
         missing_symbols = [symbol for symbol in symbols if symbol not in option_bars]
@@ -1001,7 +1010,6 @@ def _option_outcomes(
             fetch_start = start_dt
             fetch_end = end_dt
             if is_completed_session:
-                session_day = date.fromisoformat(outcome_date)
                 fetch_start = datetime.combine(session_day, time(9, 30), tzinfo=EASTERN)
                 fetch_end = datetime.combine(session_day, time(16, 0), tzinfo=EASTERN)
             try:

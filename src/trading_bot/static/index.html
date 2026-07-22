@@ -73,10 +73,10 @@
                 <option value="250">$250</option>
                 <option value="500">$500</option>
                 <option value="750">$750</option>
-                <option value="1000" selected>$1,000</option>
+                <option value="1000">$1,000</option>
                 <option value="1500">$1,500</option>
                 <option value="2500">$2,500</option>
-                <option value="5000">$5,000</option>
+                <option value="5000" selected>$5,000</option>
               </select>
             </label>
 
@@ -183,9 +183,13 @@
             </div>
               </section>
               <section id="sidebar-insights" class="sidebar-insights" aria-label="Current market analysis">
+                <div id="results" class="inspector-results hidden" aria-live="polite">
                 <div class="sidebar-insights-heading">
-                  <h3>Market Snapshot</h3>
-                  <span>Live analysis</span>
+                  <div>
+                    <h3>Market Inspector</h3>
+                    <span id="inspector-context">Live analysis</span>
+                  </div>
+                  <div id="inspector-ticker-tabs" class="inspector-ticker-tabs" role="tablist" aria-label="Market to inspect"></div>
                 </div>
                 <div class="sidebar-summary">
                   <div>
@@ -214,50 +218,139 @@
                   </div>
                 </div>
 
-                <section class="sidebar-widget sidebar-technicals">
-                  <h3>Technicals</h3>
-                  <dl>
-                    <div><dt>VWAP</dt><dd id="technical-vwap">-</dd></div>
-                    <div><dt>50-day MA</dt><dd id="technical-sma-50">-</dd></div>
-                    <div><dt>200-day MA</dt><dd id="technical-sma-200">-</dd></div>
-                    <div><dt>Fib near 200 MA</dt><dd id="technical-fib-200">-</dd></div>
-                    <div><dt>Technical lean</dt><dd id="technical-lean">-</dd></div>
-                  </dl>
-                  <ul id="technical-reasons" class="compact-list"></ul>
-                </section>
+                <div class="inspector-tablist" role="tablist" aria-label="Analysis view">
+                  <button type="button" class="active" role="tab" aria-selected="true" data-inspector-tab="map">Map</button>
+                  <button type="button" role="tab" aria-selected="false" data-inspector-tab="plan">Plan</button>
+                  <button type="button" role="tab" aria-selected="false" data-inspector-tab="levels">Levels</button>
+                  <button type="button" role="tab" aria-selected="false" data-inspector-tab="flow">Flow</button>
+                  <button type="button" role="tab" aria-selected="false" data-inspector-tab="report">Report</button>
+                </div>
 
-                <section class="sidebar-widget sidebar-greek-flow">
-                  <h3>Vanna / Charm Flow <span class="beta-label">Beta</span></h3>
-                  <dl>
-                    <div><dt>Flow read</dt><dd id="greek-flow-bias">Unavailable</dd></div>
-                    <div><dt>Net -vanna</dt><dd id="vanna-net">-</dd></div>
-                    <div><dt>Net charm</dt><dd id="charm-net">-</dd></div>
-                    <div><dt>-Vanna + / - levels</dt><dd id="vanna-levels">-</dd></div>
-                    <div><dt>Charm + / - levels</dt><dd id="charm-levels">-</dd></div>
-                  </dl>
-                  <p>Positive flow is supportive; negative flow implies passive selling. Context only, not part of the permission score.</p>
-                </section>
-
-                <section class="sidebar-widget sidebar-action">
-                  <h3>Action</h3>
-                  <p id="action">-</p>
-                </section>
-
-                <section class="sidebar-widget sidebar-report daily-report-card">
-                  <h3>Daily Report Card</h3>
-                  <div class="report-card-grid">
-                    <div><span>Total trades</span><strong id="report-total-trades">0</strong></div>
-                    <div><span>Win rate</span><strong id="report-win-rate">-</strong></div>
-                    <div><span>Average win</span><strong id="report-average-win">-</strong></div>
-                    <div><span>Average loss</span><strong id="report-average-loss">-</strong></div>
-                    <div><span>Profit factor</span><strong id="report-profit-factor">-</strong></div>
-                    <div><span>Max drawdown</span><strong id="report-max-drawdown">-</strong></div>
-                    <div><span>Best ticker</span><strong id="report-best-ticker">-</strong></div>
-                    <div><span>Worst ticker</span><strong id="report-worst-ticker">-</strong></div>
-                    <div class="report-verdict"><span>Would this day have been profitable?</span><strong id="report-profitable">No trades yet</strong></div>
+                <div class="inspector-panel active" role="tabpanel" data-inspector-panel="map">
+                  <h3>Strike Map</h3>
+                  <div id="strike-chart" class="strike-chart inspector-strike-chart" aria-label="Strike level chart"></div>
+                  <div class="legend inspector-legend">
+                    <span><i class="spot-dot"></i>Spot</span>
+                    <span><i class="zero-dot"></i>Zero gamma</span>
+                    <span><i class="call-dot"></i>Call zone</span>
+                    <span><i class="put-dot"></i>Put zone</span>
                   </div>
-                  <p>Uses one simulated contract per unique Pick #1 and the bot's recorded entry and exit decisions.</p>
-                </section>
+                </div>
+
+                <div class="inspector-panel" role="tabpanel" data-inspector-panel="plan" hidden>
+                  <section class="inspector-block">
+                    <h3>Market Regime</h3>
+                    <p id="market-regime">-</p>
+                  </section>
+                  <section class="inspector-block">
+                    <h3>Setup</h3>
+                    <p id="setup">-</p>
+                  </section>
+                  <section class="inspector-block sidebar-action">
+                    <h3>Action</h3>
+                    <p id="action">-</p>
+                  </section>
+                  <section class="inspector-block">
+                    <h3>Trade Plan</h3>
+                    <dl>
+                      <div><dt>Entry trigger</dt><dd id="entry-trigger">-</dd></div>
+                      <div><dt>Invalidation</dt><dd id="invalidation">-</dd></div>
+                      <div><dt>Target zone</dt><dd id="target-zone">-</dd></div>
+                      <div><dt>Avoid zone</dt><dd id="avoid-zone">-</dd></div>
+                    </dl>
+                  </section>
+                  <section class="inspector-block">
+                    <h3>Read</h3>
+                    <ul id="reasons" class="compact-list"></ul>
+                  </section>
+                  <section id="no-trade-panel" class="inspector-block caution hidden">
+                    <h3>No-Trade Reasons</h3>
+                    <ul id="no-trade-reasons" class="compact-list"></ul>
+                  </section>
+                  <section class="inspector-block risk">
+                    <h3>Risk</h3>
+                    <p id="risk">-</p>
+                  </section>
+                </div>
+
+                <div class="inspector-panel" role="tabpanel" data-inspector-panel="levels" hidden>
+                  <section class="inspector-block">
+                    <h3>Key Levels</h3>
+                    <dl>
+                      <div><dt>Classic positive</dt><dd id="classic-positive">-</dd></div>
+                      <div><dt>Classic negative</dt><dd id="classic-negative">-</dd></div>
+                      <div><dt>State call node</dt><dd id="state-call">-</dd></div>
+                      <div><dt>State put node</dt><dd id="state-put">-</dd></div>
+                    </dl>
+                  </section>
+                  <section class="inspector-block">
+                    <h3>Distance</h3>
+                    <dl>
+                      <div><dt>To zero gamma</dt><dd id="distance-zero">-</dd></div>
+                      <div><dt>Upside room</dt><dd id="upside-room">-</dd></div>
+                      <div><dt>Downside room</dt><dd id="downside-room">-</dd></div>
+                    </dl>
+                  </section>
+                  <section class="inspector-block">
+                    <h3>Pressure</h3>
+                    <dl>
+                      <div><dt>Classic net GEX</dt><dd id="classic-net">-</dd></div>
+                      <div><dt>State imbalance</dt><dd id="state-net">-</dd></div>
+                      <div><dt>Classic 30m</dt><dd id="classic-change">-</dd></div>
+                      <div><dt>State 30m</dt><dd id="state-change">-</dd></div>
+                      <div><dt>Net -vanna</dt><dd id="pressure-vanna-net">-</dd></div>
+                      <div><dt>Net charm</dt><dd id="pressure-charm-net">-</dd></div>
+                    </dl>
+                  </section>
+                </div>
+
+                <div class="inspector-panel" role="tabpanel" data-inspector-panel="flow" hidden>
+                  <section class="inspector-block sidebar-technicals">
+                    <h3>Technicals</h3>
+                    <dl>
+                      <div><dt>VWAP</dt><dd id="technical-vwap">-</dd></div>
+                      <div><dt>50-day MA</dt><dd id="technical-sma-50">-</dd></div>
+                      <div><dt>200-day MA</dt><dd id="technical-sma-200">-</dd></div>
+                      <div><dt>Fib near 200 MA</dt><dd id="technical-fib-200">-</dd></div>
+                      <div><dt>Technical lean</dt><dd id="technical-lean">-</dd></div>
+                    </dl>
+                    <ul id="technical-reasons" class="compact-list"></ul>
+                  </section>
+                  <section class="inspector-block sidebar-greek-flow">
+                    <h3>Vanna / Charm Flow <span class="beta-label">Beta</span></h3>
+                    <dl>
+                      <div><dt>Flow read</dt><dd id="greek-flow-bias">Unavailable</dd></div>
+                      <div><dt>Net -vanna</dt><dd id="vanna-net">-</dd></div>
+                      <div><dt>Net charm</dt><dd id="charm-net">-</dd></div>
+                      <div><dt>-Vanna + / - levels</dt><dd id="vanna-levels">-</dd></div>
+                      <div><dt>Charm + / - levels</dt><dd id="charm-levels">-</dd></div>
+                    </dl>
+                    <p>Positive flow is supportive; negative flow implies passive selling. Context only, not part of the permission score.</p>
+                  </section>
+                  <section class="inspector-block">
+                    <h3>Score Breakdown</h3>
+                    <ul id="score-breakdown" class="compact-list"></ul>
+                  </section>
+                </div>
+
+                <div class="inspector-panel" role="tabpanel" data-inspector-panel="report" hidden>
+                  <section class="inspector-block sidebar-report daily-report-card">
+                    <h3>Daily Report Card</h3>
+                    <div class="report-card-grid">
+                      <div><span>Total trades</span><strong id="report-total-trades">0</strong></div>
+                      <div><span>Win rate</span><strong id="report-win-rate">-</strong></div>
+                      <div><span>Average win</span><strong id="report-average-win">-</strong></div>
+                      <div><span>Average loss</span><strong id="report-average-loss">-</strong></div>
+                      <div><span>Profit factor</span><strong id="report-profit-factor">-</strong></div>
+                      <div><span>Max drawdown</span><strong id="report-max-drawdown">-</strong></div>
+                      <div><span>Best ticker</span><strong id="report-best-ticker">-</strong></div>
+                      <div><span>Worst ticker</span><strong id="report-worst-ticker">-</strong></div>
+                      <div class="report-verdict"><span>Would this day have been profitable?</span><strong id="report-profitable">No trades yet</strong></div>
+                    </div>
+                    <p>Uses one simulated contract per unique Pick #1 and the bot's recorded entry and exit decisions.</p>
+                  </section>
+                </div>
+                </div>
               </section>
             </aside>
             <div class="watchlist-main">
@@ -325,22 +418,15 @@
                   <span>Win rate</span>
                   <strong id="ledger-win-rate">-</strong>
                 </div>
-                <p>Opens the first 10 unique Pick #1 contracts per day with score 100 or higher. The bot closes a simulated position after two consecutive adverse GEX, zero-gamma, or VWAP readings and saves the exit reason.</p>
+                <p>Opens up to 10 unique Pick #1 contracts in each 30-minute market block when score is 100 or higher. Every block tracks its own live P/L.</p>
               </div>
               <div id="paper-ledger" class="paper-ledger-sections">
-                <section class="ledger-section" aria-labelledby="open-trades-title">
+                <section class="ledger-section" aria-labelledby="ledger-blocks-title">
                   <div class="ledger-section-heading">
-                    <h4 id="open-trades-title">Open Trades</h4>
-                    <span>New positions glow for two minutes</span>
+                    <h4 id="ledger-blocks-title">30-Minute Performance</h4>
+                    <span>Active block stays open; completed blocks collapse</span>
                   </div>
-                  <div id="paper-ledger-open" class="paper-ledger-list">No open trades.</div>
-                </section>
-                <section class="ledger-section" aria-labelledby="closed-trades-title">
-                  <div class="ledger-section-heading">
-                    <h4 id="closed-trades-title">Closed Trades</h4>
-                    <span>Recent exits glow for two minutes</span>
-                  </div>
-                  <div id="paper-ledger-closed" class="paper-ledger-list">No closed trades yet.</div>
+                  <div id="paper-ledger-blocks" class="ledger-time-blocks">No simulated trades yet.</div>
                 </section>
               </div>
             </div>
@@ -357,95 +443,6 @@
         </section>
       </section>
 
-      <section id="results" class="results hidden" aria-live="polite">
-        <section class="panel chart-panel">
-          <h2>Strike Map</h2>
-          <div id="strike-chart" class="strike-chart" aria-label="Strike level chart"></div>
-          <div class="legend">
-            <span><i class="spot-dot"></i>Spot</span>
-            <span><i class="zero-dot"></i>Zero gamma</span>
-            <span><i class="call-dot"></i>Call watch zone</span>
-            <span><i class="put-dot"></i>Put watch zone</span>
-          </div>
-        </section>
-
-        <section class="grid">
-          <div class="panel">
-            <h2>Market Regime</h2>
-            <p id="market-regime"></p>
-          </div>
-
-          <div class="panel">
-            <h2>Setup</h2>
-            <p id="setup"></p>
-          </div>
-        </section>
-
-        <section class="panel">
-          <h2>Trade Plan</h2>
-          <dl>
-            <div><dt>Entry trigger</dt><dd id="entry-trigger">-</dd></div>
-            <div><dt>Invalidation</dt><dd id="invalidation">-</dd></div>
-            <div><dt>Target zone</dt><dd id="target-zone">-</dd></div>
-            <div><dt>Avoid zone</dt><dd id="avoid-zone">-</dd></div>
-          </dl>
-        </section>
-
-        <section class="grid">
-          <div class="panel">
-            <h2>Key Levels</h2>
-            <dl>
-              <div><dt>Classic positive</dt><dd id="classic-positive">-</dd></div>
-              <div><dt>Classic negative</dt><dd id="classic-negative">-</dd></div>
-              <div><dt>State call node</dt><dd id="state-call">-</dd></div>
-              <div><dt>State put node</dt><dd id="state-put">-</dd></div>
-            </dl>
-          </div>
-
-          <div class="panel">
-            <h2>Distance</h2>
-            <dl>
-              <div><dt>To zero gamma</dt><dd id="distance-zero">-</dd></div>
-              <div><dt>Upside room</dt><dd id="upside-room">-</dd></div>
-              <div><dt>Downside room</dt><dd id="downside-room">-</dd></div>
-            </dl>
-          </div>
-        </section>
-
-        <section class="grid">
-          <div class="panel">
-            <h2>Pressure</h2>
-            <dl>
-              <div><dt>Classic net GEX</dt><dd id="classic-net">-</dd></div>
-              <div><dt>State imbalance</dt><dd id="state-net">-</dd></div>
-              <div><dt>Classic 30m</dt><dd id="classic-change">-</dd></div>
-              <div><dt>State 30m</dt><dd id="state-change">-</dd></div>
-              <div><dt>Net -vanna</dt><dd id="pressure-vanna-net">-</dd></div>
-              <div><dt>Net charm</dt><dd id="pressure-charm-net">-</dd></div>
-            </dl>
-          </div>
-
-          <div class="panel">
-            <h2>Score Breakdown</h2>
-            <ul id="score-breakdown"></ul>
-          </div>
-        </section>
-
-        <section class="panel">
-          <h2>Read</h2>
-          <ul id="reasons"></ul>
-        </section>
-
-        <section id="no-trade-panel" class="panel caution hidden">
-          <h2>No-Trade Reasons</h2>
-          <ul id="no-trade-reasons"></ul>
-        </section>
-
-        <section class="panel risk">
-          <h2>Risk</h2>
-          <p id="risk"></p>
-        </section>
-      </section>
     </main>
     <script src="/app.js"></script>
   </body>

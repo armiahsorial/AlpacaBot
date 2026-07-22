@@ -17,6 +17,10 @@ from trading_bot.market_data import MarketDataClient, MarketDataError
 os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
 
 OCC_SYMBOL = re.compile(r"^([A-Z0-9.]+)(\d{6})([CP])(\d{8})$")
+AVAILABLE_END_PATTERN = re.compile(
+    r"has data available up to ['\"](?P<available_end>[^'\"]+)['\"]",
+    re.IGNORECASE,
+)
 PRICE_SCALE = 1_000_000_000
 TIMEFRAME_SCHEMAS = {
     "1min": "ohlcv-1m",
@@ -388,6 +392,25 @@ class DatabentoClient:
                 records = frame.to_dict(orient="records")
             return [_clean_row(row) for row in records]
         except Exception as exc:
+            available_end = _available_end_from_error(exc)
+            requested_end = _optional_datetime(kwargs.get("end"))
+            requested_start = _optional_datetime(kwargs.get("start"))
+            if available_end is not None and requested_end is not None and requested_end > available_end:
+                if requested_start is not None and requested_start >= available_end:
+                    return []
+                retry_kwargs = dict(kwargs)
+                retry_kwargs["end"] = available_end.isoformat()
+                try:
+                    with _HISTORICAL_CONVERSION_LOCK:
+                        data = self._historical().timeseries.get_range(**retry_kwargs)
+                        frame = data.to_df().reset_index()
+                        records = frame.to_dict(orient="records")
+                    return [_clean_row(row) for row in records]
+                except Exception as retry_exc:
+                    raise DatabentoApiError(
+                        f"Databento historical request failed after retrying through "
+                        f"{available_end.isoformat()}: {retry_exc}"
+                    ) from retry_exc
             raise DatabentoApiError(f"Databento historical request failed: {exc}") from exc
 
     def _live_rows(
@@ -454,6 +477,25 @@ def _clean_symbol(symbol: str) -> str:
     if not value:
         raise ValueError("symbol is required.")
     return value
+
+
+def _optional_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _available_end_from_error(exc: Exception) -> datetime | None:
+    match = AVAILABLE_END_PATTERN.search(str(exc))
+    if match is None:
+        return None
+    return _optional_datetime(match.group("available_end"))
 
 
 def _to_databento_option_symbol(symbol: str) -> str:

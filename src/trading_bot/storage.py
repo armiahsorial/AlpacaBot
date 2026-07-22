@@ -374,7 +374,7 @@ class TradingBotStorage:
         self._ensure_gex_snapshots(day, ticker, period)
         selected: dict[str, list[dict[str, Any]]] = {}
         with self._connect() as connection:
-            for mode in ("classic", "state"):
+            for mode in ("classic", "state", "vanna", "charm"):
                 row = connection.execute(
                     """
                     SELECT payload_json FROM historical_gex_snapshots
@@ -466,8 +466,11 @@ class TradingBotStorage:
             raise ValueError("day must use YYYY-MM-DD format.")
         with self._connect() as connection:
             for mode, rows in rows_by_mode.items():
-                if mode not in {"classic", "state"} or not isinstance(rows, list):
+                if mode not in {"classic", "state", "vanna", "charm"} or not isinstance(rows, list):
                     continue
+                stored_rows = rows
+                if mode in {"vanna", "charm"}:
+                    stored_rows = [compact for row in rows if (compact := _compact_gex_row(row)) is not None]
                 connection.execute(
                     """
                     INSERT INTO historical_gex_rows(session_date, ticker, period, mode, payload_json)
@@ -476,7 +479,7 @@ class TradingBotStorage:
                         payload_json = excluded.payload_json,
                         fetched_at = CURRENT_TIMESTAMP
                     """,
-                    (day, _upper(ticker), period.lower(), mode, json.dumps(rows, separators=(",", ":"))),
+                    (day, _upper(ticker), period.lower(), mode, json.dumps(stored_rows, separators=(",", ":"))),
                 )
         self._save_gex_snapshots(day, _upper(ticker), period.lower(), rows_by_mode)
 
@@ -496,7 +499,7 @@ class TradingBotStorage:
                 (day, ticker, period),
             )
             for mode, rows in rows_by_mode.items():
-                if mode not in {"classic", "state"} or not isinstance(rows, list):
+                if mode not in {"classic", "state", "vanna", "charm"} or not isinstance(rows, list):
                     continue
                 snapshots = []
                 for row in rows:
@@ -683,6 +686,15 @@ def _compact_gex_row(row: Any) -> dict[str, Any] | None:
     """Keep the fields replay analysis needs and omit the large strike map."""
     if not isinstance(row, dict) or not isinstance(row.get("timestamp"), int):
         return None
+    if isinstance(row.get("net_greek"), (int, float)):
+        return {
+            "timestamp": row.get("timestamp"),
+            "ticker": row.get("ticker"),
+            "net_greek": row.get("net_greek"),
+            "gross_greek": row.get("gross_greek"),
+            "major_positive": row.get("major_positive"),
+            "major_negative": row.get("major_negative"),
+        }
     mini_contracts = row.get("mini_contracts")
     if isinstance(mini_contracts, list):
         values = [

@@ -43,6 +43,10 @@ const historyExportStatus = document.querySelector("#history-export-status");
 const tickerSelectionCount = document.querySelector("#ticker-selection-count");
 const replayTimezone = document.querySelector("#replay-timezone");
 const trackingOverviewRows = document.querySelector("#tracking-overview-rows");
+const inspectorTickerTabs = document.querySelector("#inspector-ticker-tabs");
+const inspectorContext = document.querySelector("#inspector-context");
+const inspectorTabButtons = document.querySelectorAll("[data-inspector-tab]");
+const inspectorPanels = document.querySelectorAll("[data-inspector-panel]");
 const speedButtons = document.querySelectorAll("[data-speed]");
 const barSymbol = document.querySelector("#bar-symbol");
 const latestBar = document.querySelector("#latest-bar");
@@ -62,6 +66,8 @@ let replaySpeed = 1;
 let replayClockRemainder = 0;
 let lastAnalysis = null;
 const latestAnalysisByTicker = new Map();
+let inspectedTicker = "";
+let availableInspectorTickers = [];
 let isAnalysisRunning = false;
 let isInspectingContract = false;
 let isLiveLoading = false;
@@ -99,7 +105,9 @@ const MAX_TRADE_HISTORY_ITEMS = 2000;
 const MAX_PAPER_LEDGER_ITEMS = 500;
 const COMPACT_TRADE_HISTORY_ITEMS = 600;
 const MAX_RECORDED_PERMISSION_CANDIDATES = 3;
-const PAPER_LEDGER_DAILY_TRADE_LIMIT = 10;
+const PAPER_LEDGER_BLOCK_SECONDS = 30 * 60;
+const PAPER_LEDGER_BLOCK_TRADE_LIMIT = 10;
+const MAX_LEDGER_STREAM_SYMBOLS = 100;
 const PAPER_LEDGER_MIN_SCORE = 100;
 const PAPER_LEDGER_HIGHLIGHT_MS = 2 * 60 * 1000;
 const MARKET_TIME_ZONE = "America/New_York";
@@ -109,6 +117,7 @@ let persistentStorageSyncQueued = false;
 let persistentStorageHydrating = false;
 let historyGroupDate = "";
 const openHistoryTickerGroups = new Set();
+const expandedPaperLedgerBlocks = new Set();
 const persistentHistoryByDate = new Map();
 const persistentHistoryRequests = new Map();
 const historyOutcomeRequestVersions = new Map();
@@ -171,8 +180,7 @@ const fields = {
   bestPickExit: document.querySelector("#best-pick-exit"),
   tradeHistory: document.querySelector("#trade-history"),
   paperLedger: document.querySelector("#paper-ledger"),
-  paperLedgerOpen: document.querySelector("#paper-ledger-open"),
-  paperLedgerClosed: document.querySelector("#paper-ledger-closed"),
+  paperLedgerBlocks: document.querySelector("#paper-ledger-blocks"),
   lowerConfidenceLog: document.querySelector("#lower-confidence-log"),
   ledgerRealized: document.querySelector("#ledger-realized"),
   ledgerOpenPl: document.querySelector("#ledger-open-pl"),
@@ -244,6 +252,15 @@ function withViewportAnchor(render) {
   const anchor = captureViewportAnchor();
   const result = render();
   restoreViewportAnchor(anchor);
+  return result;
+}
+
+function withFixedViewport(render) {
+  const scrollX = window.scrollX;
+  const scrollY = window.scrollY;
+  const result = render();
+  window.scrollTo(scrollX, scrollY);
+  window.requestAnimationFrame(() => window.scrollTo(scrollX, scrollY));
   return result;
 }
 
@@ -503,6 +520,34 @@ document.addEventListener("focusout", (event) => {
 window.addEventListener("scroll", hideMetricTooltip, { passive: true });
 window.addEventListener("resize", hideMetricTooltip);
 
+for (const tabButton of inspectorTabButtons) {
+  tabButton.addEventListener("click", () => {
+    activateInspectorTab(tabButton.dataset.inspectorTab || "map");
+  });
+}
+
+inspectorTickerTabs?.addEventListener("click", (event) => {
+  const tickerButton = event.target.closest("[data-inspector-ticker]");
+  if (tickerButton) {
+    selectInspectorTicker(tickerButton.dataset.inspectorTicker);
+  }
+});
+
+fields.multiTickerList?.addEventListener("click", (event) => {
+  const tickerCard = event.target.closest("[data-inspector-ticker]");
+  if (tickerCard) {
+    selectInspectorTicker(tickerCard.dataset.inspectorTicker);
+  }
+});
+
+fields.multiTickerList?.addEventListener("keydown", (event) => {
+  const tickerCard = event.target.closest("[data-inspector-ticker]");
+  if (tickerCard && (event.key === "Enter" || event.key === " ")) {
+    event.preventDefault();
+    selectInspectorTicker(tickerCard.dataset.inspectorTicker);
+  }
+});
+
 for (const speedButton of speedButtons) {
   speedButton.addEventListener("click", () => {
     replaySpeed = Number(speedButton.dataset.speed || 10);
@@ -544,8 +589,8 @@ async function runAnalysis({ isRefresh = false } = {}) {
     if (!primaryResult) {
       throw new Error(analyses.map((result) => `${result.ticker}: ${result.error}`).join(" | ") || "Analysis failed.");
     }
-    lastAnalysis = primaryResult.payload;
-    renderAnalysis(primaryResult.payload);
+    lastAnalysis = inspectorAnalysis(primaryResult.payload);
+    renderAnalysis(lastAnalysis);
     if (!isRefresh && !isInspectingContract) {
       await loadOptionRecommendation();
     }
@@ -579,6 +624,8 @@ function renderMultiTickerSummary(results) {
     return;
   }
 
+  updateInspectorTickerTabs(results);
+
   if (results.length <= 1) {
     fields.multiTickerPanel.classList.add("hidden");
     fields.multiTickerList.innerHTML = "";
@@ -603,6 +650,10 @@ function renderMultiTickerSummary(results) {
     const analysis = result.payload;
     const flow = analysis.greek_flow;
     card.className = `multi-ticker-card permission-${permissionClass(analysis.trade_permission)}`;
+    card.dataset.inspectorTicker = result.ticker;
+    card.setAttribute("role", "button");
+    card.setAttribute("tabindex", "0");
+    card.setAttribute("aria-label", `Inspect ${result.ticker}`);
     card.innerHTML = `
       <strong>${result.ticker}</strong>
       <span>${analysis.trade_permission}</span>
@@ -613,6 +664,76 @@ function renderMultiTickerSummary(results) {
     `;
     fields.multiTickerList.appendChild(card);
   }
+  syncInspectorSelectionState();
+}
+
+function activateInspectorTab(tabName) {
+  const selectedName = [...inspectorPanels].some((panel) => panel.dataset.inspectorPanel === tabName)
+    ? tabName
+    : "map";
+  for (const button of inspectorTabButtons) {
+    const active = button.dataset.inspectorTab === selectedName;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  }
+  for (const panel of inspectorPanels) {
+    const active = panel.dataset.inspectorPanel === selectedName;
+    panel.classList.toggle("active", active);
+    panel.hidden = !active;
+  }
+}
+
+function updateInspectorTickerTabs(results) {
+  availableInspectorTickers = [...new Set((results || [])
+    .filter((result) => result?.payload && !result?.error)
+    .map((result) => String(result.ticker || result.payload?.ticker || "").toUpperCase())
+    .filter(Boolean))];
+  if (!availableInspectorTickers.includes(inspectedTicker)) {
+    inspectedTicker = availableInspectorTickers[0] || "";
+  }
+  renderInspectorTickerTabs();
+}
+
+function renderInspectorTickerTabs() {
+  if (!inspectorTickerTabs) {
+    return;
+  }
+  inspectorTickerTabs.innerHTML = availableInspectorTickers.map((ticker) => `
+    <button
+      type="button"
+      role="tab"
+      data-inspector-ticker="${escapeAttribute(ticker)}"
+      aria-selected="${ticker === inspectedTicker}"
+      class="${ticker === inspectedTicker ? "active" : ""}"
+    >${escapeHtml(ticker)}</button>
+  `).join("");
+  syncInspectorSelectionState();
+}
+
+function syncInspectorSelectionState() {
+  for (const element of document.querySelectorAll("[data-inspector-ticker]")) {
+    const active = String(element.dataset.inspectorTicker || "").toUpperCase() === inspectedTicker;
+    element.classList.toggle("inspector-selected", active);
+    if (element.getAttribute("role") === "tab") {
+      element.setAttribute("aria-selected", String(active));
+    }
+  }
+}
+
+function inspectorAnalysis(fallback) {
+  return latestAnalysisByTicker.get(inspectedTicker) || fallback;
+}
+
+function selectInspectorTicker(ticker) {
+  const normalized = String(ticker || "").toUpperCase();
+  const analysis = latestAnalysisByTicker.get(normalized);
+  if (!analysis) {
+    return;
+  }
+  inspectedTicker = normalized;
+  lastAnalysis = analysis;
+  renderInspectorTickerTabs();
+  renderAnalysis(analysis);
 }
 
 function rememberTickerAnalyses(results) {
@@ -699,7 +820,7 @@ async function refreshOpenPaperLedgerPrices() {
     .filter((trade) => trade.status !== "closed" && paperLedgerDay(trade) === currentHostDate())
     .map((trade) => String(trade.symbol || "").toUpperCase())
     .filter(Boolean))]
-    .slice(0, PAPER_LEDGER_DAILY_TRADE_LIMIT);
+    .slice(0, MAX_LEDGER_STREAM_SYMBOLS);
   if (symbols.length === 0) {
     return;
   }
@@ -735,6 +856,14 @@ function syncLiveClock() {
 }
 
 function renderAnalysis(analysis) {
+  const analysisTicker = String(analysis?.ticker || "").toUpperCase();
+  if (analysisTicker) {
+    inspectedTicker = analysisTicker;
+    renderInspectorTickerTabs();
+  }
+  if (inspectorContext) {
+    inspectorContext.textContent = `${analysisTicker || "Market"} · ${selectedReplayUsesLiveData() ? "Live analysis" : `${replayClock.value} ${hostTimeZoneLabel()}`}`;
+  }
   fields.tradePermission.textContent = analysis.trade_permission;
   fields.bias.textContent = analysis.bias;
   fields.confidence.textContent = analysis.confidence;
@@ -887,11 +1016,11 @@ function initializeMaxContractCost() {
   if (!maxContractCostSelect) {
     return;
   }
-  if (localStorage.getItem(MAX_CONTRACT_DEFAULT_VERSION_KEY) !== "1000-v1") {
-    localStorage.setItem(MAX_CONTRACT_COST_STORAGE_KEY, "1000");
-    localStorage.setItem(MAX_CONTRACT_DEFAULT_VERSION_KEY, "1000-v1");
+  if (localStorage.getItem(MAX_CONTRACT_DEFAULT_VERSION_KEY) !== "5000-v1") {
+    localStorage.setItem(MAX_CONTRACT_COST_STORAGE_KEY, "5000");
+    localStorage.setItem(MAX_CONTRACT_DEFAULT_VERSION_KEY, "5000-v1");
   }
-  const saved = localStorage.getItem(MAX_CONTRACT_COST_STORAGE_KEY) || "1000";
+  const saved = localStorage.getItem(MAX_CONTRACT_COST_STORAGE_KEY) || "5000";
   if ([...maxContractCostSelect.options].some((option) => option.value === saved)) {
     maxContractCostSelect.value = saved;
   }
@@ -1166,17 +1295,27 @@ function renderStrikeChart(analysis) {
 
   const markerHtml = positionedPoints
     .map((point) => {
-      const edgeClass = point.left < 8 ? "edge-left" : point.left > 92 ? "edge-right" : "";
       return `
-        <div class="rail-marker marker-${point.key}" style="--x: ${point.left}%">
+        <div
+          class="rail-marker marker-${point.key}"
+          style="--x: ${point.left}%"
+          title="${escapeAttribute(`${point.label}: ${formatNumber(point.value)}`)}"
+          aria-label="${escapeAttribute(`${point.label}: ${formatNumber(point.value)}`)}"
+        >
           <span class="marker-pin"></span>
-        </div>
-        <div class="marker-card marker-${point.key} marker-row-${point.row} ${edgeClass}" style="--x: ${point.left}%">
-          <span>${point.shortLabel}</span>
-          <strong>${formatNumber(point.value)}</strong>
         </div>
       `;
     })
+    .join("");
+
+  const levelHtml = positionedPoints
+    .map((point) => `
+      <div class="strike-level marker-${point.key}">
+        <span class="strike-level-swatch" aria-hidden="true"></span>
+        <span>${point.shortLabel}</span>
+        <strong>${formatNumber(point.value)}</strong>
+      </div>
+    `)
     .join("");
 
   fields.strikeChart.innerHTML = `
@@ -1188,6 +1327,9 @@ function renderStrikeChart(analysis) {
       ${zoneHtml}
       <div class="rail-baseline"></div>
       ${markerHtml}
+    </div>
+    <div class="strike-level-grid" aria-label="Strike map values">
+      ${levelHtml}
     </div>
     <div class="trade-pointers">
       <div class="pointer call-pointer">
@@ -1719,10 +1861,6 @@ function renderOptionReplay(payload) {
 function renderOptionReplays(payloads, errors = [], { refreshHistory = true } = {}) {
   return withViewportAnchor(() => {
     const primary = payloads[0];
-    if (primary?.analysis) {
-      lastAnalysis = primary.analysis;
-      renderAnalysis(primary.analysis);
-    }
     rememberTickerAnalyses(payloads.map((payload) => ({
       ticker: payload.analysis?.ticker || payload.recommendation?.ticker,
       payload: payload.analysis || payload,
@@ -1731,6 +1869,10 @@ function renderOptionReplays(payloads, errors = [], { refreshHistory = true } = 
       ticker: payload.analysis?.ticker || payload.recommendation?.ticker || "Unknown",
       payload: payload.analysis,
     })).concat(errors.map((error) => ({ ticker: error.ticker, error: error.message }))));
+    if (primary?.analysis) {
+      lastAnalysis = inspectorAnalysis(primary.analysis);
+      renderAnalysis(lastAnalysis);
+    }
     setStatus(`Replay maps updated for ${payloads.length} ticker${payloads.length === 1 ? "" : "s"} at ${replayClock.value} ${hostTimeZoneLabel()}.`, false);
 
     const summaries = payloads.map((payload) => {
@@ -2067,10 +2209,6 @@ function renderOptionRecommendation(payload) {
 function renderOptionRecommendations(payloads, errors = []) {
   return withViewportAnchor(() => {
     const primary = payloads[0];
-    if (primary?.analysis) {
-      lastAnalysis = primary.analysis;
-      renderAnalysis(primary.analysis);
-    }
     rememberTickerAnalyses(payloads.map((payload) => ({
       ticker: payload.analysis?.ticker || payload.ticker,
       payload: payload.analysis || payload,
@@ -2079,6 +2217,10 @@ function renderOptionRecommendations(payloads, errors = []) {
       ticker: payload.analysis?.ticker || payload.ticker || "Unknown",
       payload: payload.analysis || payload,
     })).concat(errors.map((error) => ({ ticker: error.ticker, error: error.message }))));
+    if (primary?.analysis) {
+      lastAnalysis = inspectorAnalysis(primary.analysis);
+      renderAnalysis(lastAnalysis);
+    }
 
     const summaries = payloads.map((payload) => {
       const ticker = payload.ticker || payload.analysis?.ticker || "Ticker";
@@ -2608,6 +2750,7 @@ function createTradeHistoryRow(item) {
     <span class="history-stat history-exit-stat"><i>Exit</i><strong class="history-exit">Checking...</strong></span>
   `;
   row.addEventListener("click", () => {
+    selectInspectorTicker(historyItemTicker(item));
     stageCandidate(
       { symbol: item.symbol },
       item.entryPrice,
@@ -2671,12 +2814,17 @@ function recordPaperLedgerTrade(item) {
   const ledgerId = `ledger:${item.id}`;
   const tradeDay = historyItemDate(item);
   const normalizedSymbol = String(item.symbol).toUpperCase();
+  const blockStartSeconds = paperLedgerBlockStartForTimestamp(item.timestamp?.iso, tradeDay);
   if (ledger.some((trade) =>
-    paperLedgerDay(trade) === tradeDay && String(trade.symbol || "").toUpperCase() === normalizedSymbol
+    paperLedgerDay(trade) === tradeDay
+      && paperLedgerBlockStartSeconds(trade) === blockStartSeconds
+      && String(trade.symbol || "").toUpperCase() === normalizedSymbol
   )) {
     return;
   }
-  if (ledger.filter((trade) => paperLedgerDay(trade) === tradeDay).length >= PAPER_LEDGER_DAILY_TRADE_LIMIT) {
+  if (ledger.filter((trade) =>
+    paperLedgerDay(trade) === tradeDay && paperLedgerBlockStartSeconds(trade) === blockStartSeconds
+  ).length >= PAPER_LEDGER_BLOCK_TRADE_LIMIT) {
     return;
   }
 
@@ -2700,6 +2848,7 @@ function recordPaperLedgerTrade(item) {
     quantity: 1,
     status: "open",
     score,
+    blockStartSeconds,
     openedAtIso,
     openHighlightAcknowledged: false,
     currentPrice: entry,
@@ -2715,7 +2864,7 @@ function recordPaperLedgerTrade(item) {
 
 function renderPaperLedger({ preserveScroll = true } = {}) {
   if (preserveScroll) {
-    return withViewportAnchor(() => renderPaperLedger({ preserveScroll: false }));
+    return withFixedViewport(() => renderPaperLedger({ preserveScroll: false }));
   }
   if (!fields.paperLedger) {
     return;
@@ -2742,22 +2891,15 @@ function renderPaperLedger({ preserveScroll = true } = {}) {
   renderPaperLedgerSummary(ledger);
   renderDailyReportCard(ledger);
 
-  if (ledger.length === 0) {
-    const message = selectedDate
-      ? `No simulated paper trades recorded on ${formatContractDate(selectedDate)}.`
-      : "No simulated paper trades yet.";
-    fields.paperLedgerOpen.textContent = message;
-    fields.paperLedgerClosed.textContent = "No closed trades yet.";
-    return;
-  }
-  if (isReplayView) {
+  if (isReplayView && ledger.length > 0) {
     refreshHistoricalPaperLedgerOutcomes(ledger, replayPoint);
   }
 
-  const openTrades = ledger.filter((trade) => trade.status !== "closed");
-  const closedTrades = ledger.filter((trade) => trade.status === "closed");
-  renderPaperLedgerRows(fields.paperLedgerOpen, openTrades, { isHistoricalDay: isReplayView, state: "open" });
-  renderPaperLedgerRows(fields.paperLedgerClosed, closedTrades, { isHistoricalDay: isReplayView, state: "closed" });
+  renderPaperLedgerBlocks(fields.paperLedgerBlocks, ledger, {
+    isHistoricalDay: isReplayView,
+    selectedDate,
+    replayPoint,
+  });
   scheduleLedgerHighlightExpiry(ledger, isReplayView);
 }
 
@@ -2766,6 +2908,139 @@ function paperLedgerVisibleAtReplayPoint(trade, selectedDate, replayPoint) {
     mode: trade.mode,
     timestamp: trade.timestamp,
   }, selectedDate, replayPoint);
+}
+
+function paperLedgerBlockStartForTimestamp(timestampIso, day) {
+  const marketWindow = hostMarketWindow(day);
+  const parsed = new Date(timestampIso || "");
+  const seconds = Number.isFinite(parsed.getTime()) ? localSeconds(parsed) : marketWindow.min;
+  const offset = Math.max(0, seconds - marketWindow.min);
+  return marketWindow.min + Math.floor(offset / PAPER_LEDGER_BLOCK_SECONDS) * PAPER_LEDGER_BLOCK_SECONDS;
+}
+
+function paperLedgerBlockStartSeconds(trade) {
+  const saved = optionalNumber(trade.blockStartSeconds);
+  if (saved !== null) {
+    return saved;
+  }
+  return paperLedgerBlockStartForTimestamp(
+    trade.timestamp?.iso || trade.openedAtIso,
+    paperLedgerDay(trade)
+  );
+}
+
+function formatLedgerBlockTime(seconds) {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const suffix = hours >= 12 ? "PM" : "AM";
+  const displayHour = hours % 12 || 12;
+  return `${displayHour}:${String(minutes).padStart(2, "0")} ${suffix}`;
+}
+
+function paperLedgerDisplayedPnl(trade, isHistoricalDay) {
+  if (!isHistoricalDay || trade.status === "closed") {
+    return paperTradePnl(trade);
+  }
+  const replayMinute = getReplayPoint().iso.slice(0, 16);
+  const outcome = displayedHistoryOutcomes.get(trade.sourceHistoryId);
+  const current = outcome?.replayMinute === replayMinute && outcome.source === "market-data option bars"
+    ? optionalNumber(outcome.current)
+    : optionalNumber(trade.currentPrice);
+  return paperTradePnl({ ...trade, currentPrice: current });
+}
+
+function renderPaperLedgerBlocks(container, trades, { isHistoricalDay, selectedDate, replayPoint }) {
+  if (!container) {
+    return;
+  }
+  const groups = new Map();
+  for (const trade of trades) {
+    const start = paperLedgerBlockStartSeconds(trade);
+    if (!groups.has(start)) {
+      groups.set(start, []);
+    }
+    groups.get(start).push(trade);
+  }
+
+  const marketWindow = hostMarketWindow(selectedDate);
+  const currentSeconds = isHistoricalDay
+    ? Number(replayPoint?.localSecond ?? replayTime.value)
+    : localSeconds(new Date());
+  const boundedCurrentSeconds = Math.min(
+    marketWindow.max - 1,
+    Math.max(marketWindow.min, currentSeconds)
+  );
+  const activeStart = marketWindow.min
+    + Math.floor((boundedCurrentSeconds - marketWindow.min) / PAPER_LEDGER_BLOCK_SECONDS)
+      * PAPER_LEDGER_BLOCK_SECONDS;
+  if (!groups.has(activeStart)) {
+    groups.set(activeStart, []);
+  }
+
+  container.innerHTML = "";
+  for (const [start, blockTrades] of [...groups.entries()].sort((a, b) => b[0] - a[0])) {
+    const end = Math.min(start + PAPER_LEDGER_BLOCK_SECONDS, marketWindow.max);
+    const openTrades = blockTrades.filter((trade) => trade.status !== "closed");
+    const closedTrades = blockTrades.filter((trade) => trade.status === "closed");
+    const pnl = blockTrades.reduce(
+      (sum, trade) => sum + paperLedgerDisplayedPnl(trade, isHistoricalDay),
+      0
+    );
+    const wins = blockTrades.filter((trade) => paperLedgerDisplayedPnl(trade, isHistoricalDay) > 0).length;
+    const isActive = start === activeStart && blockTrades.length < PAPER_LEDGER_BLOCK_TRADE_LIMIT;
+    const blockKey = `${selectedDate}:${start}`;
+    const block = document.createElement("details");
+    block.className = `ledger-time-block${isActive ? " is-active" : ""}`;
+    block.dataset.blockKey = blockKey;
+    block.open = isActive || expandedPaperLedgerBlocks.has(blockKey);
+    block.innerHTML = `
+      <summary>
+        <span class="ledger-block-window">${formatLedgerBlockTime(start)}–${formatLedgerBlockTime(end)}</span>
+        <span class="ledger-block-state">${isActive ? "Active" : blockTrades.length >= PAPER_LEDGER_BLOCK_TRADE_LIMIT ? "10-trade block" : "Complete"}</span>
+        <span><i>Trades</i><strong>${blockTrades.length}/${PAPER_LEDGER_BLOCK_TRADE_LIMIT}</strong></span>
+        <span><i>Open / closed</i><strong>${openTrades.length} / ${closedTrades.length}</strong></span>
+        <span><i>Positive</i><strong>${wins}/${blockTrades.length}</strong></span>
+        <span><i>Block P/L</i><strong class="${pnl >= 0 ? "positive" : "negative"}">${formatCurrency(pnl)}</strong></span>
+      </summary>
+      <div class="ledger-block-body"></div>
+    `;
+    block.addEventListener("toggle", () => {
+      if (isActive) {
+        return;
+      }
+      if (block.open) {
+        expandedPaperLedgerBlocks.add(blockKey);
+      } else {
+        expandedPaperLedgerBlocks.delete(blockKey);
+      }
+    });
+    const body = block.querySelector(".ledger-block-body");
+    if (openTrades.length) {
+      const heading = document.createElement("h5");
+      heading.textContent = "Open trades";
+      body.appendChild(heading);
+      const list = document.createElement("div");
+      list.className = "paper-ledger-list";
+      body.appendChild(list);
+      renderPaperLedgerRows(list, openTrades, { isHistoricalDay, state: "open" });
+    }
+    if (closedTrades.length) {
+      const heading = document.createElement("h5");
+      heading.textContent = "Closed trades";
+      body.appendChild(heading);
+      const list = document.createElement("div");
+      list.className = "paper-ledger-list";
+      body.appendChild(list);
+      renderPaperLedgerRows(list, closedTrades, { isHistoricalDay, state: "closed" });
+    }
+    if (blockTrades.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "ledger-block-empty";
+      empty.textContent = "Waiting for a qualifying score-100 Pick #1 trade.";
+      body.appendChild(empty);
+    }
+    container.appendChild(block);
+  }
 }
 
 function renderPaperLedgerRows(container, trades, { isHistoricalDay, state }) {
@@ -3739,7 +4014,7 @@ async function fetchTradeHistoryOutcomes(history, replayPoint = null) {
     const payload = await postJsonWithRetry("/api/options/outcomes", {
       entries: batch,
       local_only: Boolean(replayPoint),
-    }, 3);
+    }, 3, 15000);
     Object.assign(outcomes, payload.outcomes || {});
     if (cacheMinute) {
       for (const entry of batch) {
@@ -3756,11 +4031,11 @@ async function fetchTradeHistoryOutcomes(history, replayPoint = null) {
   return outcomes;
 }
 
-async function postJsonWithRetry(url, body, attempts = 2) {
+async function postJsonWithRetry(url, body, attempts = 2, timeoutMs = null) {
   let lastError = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await postJson(url, body);
+      return await postJson(url, body, timeoutMs);
     } catch (error) {
       lastError = error;
       if (attempt < attempts) {
@@ -4246,8 +4521,8 @@ function savePaperLedger(ledger) {
     localStorage.setItem(PAPER_LEDGER_STORAGE_KEY, JSON.stringify(uniquePaperLedgerTrades(ledger)));
     schedulePersistentStorageSync();
   } catch (_error) {
-    if (fields.paperLedgerOpen) {
-      fields.paperLedgerOpen.textContent = "Paper simulation ledger could not be saved in this browser.";
+    if (fields.paperLedgerBlocks) {
+      fields.paperLedgerBlocks.textContent = "Paper simulation ledger could not be saved in this browser.";
     }
   }
 }
@@ -4404,7 +4679,8 @@ function uniquePaperLedgerTrades(ledger) {
     .filter((trade) => {
       const day = paperLedgerDay(trade);
       const symbol = String(trade.symbol || "").toUpperCase();
-      const key = day && symbol ? `${day}:${symbol}` : String(trade.id || "");
+      const blockStart = paperLedgerBlockStartSeconds(trade);
+      const key = day && symbol ? `${day}:${blockStart}:${symbol}` : String(trade.id || "");
       if (!key || seen.has(key)) {
         return false;
       }
@@ -4640,17 +4916,28 @@ async function getJsonWithTimeout(url, { signal, timeoutMs }) {
   }
 }
 
-async function postJson(url, body) {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload.error || "Request failed.");
+async function postJson(url, body, timeoutMs = null) {
+  const controller = timeoutMs ? new AbortController() : null;
+  const timeout = controller
+    ? setTimeout(() => controller.abort(new Error("Request timed out.")), timeoutMs)
+    : null;
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller?.signal,
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "Request failed.");
+    }
+    return payload;
+  } finally {
+    if (timeout !== null) {
+      clearTimeout(timeout);
+    }
   }
-  return payload;
 }
 
 function optionalNumber(value) {

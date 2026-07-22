@@ -162,6 +162,20 @@ class TradingBotStorageTests(unittest.TestCase):
         rows = {
             "classic": [row(100, 7501.0), row(200, 7502.0)],
             "state": [row(100, 7503.0), row(200, 7504.0)],
+            "vanna": [{
+                "timestamp": 100,
+                "ticker": "SPX",
+                "major_positive": 7520.0,
+                "major_negative": 7480.0,
+                "mini_contracts": [[7500.0, 0.2, 0.3, 12.0, []]],
+            }],
+            "charm": [{
+                "timestamp": 100,
+                "ticker": "SPX",
+                "major_positive": 7520.0,
+                "major_negative": 7480.0,
+                "mini_contracts": [[7500.0, 0.2, 0.3, -5.0, []]],
+            }],
         }
         self.storage.save_gex_rows("2026-07-20", "SPX", "zero", rows)
 
@@ -169,8 +183,14 @@ class TradingBotStorageTests(unittest.TestCase):
 
         self.assertEqual(selected["classic"][0]["spot"], 7501.0)
         self.assertEqual(selected["state"][0]["spot"], 7503.0)
+        self.assertEqual(selected["vanna"][0]["net_greek"], 12.0)
+        self.assertEqual(selected["charm"][0]["net_greek"], -5.0)
         self.assertEqual(selected["classic"][0]["strikes"], [])
-        self.assertEqual(self.storage.gex_rows("2026-07-20", "SPX", "zero"), rows)
+        stored = self.storage.gex_rows("2026-07-20", "SPX", "zero")
+        self.assertEqual(stored["classic"], rows["classic"])
+        self.assertEqual(stored["state"], rows["state"])
+        self.assertEqual(stored["vanna"][0]["net_greek"], 12.0)
+        self.assertEqual(stored["charm"][0]["net_greek"], -5.0)
 
     def test_delete_day_rejects_invalid_inputs(self):
         with self.assertRaises(ValueError):

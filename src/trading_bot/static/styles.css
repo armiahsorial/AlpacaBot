@@ -1579,6 +1579,14 @@ button:disabled {
   align-content: start;
 }
 
+.ledger-profit-lock {
+  max-width: 220px;
+}
+
+.ledger-profit-lock.positive {
+  color: var(--accent);
+}
+
 .ledger-force-close {
   width: fit-content;
   min-height: 28px;

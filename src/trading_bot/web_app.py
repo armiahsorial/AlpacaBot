@@ -734,6 +734,7 @@ def _cache_completed_day(
                     end=_to_utc_iso(session_close),
                     timeframe="1Min",
                     limit=10000,
+                    prefer_historical=True,
                 )
                 storage.save_option_bars(
                     provider,
@@ -1120,6 +1121,7 @@ def _normalize_option_outcome_entry(entry: object) -> dict[str, object] | None:
             for value in (_optional_snapshot_float(value) for value in _as_list(entry.get("fallback_path")))
             if value is not None
         ],
+        "fallback_path_is_post_entry": entry.get("fallback_path_is_post_entry") is True,
         "fallback_delta": _optional_snapshot_float(entry.get("fallback_delta")),
         "fallback_gamma": _optional_snapshot_float(entry.get("fallback_gamma")),
     }
@@ -1235,7 +1237,7 @@ def _outcome_for_entry(
 
 
 def _fallback_outcome_for_entry(entry: dict[str, object], option_bars_error: str | None) -> dict[str, object]:
-    path = entry.get("fallback_path")
+    path = entry.get("fallback_path") if entry.get("fallback_path_is_post_entry") is True else []
     path = path if isinstance(path, list) else []
     prices = [price for price in path if isinstance(price, float)]
     if not prices:

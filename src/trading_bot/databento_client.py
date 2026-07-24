@@ -296,6 +296,7 @@ class DatabentoClient:
         timeframe: str = "1Min",
         feed: str | None = None,
         limit: int = 10000,
+        prefer_historical: bool = False,
     ) -> dict[str, Any]:
         del feed
         clean_symbols = [_clean_symbol(symbol) for symbol in symbols if symbol.strip()]
@@ -308,6 +309,7 @@ class DatabentoClient:
             end=end,
             timeframe=timeframe,
             stype_in="raw_symbol",
+            prefer_historical=prefer_historical,
         )
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in rows:
@@ -331,6 +333,7 @@ class DatabentoClient:
                 end=end,
                 timeframe=timeframe,
                 stype_in="raw_symbol",
+                prefer_historical=prefer_historical,
             )
             alias_grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for row in alias_rows:
@@ -358,12 +361,17 @@ class DatabentoClient:
         end: str,
         timeframe: str,
         stype_in: str,
+        prefer_historical: bool = False,
     ) -> list[dict[str, Any]]:
         schema = TIMEFRAME_SCHEMAS.get(timeframe.strip().lower())
         if schema is None:
             raise ValueError("Databento supports 1Min and 1Day bars in this application.")
         end_dt = _parse_datetime(end)
-        if schema == "ohlcv-1m" and end_dt.date() >= datetime.now(timezone.utc).date():
+        if (
+            not prefer_historical
+            and schema == "ohlcv-1m"
+            and end_dt.date() >= datetime.now(timezone.utc).date()
+        ):
             rows = self._live_rows(
                 dataset=dataset,
                 schema=schema,

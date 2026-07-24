@@ -231,7 +231,9 @@ class AlpacaClient:
         timeframe: str = "1Min",
         feed: str | None = None,
         limit: int = 10000,
+        prefer_historical: bool = False,
     ) -> dict[str, Any]:
+        del prefer_historical
         clean_symbols = [symbol.strip().upper() for symbol in symbols if symbol.strip()]
         if not clean_symbols:
             raise ValueError("symbols are required.")

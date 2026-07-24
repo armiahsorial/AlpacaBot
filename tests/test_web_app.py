@@ -1,6 +1,6 @@
 import json
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 from http import HTTPStatus
 from unittest.mock import MagicMock, patch
@@ -177,6 +177,18 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Sell: trade permission disappeared", javascript)
         self.assertIn("Sell: spot fell below zero gamma", javascript)
         self.assertIn("Sell: underlying fell below VWAP", javascript)
+
+    def test_paper_ledger_locks_profit_with_a_trailing_stop(self):
+        html = (STATIC_DIR / "index.html").read_text()
+        javascript = (STATIC_DIR / "app.js").read_text()
+
+        self.assertIn("const TRAILING_STOP_ACTIVATION_PROFIT = 150", javascript)
+        self.assertIn("const TRAILING_STOP_MIN_LOCKED_PROFIT = 100", javascript)
+        self.assertIn("const TRAILING_STOP_PROFIT_KEEP_RATIO = 0.70", javascript)
+        self.assertIn("function trailingStopState(trade, currentPrice)", javascript)
+        self.assertIn('key: "trailing-profit-lock"', javascript)
+        self.assertIn("closePaperLedgerTrade(next, current, now, trailing.label)", javascript)
+        self.assertIn("locks at least $100", html)
 
     def test_frontend_caps_high_confidence_ledger_and_splits_trade_states(self):
         html = (STATIC_DIR / "index.html").read_text()
@@ -557,13 +569,16 @@ class WebAppTests(unittest.TestCase):
         market.get_stock_bars.assert_not_called()
 
     def test_current_day_local_only_outcomes_use_sqlite_cache(self):
-        today = datetime.now(EASTERN).date().isoformat()
+        now = datetime.now(EASTERN)
+        today = now.date().isoformat()
+        recorded_at = now - timedelta(minutes=2)
+        replay_at = now - timedelta(minutes=1)
         market = MagicMock()
         market.provider_name = "databento"
         cache = MagicMock()
         cache.option_bars.return_value = {
-            "NDXP260721C29220000": [
-                {"t": f"{today}T14:30:00Z", "h": 0.9, "l": 0.7, "c": 0.8},
+            "NDXP260731C29220000": [
+                {"t": recorded_at.isoformat(), "h": 0.9, "l": 0.7, "c": 0.8},
             ]
         }
         cache.stock_bars.return_value = []
@@ -572,12 +587,12 @@ class WebAppTests(unittest.TestCase):
             market,
             [{
                 "id": "current-local-only",
-                "symbol": "NDXP260721C29220000",
+                "symbol": "NDXP260731C29220000",
                 "date": today,
-                "timestamp_iso": f"{today}T14:30:00Z",
+                "timestamp_iso": recorded_at.isoformat(),
                 "underlying": "NDX",
                 "entry_price": 0.75,
-                "as_of_iso": f"{today}T14:31:00Z",
+                "as_of_iso": replay_at.isoformat(),
             }],
             option_bar_cache=cache,
             allow_remote=False,
@@ -676,7 +691,7 @@ class WebAppTests(unittest.TestCase):
         self.assertNotIn(745.0, {call.args[1] for call in delta_mock.call_args_list})
         cache.gex_spot_rows.assert_called_once_with("2026-07-17", "SPX")
 
-    def test_option_outcomes_uses_saved_path_when_option_bars_fail(self):
+    def test_option_outcomes_uses_explicit_post_entry_path_when_option_bars_fail(self):
         alpaca = MagicMock()
         alpaca.get_option_bars.side_effect = AlpacaApiError("subscription does not permit option bars")
         alpaca.get_stock_bars.return_value = []
@@ -698,6 +713,7 @@ class WebAppTests(unittest.TestCase):
                     "fallback_delta": 0.4,
                     "fallback_gamma": 0.02,
                     "fallback_path": [10.0, 12.5, 9.5],
+                    "fallback_path_is_post_entry": True,
                 }
             ],
         )
@@ -708,6 +724,26 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(outcome["current"], 9.5)
         self.assertEqual(outcome["source"], "saved intraday path fallback")
         self.assertEqual(outcome["high_greeks"]["delta"], 0.4)
+
+    def test_option_outcomes_rejects_untimestamped_whole_day_path(self):
+        alpaca = MagicMock()
+        alpaca.get_option_bars.side_effect = AlpacaApiError("option bars unavailable")
+        alpaca.get_stock_bars.return_value = []
+
+        outcomes = _option_outcomes(
+            alpaca,
+            [{
+                "id": "late-signal",
+                "symbol": "NDXP260723C28430000",
+                "date": "2026-07-23",
+                "timestamp_iso": "2026-07-23T19:59:00Z",
+                "underlying": "NDX",
+                "entry_price": 32.5,
+                "fallback_path": [137.0, 52.0, 26.63],
+            }],
+        )
+
+        self.assertIn("error", outcomes["late-signal"])
 
     def test_option_outcomes_stops_at_selected_replay_time(self):
         alpaca = MagicMock()

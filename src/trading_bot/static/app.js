@@ -99,6 +99,9 @@ const TRACKING_HISTORY_STORAGE_KEY = "tradingBot.trackedTickersByDate";
 const DATABASE_MIGRATION_STORAGE_KEY = "tradingBot.sqliteMigrationVersion";
 const OPTION_CONTRACT_MULTIPLIER = 100;
 const EXIT_CONFIRMATION_REFRESHES = 2;
+const TRAILING_STOP_ACTIVATION_PROFIT = 150;
+const TRAILING_STOP_MIN_LOCKED_PROFIT = 100;
+const TRAILING_STOP_PROFIT_KEEP_RATIO = 0.70;
 // Keep enough signals for multi-day exports instead of allowing one busy session
 // to evict the previous day's history.
 const MAX_TRADE_HISTORY_ITEMS = 2000;
@@ -1812,9 +1815,13 @@ async function refreshCacheStatus() {
       cacheStatus.classList.remove("error");
       return rows;
     }
-    cacheStatus.textContent = rows.map((row) =>
-      `${row.ticker}: ${row.status === "complete" ? `${row.option_contract_count} contracts cached` : row.status}`
-    ).join(" · ");
+    cacheStatus.textContent = rows.map((row) => {
+      if (row.status === "complete") {
+        return `${row.ticker}: ${row.option_contract_count} contracts cached`;
+      }
+      const error = row.detail?.errors?.[0];
+      return `${row.ticker}: ${error || row.status}`;
+    }).join(" · ");
     cacheStatus.classList.toggle("error", rows.some((row) => row.status === "error"));
     return rows;
   } catch (error) {
@@ -2854,6 +2861,10 @@ function recordPaperLedgerTrade(item) {
     currentPrice: entry,
     highPrice: entry,
     lowPrice: entry,
+    trailingPeakPrice: entry,
+    trailingStopActive: false,
+    trailingStopPrice: null,
+    trailingLockedProfit: null,
     highTimestampIso: item.timestamp?.iso || null,
     lowTimestampIso: item.timestamp?.iso || null,
     openedReason: `${item.bias || "unknown"} ${item.permission || "trade permission"}`,
@@ -3099,8 +3110,9 @@ function renderPaperLedgerRows(container, trades, { isHistoricalDay, state }) {
       <span class="history-stat"><i>P/L</i><strong class="${pnl >= 0 ? "positive" : "negative"}">${formatCurrency(pnl)}</strong></span>
       <span class="history-stat"><i>Move</i><strong class="${pnlPct >= 0 ? "positive" : "negative"}">${formatPercent(pnlPct)}</strong></span>
       <span class="history-stat ledger-exit-read">
-        <i>GEX exit read</i>
+        <i>Exit read</i>
         <strong class="${advisory.className}">${advisory.label}</strong>
+        ${trailingStopMarkup(trade)}
         ${canForceClose ? `<button class="ledger-force-close" type="button" data-ledger-force-close="${escapeHtml(trade.id)}">Force Close</button>` : ""}
       </span>
       ${highlight ? `<button class="ledger-ack" type="button" data-ledger-ack="${escapeHtml(trade.id)}" data-ledger-state="${highlight}">Acknowledge</button>` : ""}
@@ -3111,6 +3123,22 @@ function renderPaperLedgerRows(container, trades, { isHistoricalDay, state }) {
     `;
     container.appendChild(row);
   }
+}
+
+function trailingStopMarkup(trade) {
+  if (trade?.status === "closed" && trade?.exitReason?.includes("profit lock")) {
+    return `<small class="ledger-profit-lock positive">Profit was protected by the trailing stop.</small>`;
+  }
+  if (!trade?.trailingStopActive) {
+    const activationPrice = optionalNumber(trade?.entryPrice) === null
+      ? null
+      : optionalNumber(trade.entryPrice) + TRAILING_STOP_ACTIVATION_PROFIT
+        / (OPTION_CONTRACT_MULTIPLIER * Math.max(1, Number(trade.quantity || 1)));
+    return activationPrice === null
+      ? ""
+      : `<small class="ledger-profit-lock">Arms at ${formatCurrency(activationPrice)} (+${formatCurrency(TRAILING_STOP_ACTIVATION_PROFIT)})</small>`;
+  }
+  return `<small class="ledger-profit-lock positive">Stop ${formatCurrency(trade.trailingStopPrice)} · locks at least ${formatCurrency(trade.trailingLockedProfit)}</small>`;
 }
 
 function paperLedgerHighlightState(trade, isHistoricalDay = false) {
@@ -3336,10 +3364,12 @@ function updatePaperLedgerPrices(priceMap, asOfIso = null, { evaluateExit = true
     const previousLow = optionalNumber(trade.lowPrice) ?? entry;
     const madeHigh = current > previousHigh;
     const madeLow = current < previousLow;
+    const trailing = trailingStopState(trade, current);
     if (!evaluateExit) {
       changed = true;
-      return {
+      const next = {
         ...trade,
+        status: trailing.shouldExit ? "closed" : "open",
         currentPrice: current,
         highPrice: madeHigh ? current : previousHigh,
         lowPrice: madeLow ? current : previousLow,
@@ -3347,16 +3377,22 @@ function updatePaperLedgerPrices(priceMap, asOfIso = null, { evaluateExit = true
         lowTimestampIso: madeLow ? now.toISOString() : trade.lowTimestampIso || trade.timestamp?.iso || null,
         lastUpdatedIso: now.toISOString(),
         pricePath: appendPaperLedgerPrice(trade.pricePath, current),
+        ...trailing.fields,
       };
+      if (trailing.shouldExit) {
+        closePaperLedgerTrade(next, current, now, trailing.label);
+      }
+      return next;
     }
-    const decision = gexSellDecision(trade);
+    const decision = trailing.shouldExit ? trailing : gexSellDecision(trade);
     const sameSignal = decision.shouldExit && trade.exitSignalKey === decision.key;
     const previousSignalTime = Date.parse(trade.exitSignalTimestamp || "");
     const distinctRefresh = !Number.isFinite(previousSignalTime) || now.getTime() - previousSignalTime >= 5000;
     const exitSignalCount = decision.shouldExit
       ? (sameSignal ? Number(trade.exitSignalCount || 0) + (distinctRefresh ? 1 : 0) : 1)
       : 0;
-    const shouldClose = decision.shouldExit && exitSignalCount >= EXIT_CONFIRMATION_REFRESHES;
+    const shouldClose = trailing.shouldExit
+      || (decision.shouldExit && exitSignalCount >= EXIT_CONFIRMATION_REFRESHES);
     const next = {
       ...trade,
       status: shouldClose ? "closed" : "open",
@@ -3367,6 +3403,7 @@ function updatePaperLedgerPrices(priceMap, asOfIso = null, { evaluateExit = true
       lowTimestampIso: madeLow ? now.toISOString() : trade.lowTimestampIso || trade.timestamp?.iso || null,
       lastUpdatedIso: now.toISOString(),
       pricePath: appendPaperLedgerPrice(trade.pricePath, current),
+      ...trailing.fields,
       exitSignalKey: decision.shouldExit ? decision.key : null,
       exitSignalCount,
       exitSignalLabel: decision.shouldExit ? decision.label : null,
@@ -3375,11 +3412,7 @@ function updatePaperLedgerPrices(priceMap, asOfIso = null, { evaluateExit = true
         : null,
     };
     if (shouldClose) {
-      next.exitPrice = current;
-      next.exitTimestamp = now.toISOString();
-      next.closedAtIso = now.toISOString();
-      next.closeHighlightAcknowledged = false;
-      next.exitReason = decision.label;
+      closePaperLedgerTrade(next, current, now, decision.label);
     }
     changed = true;
     return next;
@@ -3389,6 +3422,66 @@ function updatePaperLedgerPrices(priceMap, asOfIso = null, { evaluateExit = true
     savePaperLedger(updated);
     renderPaperLedger();
   }
+}
+
+function trailingStopState(trade, currentPrice) {
+  const entry = optionalNumber(trade?.entryPrice);
+  const current = optionalNumber(currentPrice);
+  const quantity = Math.max(1, Number(trade?.quantity || 1));
+  if (entry === null || entry <= 0 || current === null || current <= 0) {
+    return { shouldExit: false, key: null, label: "", fields: {} };
+  }
+
+  const previousPeak = optionalNumber(trade?.trailingPeakPrice) ?? entry;
+  const peakPrice = Math.max(entry, previousPeak, current);
+  const peakProfit = (peakPrice - entry) * OPTION_CONTRACT_MULTIPLIER * quantity;
+  const wasActive = Boolean(trade?.trailingStopActive);
+  const active = wasActive || peakProfit >= TRAILING_STOP_ACTIVATION_PROFIT;
+  if (!active) {
+    return {
+      shouldExit: false,
+      key: null,
+      label: "",
+      fields: {
+        trailingPeakPrice: peakPrice,
+        trailingStopActive: false,
+        trailingStopPrice: null,
+        trailingLockedProfit: null,
+      },
+    };
+  }
+
+  const lockedProfit = Math.max(
+    TRAILING_STOP_MIN_LOCKED_PROFIT,
+    peakProfit * TRAILING_STOP_PROFIT_KEEP_RATIO,
+  );
+  const calculatedStop = entry + lockedProfit / (OPTION_CONTRACT_MULTIPLIER * quantity);
+  const previousStop = optionalNumber(trade?.trailingStopPrice);
+  const stopPrice = Math.max(entry, calculatedStop, previousStop ?? entry);
+  const shouldExit = current <= stopPrice;
+  return {
+    shouldExit,
+    key: "trailing-profit-lock",
+    label: shouldExit
+      ? `Sell: profit lock triggered at ${formatCurrency(stopPrice)}`
+      : `Profit lock ${formatCurrency(stopPrice)}`,
+    className: shouldExit ? "negative" : "positive",
+    fields: {
+      trailingPeakPrice: peakPrice,
+      trailingStopActive: true,
+      trailingStopPrice: stopPrice,
+      trailingLockedProfit: (stopPrice - entry) * OPTION_CONTRACT_MULTIPLIER * quantity,
+    },
+  };
+}
+
+function closePaperLedgerTrade(trade, price, timestamp, reason) {
+  trade.status = "closed";
+  trade.exitPrice = price;
+  trade.exitTimestamp = timestamp.toISOString();
+  trade.closedAtIso = timestamp.toISOString();
+  trade.closeHighlightAcknowledged = false;
+  trade.exitReason = reason;
 }
 
 function currentOpenPaperTrades() {
@@ -3984,7 +4077,6 @@ async function fetchTradeHistoryOutcomes(history, replayPoint = null) {
       entry_price: item.entryPrice,
       entry_spot: item.entrySpot,
       entry_iv: item.entryGreeks?.implied_volatility,
-      fallback_path: item.pricePath || [],
       fallback_delta: item.entryGreeks?.delta,
       fallback_gamma: item.entryGreeks?.gamma,
       as_of_time: replayPoint?.marketClock || null,
@@ -4279,7 +4371,7 @@ function refreshVisibleTradeHistoryPrices() {
 
 function sellPlanText(entryPrice) {
   return optionalNumber(entryPrice)
-    ? "Exit plan: sell after two consecutive adverse GEX, zero-gamma, or VWAP readings. High and low remain recorded for review."
+    ? "Exit plan: once profit reaches $150, lock at least $100 and trail 70% of the best gain. Confirmed adverse GEX, zero-gamma, or VWAP readings can exit sooner."
     : "Tracking begins after a valid entry price is recorded.";
 }
 
@@ -4507,6 +4599,10 @@ function normalizePaperLedgerTrade(trade) {
     currentPrice: current,
     highPrice: observed.length ? Math.max(...observed) : null,
     lowPrice: observed.length ? Math.min(...observed) : null,
+    trailingPeakPrice: optionalNumber(withoutPercentageRules.trailingPeakPrice) ?? entry,
+    trailingStopActive: Boolean(withoutPercentageRules.trailingStopActive),
+    trailingStopPrice: optionalNumber(withoutPercentageRules.trailingStopPrice),
+    trailingLockedProfit: optionalNumber(withoutPercentageRules.trailingLockedProfit),
   };
   if (legacyPercentageExit) {
     delete normalized.exitPrice;

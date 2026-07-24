@@ -108,6 +108,21 @@ class DatabentoClientTests(unittest.TestCase):
         self.assertEqual(bars["SPX260717P07320000"][0]["t"], "2026-07-16T19:59:00Z")
         self.assertEqual(bars["SPX260717P07320000"][0]["c"], 0.25)
 
+    def test_option_bars_can_force_historical_for_current_day_cache(self):
+        client = DatabentoClient(DatabentoSettings(api_key="key"))
+        client._historical_rows = MagicMock(return_value=[])
+        client._live_rows = MagicMock(return_value=[])
+
+        client.get_option_bars(
+            ["SPXW260723C07500000"],
+            start="2026-07-23T13:30:00Z",
+            end="2026-07-23T20:00:00Z",
+            prefer_historical=True,
+        )
+
+        client._historical_rows.assert_called_once()
+        client._live_rows.assert_not_called()
+
     def test_normalizes_definition_to_existing_contract_shape(self):
         contract = _normalize_contract(
             {

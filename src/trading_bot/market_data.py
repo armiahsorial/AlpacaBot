@@ -48,6 +48,7 @@ class MarketDataClient(Protocol):
         timeframe: str = "1Min",
         feed: str | None = None,
         limit: int = 10000,
+        prefer_historical: bool = False,
     ) -> dict[str, Any]: ...
 
 
